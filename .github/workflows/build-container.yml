@@ -38,4 +38,4 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Build OCI Image
-      run: nix build .#dockerImage
+      run: nix build .#oci
