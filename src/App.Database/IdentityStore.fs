@@ -1,4 +1,4 @@
-namespace App
+namespace App.Database
 
 open System
 open System.Collections.Generic
@@ -6,9 +6,12 @@ open System.Security.Cryptography
 open System.Text
 open System.Threading
 open System.Threading.Tasks
+open App.Database.Schema
+open App.Database.Schema.fsnix
 open Microsoft.AspNetCore.Identity
 open Npgsql
-open NpgsqlTypes
+open SqlHydra.Query
+open SqlHydra.Query.NpgsqlExtensions
 
 [<AllowNullLiteral>]
 type ApplicationUser() =
@@ -29,84 +32,52 @@ type ApplicationUser() =
 [<Sealed>]
 type PostgresUserStore(dataSource: NpgsqlDataSource) =
     let errors = IdentityErrorDescriber()
+    let db = QueryContextFactory.Create dataSource
 
-    let columns =
-        "id, username, normalized_username, email, normalized_email, email_confirmed, password_hash, two_factor_enabled, security_stamp, concurrency_stamp, lockout_end, lockout_enabled, access_failed_count"
-
-    let userFromReader (reader: NpgsqlDataReader) =
+    let userFromRow (row: users) =
         let user = ApplicationUser()
-        user.Id <- reader.GetGuid 0
-        user.UserName <- reader.GetString 1
-        user.NormalizedUserName <- reader.GetString 2
-        user.Email <- reader.GetString 3
-        user.NormalizedEmail <- reader.GetString 4
-        user.EmailConfirmed <- reader.GetBoolean 5
-        user.PasswordHash <- reader.GetString 6
-        user.TwoFactorEnabled <- reader.GetBoolean 7
-        user.SecurityStamp <- reader.GetString 8
-        user.ConcurrencyStamp <- reader.GetString 9
-
-        let lockoutEnd =
-            reader.GetDateTime 10
-            |> fun value -> DateTime.SpecifyKind(value, DateTimeKind.Utc)
-            |> DateTimeOffset
+        user.Id <- row.id
+        user.UserName <- row.username
+        user.NormalizedUserName <- row.normalized_username
+        user.Email <- row.email
+        user.NormalizedEmail <- row.normalized_email
+        user.EmailConfirmed <- row.email_confirmed
+        user.PasswordHash <- Option.toObj row.password_hash
+        user.TwoFactorEnabled <- row.two_factor_enabled
+        user.SecurityStamp <- row.security_stamp
+        user.ConcurrencyStamp <- row.concurrency_stamp
 
         user.LockoutEnd <-
-            if lockoutEnd = DateTimeOffset.MinValue then
-                Nullable()
-            else
-                Nullable lockoutEnd
+            row.lockout_end
+            |> Option.map (fun value -> DateTime.SpecifyKind(value, DateTimeKind.Utc) |> DateTimeOffset)
+            |> Option.toNullable
 
-        user.LockoutEnabled <- reader.GetBoolean 11
-        user.AccessFailedCount <- reader.GetInt32 12
+        user.LockoutEnabled <- row.lockout_enabled
+        user.AccessFailedCount <- row.access_failed_count
         user
+
+    let rowFromUser (user: ApplicationUser) : users =
+        { id = user.Id
+          username = user.UserName
+          normalized_username = user.NormalizedUserName
+          email = user.Email
+          normalized_email = user.NormalizedEmail
+          email_confirmed = user.EmailConfirmed
+          password_hash = Option.ofObj user.PasswordHash
+          two_factor_enabled = user.TwoFactorEnabled
+          security_stamp = user.SecurityStamp
+          concurrency_stamp = user.ConcurrencyStamp
+          lockout_end =
+            if user.LockoutEnd.HasValue then
+                Some user.LockoutEnd.Value.UtcDateTime
+            else
+                None
+          lockout_enabled = user.LockoutEnabled
+          access_failed_count = user.AccessFailedCount }
 
     let checkUser (user: ApplicationUser) (cancellationToken: CancellationToken) =
         cancellationToken.ThrowIfCancellationRequested()
         ArgumentNullException.ThrowIfNull user
-
-    let addTextOrEmpty (command: NpgsqlCommand) (name: string) (value: string) =
-        command.Parameters.Add(name, NpgsqlDbType.Text).Value <- if isNull value then "" else value
-
-    let addLockoutEnd (command: NpgsqlCommand) (value: Nullable<DateTimeOffset>) =
-        command.Parameters.Add("lockout_end", NpgsqlDbType.TimestampTz).Value <-
-            if value.HasValue then
-                value.Value.UtcDateTime
-            else
-                DateTimeOffset.MinValue.UtcDateTime
-
-    let addUserParameters (command: NpgsqlCommand) (user: ApplicationUser) =
-        command.Parameters.AddWithValue("id", user.Id) |> ignore
-        command.Parameters.AddWithValue("username", user.UserName) |> ignore
-
-        command.Parameters.AddWithValue("normalized_username", user.NormalizedUserName)
-        |> ignore
-
-        command.Parameters.AddWithValue("email", user.Email) |> ignore
-
-        command.Parameters.AddWithValue("normalized_email", user.NormalizedEmail)
-        |> ignore
-
-        command.Parameters.AddWithValue("email_confirmed", user.EmailConfirmed)
-        |> ignore
-
-        addTextOrEmpty command "password_hash" user.PasswordHash
-
-        command.Parameters.AddWithValue("two_factor_enabled", user.TwoFactorEnabled)
-        |> ignore
-
-        command.Parameters.AddWithValue("security_stamp", user.SecurityStamp) |> ignore
-
-        command.Parameters.AddWithValue("concurrency_stamp", user.ConcurrencyStamp)
-        |> ignore
-
-        addLockoutEnd command user.LockoutEnd
-
-        command.Parameters.AddWithValue("lockout_enabled", user.LockoutEnabled)
-        |> ignore
-
-        command.Parameters.AddWithValue("access_failed_count", user.AccessFailedCount)
-        |> ignore
 
     let duplicateResult (exceptionValue: PostgresException) (user: ApplicationUser) =
         match exceptionValue.ConstraintName with
@@ -114,74 +85,52 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
         | "uq_users_normalized_email" -> IdentityResult.Failed(errors.DuplicateEmail user.Email)
         | _ -> IdentityResult.Failed(errors.DefaultError())
 
-    let queryOne (sql: string) (parameterName: string) (parameterValue: obj) cancellationToken =
-        task {
-            use! connection = dataSource.OpenConnectionAsync cancellationToken
-            use command = new NpgsqlCommand(sql, connection)
-            command.Parameters.AddWithValue(parameterName, parameterValue) |> ignore
-            use! reader = command.ExecuteReaderAsync cancellationToken
-            let! found = reader.ReadAsync cancellationToken
-            return if found then userFromReader reader else null
-        }
-
     let setToken (user: ApplicationUser) provider name (value: string) cancellationToken =
         task {
             checkUser user cancellationToken
-            use! connection = dataSource.OpenConnectionAsync cancellationToken
 
             if isNull value then
-                use command =
-                    new NpgsqlCommand(
-                        "DELETE FROM fsnix.user_tokens WHERE user_id = @user_id AND login_provider = @provider AND name = @name",
-                        connection
-                    )
+                let! _ =
+                    deleteTask db {
+                        for token in fsnix.user_tokens do
+                            where (token.user_id = user.Id && token.login_provider = provider && token.name = name)
+                            cancel cancellationToken
+                    }
 
-                command.Parameters.AddWithValue("user_id", user.Id) |> ignore
-                command.Parameters.AddWithValue("provider", provider) |> ignore
-                command.Parameters.AddWithValue("name", name) |> ignore
-                let! _ = command.ExecuteNonQueryAsync cancellationToken
                 return ()
             else
-                use command =
-                    new NpgsqlCommand(
-                        """
-                        INSERT INTO fsnix.user_tokens (user_id, login_provider, name, value)
-                        VALUES (@user_id, @provider, @name, @value)
-                        ON CONFLICT (user_id, login_provider, name)
-                        DO UPDATE SET value = EXCLUDED.value
-                        """,
-                        connection
-                    )
+                let row: user_tokens =
+                    { user_id = user.Id
+                      login_provider = provider
+                      name = name
+                      value = value }
 
-                command.Parameters.AddWithValue("user_id", user.Id) |> ignore
-                command.Parameters.AddWithValue("provider", provider) |> ignore
-                command.Parameters.AddWithValue("name", name) |> ignore
-                command.Parameters.AddWithValue("value", value) |> ignore
-                let! _ = command.ExecuteNonQueryAsync cancellationToken
+                let! _ =
+                    insertTask db {
+                        for token in fsnix.user_tokens do
+                            entity row
+                            onConflict (token.user_id, token.login_provider, token.name)
+                            doUpdate token.value
+                            cancel cancellationToken
+                    }
+
                 return ()
         }
 
     let getToken (user: ApplicationUser) provider name cancellationToken =
         task {
             checkUser user cancellationToken
-            use! connection = dataSource.OpenConnectionAsync cancellationToken
 
-            use command =
-                new NpgsqlCommand(
-                    "SELECT value FROM fsnix.user_tokens WHERE user_id = @user_id AND login_provider = @provider AND name = @name",
-                    connection
-                )
+            let! value =
+                selectTask db {
+                    for token in fsnix.user_tokens do
+                        where (token.user_id = user.Id && token.login_provider = provider && token.name = name)
+                        select token.value
+                        tryHead
+                        cancel cancellationToken
+                }
 
-            command.Parameters.AddWithValue("user_id", user.Id) |> ignore
-            command.Parameters.AddWithValue("provider", provider) |> ignore
-            command.Parameters.AddWithValue("name", name) |> ignore
-            let! value = command.ExecuteScalarAsync cancellationToken
-
-            return
-                if isNull value || value = DBNull.Value then
-                    null
-                else
-                    string value
+            return Option.toObj value
         }
 
     let hashRecoveryCode (code: string) =
@@ -210,27 +159,14 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 if String.IsNullOrWhiteSpace user.ConcurrencyStamp then
                     user.ConcurrencyStamp <- Guid.NewGuid().ToString("N")
 
-                use! connection = dataSource.OpenConnectionAsync cancellationToken
-
-                use command =
-                    new NpgsqlCommand(
-                        """
-                        INSERT INTO fsnix.users
-                            (id, username, normalized_username, email, normalized_email, email_confirmed,
-                             password_hash, two_factor_enabled, security_stamp, concurrency_stamp,
-                             lockout_end, lockout_enabled, access_failed_count)
-                        VALUES
-                            (@id, @username, @normalized_username, @email, @normalized_email, @email_confirmed,
-                             @password_hash, @two_factor_enabled, @security_stamp, @concurrency_stamp,
-                             @lockout_end, @lockout_enabled, @access_failed_count)
-                        """,
-                        connection
-                    )
-
-                addUserParameters command user
-
                 try
-                    let! _ = command.ExecuteNonQueryAsync cancellationToken
+                    let! _ =
+                        insertTask db {
+                            into fsnix.users
+                            entity (rowFromUser user)
+                            cancel cancellationToken
+                        }
+
                     return IdentityResult.Success
                 with :? PostgresException as exceptionValue when
                     exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
@@ -242,34 +178,27 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 checkUser user cancellationToken
                 let previousStamp = user.ConcurrencyStamp
                 let nextStamp = Guid.NewGuid().ToString("N")
-                use! connection = dataSource.OpenConnectionAsync cancellationToken
-
-                use command =
-                    new NpgsqlCommand(
-                        """
-                        UPDATE fsnix.users
-                        SET username = @username,
-                            normalized_username = @normalized_username,
-                            email = @email,
-                            normalized_email = @normalized_email,
-                            email_confirmed = @email_confirmed,
-                            password_hash = @password_hash,
-                            two_factor_enabled = @two_factor_enabled,
-                            security_stamp = @security_stamp,
-                            concurrency_stamp = @next_concurrency_stamp,
-                            lockout_end = @lockout_end,
-                            lockout_enabled = @lockout_enabled,
-                            access_failed_count = @access_failed_count
-                        WHERE id = @id AND concurrency_stamp = @concurrency_stamp
-                        """,
-                        connection
-                    )
-
-                addUserParameters command user
-                command.Parameters.AddWithValue("next_concurrency_stamp", nextStamp) |> ignore
+                let row = rowFromUser user
 
                 try
-                    let! affected = command.ExecuteNonQueryAsync cancellationToken
+                    let! affected =
+                        updateTask db {
+                            for persisted in fsnix.users do
+                                set persisted.username row.username
+                                set persisted.normalized_username row.normalized_username
+                                set persisted.email row.email
+                                set persisted.normalized_email row.normalized_email
+                                set persisted.email_confirmed row.email_confirmed
+                                set persisted.password_hash row.password_hash
+                                set persisted.two_factor_enabled row.two_factor_enabled
+                                set persisted.security_stamp row.security_stamp
+                                set persisted.concurrency_stamp nextStamp
+                                set persisted.lockout_end row.lockout_end
+                                set persisted.lockout_enabled row.lockout_enabled
+                                set persisted.access_failed_count row.access_failed_count
+                                where (persisted.id = user.Id && persisted.concurrency_stamp = previousStamp)
+                                cancel cancellationToken
+                        }
 
                     if affected = 1 then
                         user.ConcurrencyStamp <- nextStamp
@@ -278,27 +207,19 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                         return IdentityResult.Failed(errors.ConcurrencyFailure())
                 with :? PostgresException as exceptionValue when
                     exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
-                    user.ConcurrencyStamp <- previousStamp
                     return duplicateResult exceptionValue user
             }
 
         member _.DeleteAsync(user, cancellationToken) =
             task {
                 checkUser user cancellationToken
-                use! connection = dataSource.OpenConnectionAsync cancellationToken
 
-                use command =
-                    new NpgsqlCommand(
-                        "DELETE FROM fsnix.users WHERE id = @id AND concurrency_stamp = @concurrency_stamp",
-                        connection
-                    )
-
-                command.Parameters.AddWithValue("id", user.Id) |> ignore
-
-                command.Parameters.AddWithValue("concurrency_stamp", user.ConcurrencyStamp)
-                |> ignore
-
-                let! affected = command.ExecuteNonQueryAsync cancellationToken
+                let! affected =
+                    deleteTask db {
+                        for persisted in fsnix.users do
+                            where (persisted.id = user.Id && persisted.concurrency_stamp = user.ConcurrencyStamp)
+                            cancel cancellationToken
+                    }
 
                 return
                     if affected = 1 then
@@ -311,17 +232,36 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
             cancellationToken.ThrowIfCancellationRequested()
 
             match Guid.TryParse userId with
-            | true, id -> queryOne $"SELECT {columns} FROM fsnix.users WHERE id = @id" "id" (box id) cancellationToken
+            | true, id ->
+                task {
+                    let! row =
+                        selectTask db {
+                            for persisted in fsnix.users do
+                                where (persisted.id = id)
+                                select persisted
+                                tryHead
+                                cancel cancellationToken
+                        }
+
+                    return row |> Option.map userFromRow |> Option.defaultValue null
+                }
             | false, _ -> Task.FromResult null
 
         member _.FindByNameAsync(normalizedUserName, cancellationToken) =
             cancellationToken.ThrowIfCancellationRequested()
 
-            queryOne
-                $"SELECT {columns} FROM fsnix.users WHERE normalized_username = @normalized_username"
-                "normalized_username"
-                (box normalizedUserName)
-                cancellationToken
+            task {
+                let! row =
+                    selectTask db {
+                        for persisted in fsnix.users do
+                            where (persisted.normalized_username = normalizedUserName)
+                            select persisted
+                            tryHead
+                            cancel cancellationToken
+                    }
+
+                return row |> Option.map userFromRow |> Option.defaultValue null
+            }
 
         member _.GetUserIdAsync(user, cancellationToken) =
             checkUser user cancellationToken
@@ -383,11 +323,18 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
         member _.FindByEmailAsync(normalizedEmail, cancellationToken) =
             cancellationToken.ThrowIfCancellationRequested()
 
-            queryOne
-                $"SELECT {columns} FROM fsnix.users WHERE normalized_email = @normalized_email"
-                "normalized_email"
-                (box normalizedEmail)
-                cancellationToken
+            task {
+                let! row =
+                    selectTask db {
+                        for persisted in fsnix.users do
+                            where (persisted.normalized_email = normalizedEmail)
+                            select persisted
+                            tryHead
+                            cancel cancellationToken
+                    }
+
+                return row |> Option.map userFromRow |> Option.defaultValue null
+            }
 
         member _.GetNormalizedEmailAsync(user, cancellationToken) =
             checkUser user cancellationToken
@@ -447,27 +394,24 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
             task {
                 checkUser user cancellationToken
                 let submittedHash = hashRecoveryCode code
-                use! connection = dataSource.OpenConnectionAsync cancellationToken
-                use! transaction = connection.BeginTransactionAsync cancellationToken
+                use! context = db.OpenContextAsync()
+                use! transaction = context.Connection.BeginTransactionAsync cancellationToken
+                context.Transaction <- Some transaction
 
-                use selectCommand =
-                    new NpgsqlCommand(
-                        """
-                        SELECT value
-                        FROM fsnix.user_tokens
-                        WHERE user_id = @user_id AND login_provider = @provider AND name = @name
-                        FOR UPDATE
-                        """,
-                        connection,
-                        transaction
-                    )
+                let lockQuery =
+                    select {
+                        for token in fsnix.user_tokens do
+                            where (
+                                token.user_id = user.Id
+                                && token.login_provider = authenticationProvider
+                                && token.name = recoveryCodesName
+                            )
 
-                selectCommand.Parameters.AddWithValue("user_id", user.Id) |> ignore
+                            select token.value
+                    }
 
-                selectCommand.Parameters.AddWithValue("provider", authenticationProvider)
-                |> ignore
-
-                selectCommand.Parameters.AddWithValue("name", recoveryCodesName) |> ignore
+                use selectCommand = context.BuildCommand(lockQuery.IR)
+                selectCommand.CommandText <- selectCommand.CommandText.TrimEnd(';') + " FOR UPDATE"
                 let! storedValue = selectCommand.ExecuteScalarAsync cancellationToken
 
                 let codes =
@@ -479,30 +423,27 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 match codes |> Array.tryFindIndex (fixedTimeEqual submittedHash) with
                 | None ->
                     do! transaction.CommitAsync cancellationToken
+                    context.Transaction <- None
                     return false
                 | Some index ->
                     let remaining = codes |> Array.removeAt index |> String.concat ";"
 
-                    use updateCommand =
-                        new NpgsqlCommand(
-                            """
-                            UPDATE fsnix.user_tokens
-                            SET value = @value
-                            WHERE user_id = @user_id AND login_provider = @provider AND name = @name
-                            """,
-                            connection,
-                            transaction
-                        )
+                    let! _ =
+                        updateTask context {
+                            for token in fsnix.user_tokens do
+                                set token.value remaining
 
-                    updateCommand.Parameters.AddWithValue("value", remaining) |> ignore
-                    updateCommand.Parameters.AddWithValue("user_id", user.Id) |> ignore
+                                where (
+                                    token.user_id = user.Id
+                                    && token.login_provider = authenticationProvider
+                                    && token.name = recoveryCodesName
+                                )
 
-                    updateCommand.Parameters.AddWithValue("provider", authenticationProvider)
-                    |> ignore
+                                cancel cancellationToken
+                        }
 
-                    updateCommand.Parameters.AddWithValue("name", recoveryCodesName) |> ignore
-                    let! _ = updateCommand.ExecuteNonQueryAsync cancellationToken
                     do! transaction.CommitAsync cancellationToken
+                    context.Transaction <- None
                     return true
             }
 

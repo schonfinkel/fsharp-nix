@@ -1,9 +1,15 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/App/App.fsproj" />
+    <Project Path="src/App.Database/App.Database.fsproj" />
+    <Project Path="src/App.Domain/App.Domain.fsproj" />
     <Project Path="src/App.Migrations/App.Migrations.fsproj" />
+    <Project Path="src/App.Views/App.Views.fsproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/App.Tests/App.Tests.fsproj" />
+    <Project Path="tests/App.DatabaseTests/App.DatabaseTests.fsproj" />
+    <Project Path="tests/App.HttpTests/App.HttpTests.fsproj" />
+    <Project Path="tests/App.Testing/App.Testing.fsproj" />
+    <Project Path="tests/App.UnitTests/App.UnitTests.fsproj" />
   </Folder>
 </Solution>

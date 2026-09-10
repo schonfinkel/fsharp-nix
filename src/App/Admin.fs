@@ -1,110 +1,13 @@
 namespace App
 
 open System
-open System.Globalization
+open App.Domain
+open App.Views
 open Microsoft.AspNetCore.Antiforgery
 open Microsoft.AspNetCore.Http
 open Oxpecker
 open Oxpecker.Htmx
 open Oxpecker.ViewEngine
-
-type AdminFeatureModel =
-    { Current: CurrentDefinition
-      History: HistoryEntry list }
-
-[<RequireQualifiedAccess>]
-module AdminViews =
-    let private timestamp (value: DateTimeOffset option) =
-        match value with
-        | Some value -> value.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'", CultureInfo.InvariantCulture)
-        | None -> "∞"
-
-    let private state (value: bool) = if value then "Enabled" else "Disabled"
-
-    let card (context: HttpContext) (model: AdminFeatureModel) (error: string option) =
-        let name = FeatureFlag.persistedName model.Current.Flag
-
-        let stateClass =
-            if model.Current.Enabled then
-                "card enabled"
-            else
-                "card disabled"
-
-        let future =
-            model.History
-            |> List.filter (fun item -> item.ValidFrom > DateTimeOffset.UtcNow)
-
-        article (id = $"feature-{name}", class' = stateClass) {
-            span (class' = "badge") { state model.Current.Enabled }
-            h2 () { name }
-            p (class' = "muted") { $"Current interval began {timestamp (Some model.Current.ValidFrom)}." }
-
-            for message in Option.toList error do
-                p (class' = "error") { message }
-
-            form(action = $"/admin/features/{name}/schedule", method = "post")
-                .hxPost($"/admin/features/{name}/schedule")
-                .hxTarget($"#feature-{name}")
-                .hxSwap("outerHTML")
-                .hxStatus("422", $"swap:outerHTML target:#feature-{name}")
-                .hxStatus ("409", $"swap:outerHTML target:#feature-{name}") {
-                context.GetAntiforgeryInput()
-                label (for' = $"enabled-{name}") { "New state" }
-                input (type' = "checkbox", id = $"enabled-{name}", name = "enabled", value = "true")
-                label (for' = $"effective-{name}") { "Effective at (UTC; blank means now)" }
-                input (type' = "datetime-local", id = $"effective-{name}", name = "effectiveAt")
-                div (class' = "schedule-actions") { button (type' = "submit") { "Schedule change" } }
-            }
-
-            h3 (class' = "section-heading") { "Future schedule" }
-
-            if List.isEmpty future then
-                p (class' = "muted") { "No future changes." }
-            else
-                ul () {
-                    for item in future do
-                        li () { $"{timestamp (Some item.ValidFrom)} — {state item.Enabled}" }
-                }
-
-            h3 (class' = "section-heading") { "History" }
-
-            table () {
-                thead () {
-                    tr () {
-                        th () { "State" }
-                        th () { "From" }
-                        th () { "Until" }
-                    }
-                }
-
-                tbody () {
-                    for item in model.History do
-                        tr () {
-                            td () { state item.Enabled }
-                            td () { timestamp (Some item.ValidFrom) }
-                            td () { timestamp item.ValidTo }
-                        }
-                }
-            }
-        }
-
-    let page (context: HttpContext) (models: AdminFeatureModel list) =
-        let content =
-            Fragment() {
-                p (class' = "badge") { "MFA-PROTECTED ADMIN" }
-                h1 () { "Feature schedule" }
-
-                p (class' = "lede") {
-                    "Each update creates a new closed-open interval. Existing history is append-only and future boundaries are preserved."
-                }
-
-                div (class' = "grid") {
-                    for model in models do
-                        card context model None
-                }
-            }
-
-        Views.layout context "Admin" content
 
 [<RequireQualifiedAccess>]
 module Admin =
@@ -122,50 +25,50 @@ module Admin =
                     return! next context
             }
 
-    let private isHtmx (context: HttpContext) =
-        context.Request.Headers.ContainsKey HxRequestHeader.Request
-
-    let private model (store: IFeatureFlagStore) flag cancellationToken =
+    let private model (store: IFeatureFlagStore) form flag cancellationToken =
         task {
-            let! current = store.GetCurrent(flag, cancellationToken)
-            let! history = store.GetHistory(flag, cancellationToken)
-
-            return current |> Option.map (fun value -> { Current = value; History = history })
+            let! schedule = store.GetSchedule(flag, cancellationToken)
+            return schedule |> Option.map (fun value -> { Schedule = value; Form = form })
         }
 
-    let private writeCard status error flag (context: HttpContext) =
+    let private writeCard status form flag (context: HttpContext) =
         task {
+            Web.noStore context
             context.Response.StatusCode <- status
             let store = context.GetService<IFeatureFlagStore>()
-            let! found = model store flag context.RequestAborted
+            let now = context.GetService<TimeProvider>().GetUtcNow()
+            let! found = model store form flag context.RequestAborted
 
             match found with
-            | Some value -> return! context.WriteHtmlView(AdminViews.card context value error)
+            | Some value -> return! context.WriteHtmlView(AdminViews.card context now value)
             | None -> return! context.WriteHtmlView(p (class' = "error") { "Feature flag not found." })
         }
 
     let index: EndpointHandler =
         fun context ->
             task {
+                Web.noStore context
+                Web.varyHtmx context
                 let store = context.GetService<IFeatureFlagStore>()
+                let now = context.GetService<TimeProvider>().GetUtcNow()
 
                 let! models =
                     FeatureFlag.all
-                    |> List.map (fun flag -> model store flag context.RequestAborted)
+                    |> List.map (fun flag -> model store AdminViews.emptyForm flag context.RequestAborted)
                     |> System.Threading.Tasks.Task.WhenAll
 
                 let existing = models |> Array.choose id |> Array.toList
 
-                if isHtmx context then
+                if Web.isHtmx context then
                     return!
                         context.WriteHtmlView(
                             Fragment() {
                                 for item in existing do
-                                    AdminViews.card context item None
+                                    AdminViews.card context now item
                             }
                         )
                 else
-                    return! context.WriteHtmlView(AdminViews.page context existing)
+                    return! context.WriteHtmlView(AdminViews.page context now existing)
             }
 
     let featureCard: EndpointHandler =
@@ -175,7 +78,7 @@ module Admin =
                 | None ->
                     context.Response.StatusCode <- StatusCodes.Status404NotFound
                     return! context.WriteHtmlView(p (class' = "error") { "Feature flag not found." })
-                | Some flag -> return! writeCard StatusCodes.Status200OK None flag context
+                | Some flag -> return! writeCard StatusCodes.Status200OK AdminViews.emptyForm flag context
             }
 
     let schedule: EndpointHandler =
@@ -189,44 +92,65 @@ module Admin =
                     let! form = context.Request.ReadFormAsync context.RequestAborted
                     let enabled = form.ContainsKey "enabled"
 
-                    let effectiveAt =
-                        match form.TryGetValue "effectiveAt" with
-                        | true, value when not (String.IsNullOrWhiteSpace(string value)) -> Some(string value)
-                        | _ -> None
+                    let formValue name =
+                        match form.TryGetValue name with
+                        | true, value -> string value
+                        | false, _ -> ""
+
+                    let localEffectiveAt = formValue "effectiveAtLocal"
+                    let effectiveAt = formValue "effectiveAt"
+
+                    let timestampToParse =
+                        if
+                            String.IsNullOrWhiteSpace effectiveAt
+                            && not (String.IsNullOrWhiteSpace localEffectiveAt)
+                        then
+                            localEffectiveAt
+                        else
+                            effectiveAt
+
+                    let displayedEffectiveAt =
+                        if String.IsNullOrWhiteSpace localEffectiveAt then
+                            effectiveAt
+                        else
+                            localEffectiveAt
+
+                    let submitted error =
+                        { Enabled = enabled
+                          EffectiveAt = displayedEffectiveAt
+                          Error = Some error }
 
                     let now = context.GetService<TimeProvider>().GetUtcNow()
 
-                    match Scheduling.parseEffectiveTime now effectiveAt with
+                    match Scheduling.parseEffectiveTime now (Some timestampToParse) with
                     | Error EffectiveTimeIsInPast ->
                         return!
                             writeCard
                                 StatusCodes.Status422UnprocessableEntity
-                                (Some "The effective time cannot be in the past.")
+                                (submitted "The effective time cannot be in the past.")
                                 flag
                                 context
                     | Error(InvalidEffectiveTime _) ->
                         return!
                             writeCard
                                 StatusCodes.Status422UnprocessableEntity
-                                (Some "Enter a valid UTC date and time.")
+                                (submitted "Enter a valid local date and time.")
                                 flag
                                 context
-                    | Error(UnknownFlag _) ->
-                        context.Response.StatusCode <- StatusCodes.Status404NotFound
-                        return! context.WriteHtmlView(p (class' = "error") { "Feature flag not found." })
                     | Ok effectiveTime ->
                         let change =
                             { Flag = flag
-                              Enabled = enabled
+                              State = FeatureState.ofBool enabled
                               EffectiveTime = effectiveTime }
 
                         let store = context.GetService<IFeatureFlagStore>()
                         let! result = Workflow.schedule store now change context.RequestAborted
 
                         match result with
-                        | Ok() ->
+                        | Ok Changed ->
                             context.Response.Headers[HxResponseHeader.Trigger] <- "feature-change"
-                            return! writeCard StatusCodes.Status200OK None flag context
+                            return! writeCard StatusCodes.Status200OK AdminViews.emptyForm flag context
+                        | Ok Unchanged -> return! writeCard StatusCodes.Status200OK AdminViews.emptyForm flag context
                         | Error FlagNotFound ->
                             context.Response.StatusCode <- StatusCodes.Status404NotFound
                             return! context.WriteHtmlView(p (class' = "error") { "Feature flag not found." })
@@ -234,17 +158,7 @@ module Admin =
                             return!
                                 writeCard
                                     StatusCodes.Status409Conflict
-                                    (Some "That time is a gap or an existing schedule boundary.")
-                                    flag
-                                    context
-                        | Error(DatabaseFailure _) ->
-                            context.Response.StatusCode <- StatusCodes.Status500InternalServerError
-                            return! context.WriteHtmlView(p (class' = "error") { "The change could not be saved." })
-                        | Error(ValidationFailure _) ->
-                            return!
-                                writeCard
-                                    StatusCodes.Status422UnprocessableEntity
-                                    (Some "The submitted schedule is invalid.")
+                                    (submitted "That time is a gap or an existing schedule boundary.")
                                     flag
                                     context
             }

@@ -2,11 +2,15 @@ namespace App.Tests
 
 open System
 open System.Collections.Generic
+open System.IO
 open System.Net
 open System.Net.Http
 open System.Security.Cryptography
 open System.Text.RegularExpressions
 open App
+open App.Database
+open App.Domain
+open Expecto
 open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Identity
 open Microsoft.AspNetCore.Mvc.Testing
@@ -15,27 +19,29 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.DependencyInjection.Extensions
 open Microsoft.FeatureManagement
 open Npgsql
-open Xunit
 
-type IdentityAppFactory(connectionString: string, featureStore: FakeFeatureFlagStore) =
+type IdentityAppFactory(connectionString: string, featureStore: FakeFeatureFlagStore, environmentName: string) =
     inherit WebApplicationFactory<AppMarker>()
 
+    new(connectionString, featureStore) = new IdentityAppFactory(connectionString, featureStore, "Development")
+
     override _.ConfigureWebHost(builder: IWebHostBuilder) =
-        builder.ConfigureServices(fun services ->
-            services.RemoveAll<NpgsqlDataSource>() |> ignore
+        builder
+            .UseEnvironment(environmentName)
+            .UseContentRoot(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../src/App")))
+            .ConfigureServices(fun services ->
+                services.RemoveAll<NpgsqlDataSource>() |> ignore
 
-            services.AddSingleton<NpgsqlDataSource>(fun _ -> NpgsqlDataSource.Create connectionString)
-            |> ignore
+                services.AddSingleton<NpgsqlDataSource>(fun _ -> NpgsqlDataSource.Create connectionString)
+                |> ignore
 
-            services.AddSingleton<IFeatureFlagStore>(featureStore :> IFeatureFlagStore)
-            |> ignore
+                services.AddSingleton<IFeatureFlagStore>(featureStore :> IFeatureFlagStore)
+                |> ignore
 
-            services.AddSingleton<IFeatureDefinitionProvider, DatabaseFeatureDefinitionProvider>()
-            |> ignore)
+                services.AddSingleton<IFeatureDefinitionProvider, DatabaseFeatureDefinitionProvider>()
+                |> ignore)
         |> ignore
 
-[<Collection("postgres")>]
-[<Trait("Category", "Integration")>]
 type AuthHttpTests(fixture: PostgreSqlFixture) =
     let decodeBase32 (value: string) =
         let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
@@ -107,7 +113,6 @@ type AuthHttpTests(fixture: PostgreSqlFixture) =
             return user
         }
 
-    [<Fact>]
     member _.``bootstrap creates one account and rejects missing or duplicate configuration``() =
         task {
             do! reset ()
@@ -145,7 +150,6 @@ type AuthHttpTests(fixture: PostgreSqlFixture) =
             Assert.Equal(Error "Bootstrap__Username, Bootstrap__Email, and Bootstrap__Password are required.", missing)
         }
 
-    [<Fact>]
     member _.``repeated password failures lock the account without revealing why``() =
         task {
             do! reset ()
@@ -188,7 +192,6 @@ type AuthHttpTests(fixture: PostgreSqlFixture) =
             Assert.True(persisted.LockoutEnd.Value > DateTimeOffset.UtcNow)
         }
 
-    [<Fact>]
     member _.``password session must enroll TOTP before feature administration``() =
         task {
             do! reset ()
@@ -269,6 +272,37 @@ type AuthHttpTests(fixture: PostgreSqlFixture) =
             let! secondPasswordLogin = postForm client "/account/login" secondLoginFields
             Assert.Equal(HttpStatusCode.Redirect, secondPasswordLogin.StatusCode)
             Assert.Contains("/account/login/2fa", secondPasswordLogin.Headers.Location.OriginalString)
+
+            let displayedAuthenticatorKey =
+                authenticatorKey.ToLowerInvariant()
+                |> Seq.chunkBySize 4
+                |> Seq.map String
+                |> String.concat " "
+
+            let! developmentTwoFactorPage = client.GetStringAsync "/account/login/2fa"
+            Assert.Contains("Development authenticator key:", developmentTwoFactorPage)
+            Assert.Contains(displayedAuthenticatorKey, developmentTwoFactorPage)
+            Assert.Contains("Run make totp", developmentTwoFactorPage)
+
+            use productionFactory =
+                new IdentityAppFactory(fixture.ConnectionString, FakeFeatureFlagStore(), "Production")
+
+            use productionClient =
+                productionFactory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            let! productionLoginPage = productionClient.GetStringAsync "/account/login"
+            let productionLoginFields = Dictionary<string, string>()
+            productionLoginFields["email"] <- user.Email
+            productionLoginFields["password"] <- "Correct-Horse-42!"
+            productionLoginFields["returnUrl"] <- "/admin/features"
+            productionLoginFields["__RequestVerificationToken"] <- csrf productionLoginPage
+            let! productionLogin = postForm productionClient "/account/login" productionLoginFields
+            Assert.Equal(HttpStatusCode.Redirect, productionLogin.StatusCode)
+            Assert.Contains("/account/login/2fa", productionLogin.Headers.Location.OriginalString)
+
+            let! productionTwoFactorPage = productionClient.GetStringAsync "/account/login/2fa"
+            Assert.DoesNotContain("Development authenticator key:", productionTwoFactorPage)
+            Assert.DoesNotContain(displayedAuthenticatorKey, productionTwoFactorPage)
 
             let! recoveryLoginPage = client.GetStringAsync "/account/login/recovery?returnUrl=%2Fadmin%2Ffeatures"
             let recoveryFields = Dictionary<string, string>()

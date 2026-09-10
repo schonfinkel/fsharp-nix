@@ -4,9 +4,13 @@
 [![[.Net] Build & Test](https://github.com/mtrsk/fsharp-nix/actions/workflows/build.yml/badge.svg)](https://github.com/mtrsk/fsharp-nix/actions/workflows/build.yml)
 [![[Nix] Build Container](https://github.com/mtrsk/fsharp-nix/actions/workflows/build-container.yml/badge.svg)](https://github.com/mtrsk/fsharp-nix/actions/workflows/build-container.yml)
 
-This .NET 10 sample stores time-bounded feature definitions in PostgreSQL 18, evaluates them through `Microsoft.FeatureManagement`, and renders full pages and HTMX 4 fragments with Oxpecker.
+This .NET 10 sample stores time-bounded feature definitions in PostgreSQL, evaluates them through `Microsoft.FeatureManagement`, and renders full pages and HTMX 4 fragments with Oxpecker.
 
-The MFA-protected admin can apply a flag immediately or schedule it for a future UTC time while retaining the complete interval history. Authentication uses ASP.NET Core Identity with a custom Npgsql store, TOTP, and single-use recovery codes. Multi-step bootstrap and authenticator state transitions use `FsToolkit.ErrorHandling` task results to short-circuit failures explicitly.
+- The MFA-protected admin can apply a flag immediately or schedule it for a future time in the browser's local time zone while retaining the complete interval history.\
+- Authentication uses ASP.NET Core Identity with a custom Npgsql store, TOTP, and single-use recovery codes. 
+- Multi-step bootstrap and authenticator state transitions use `FsToolkit.ErrorHandling` task results to short-circuit failures explicitly.
+
+The demo and admin feature cards stay current through HTMX 4 server-sent events. Scheduling publishes a PostgreSQL notification, and each event stream also waits for the next persisted temporal boundary before telling the cards to refresh. PostgreSQL is queried directly as the cross-instance source of truth; there is no process-local feature cache to invalidate.
 
 ## Development
 
@@ -46,6 +50,8 @@ Open <http://localhost:5000/> for the demo or <http://localhost:5000/admin/featu
 
 Authenticator setup renders an `otpauth://` QR code with the locally vendored [QRCode.js 1.0.0](https://github.com/davidshimjs/qrcodejs) asset. Recovery codes are shown once, stored only as SHA-256 hashes, and atomically consumed. Authenticator reset and recovery-code regeneration require a session carrying the `amr=mfa` claim; password-only sessions cannot administer features or weaken MFA.
 
+For local testing without an authenticator app, run `make totp`, paste the manual authenticator key when prompted, and enter the generated six-digit code in the application. Treat the key as a password and never commit it.
+
 The application defaults to the `Development` .NET environment. Set `DOTNET_ENVIRONMENT=Production` in production. Serve the application over HTTPS and persist ASP.NET Core Data Protection keys when running more than one instance or replacing instances.
 
 ## Build and test
@@ -54,34 +60,14 @@ The existing solution is `fsnix.slnx`:
 
 ```sh
 dotnet build fsnix.slnx
-dotnet test fsnix.slnx
+make test
 ```
 
-Run the suites independently with `make test-unit` or `make test-integration`. PostgreSQL integration tests use the already-running devenv server and recreate dedicated `fsnix_tests` and `fsnix_tests_production` databases. The local `fsnix` role has `CREATEDB` solely so the fixture can provision those databases; tests do not start containers. The authentication tests exercise bootstrap, lockout, password login, TOTP enrollment, MFA authorization, recovery login, one-time recovery-code redemption and regeneration, and authenticator reset through the real HTTP and PostgreSQL stack.
+Tests use Expecto 11 and are split into focused executable projects. Run the suites independently with `make test-unit`, `make test-database`, or `make test-http`; `make test-integration` depends on the latter two. The Make targets form an independent dependency graph, so `make -j3 test` can run all three executables concurrently when desired. Additional Expecto arguments can be passed after `--` to any test project, such as `dotnet run --project tests/App.DatabaseTests/App.DatabaseTests.fsproj -- --filter scheduling`.
 
-## Migrations and generated database types
+`App.UnitTests` contains fast domain/application/view tests, `App.DatabaseTests` exercises persistence and migrations, `App.HttpTests` covers the real HTTP/htmx and authentication stack, and `App.Testing` contains shared fakes, assertions, and database fixtures. PostgreSQL integration cases use the already-running devenv server. Every case creates a uniquely named database, runs independently in parallel within its executable, and drops its database afterward. The local `fsnix` role has `CREATEDB` solely so the test fixture can provision those databases; tests do not start containers. The authentication tests exercise bootstrap, lockout, password login, TOTP enrollment, MFA authorization, recovery login, one-time recovery-code redemption and regeneration, and authenticator reset through the real HTTP and PostgreSQL stack.
 
-SQL migrations live in `src/App.Migrations/Migrations` and are embedded in the separate `App.Migrations` assembly. Application startup, bootstrap, `App --migrate`, and the integration fixture all call the same DbUp migrator under a PostgreSQL advisory lock. Migration directories have distinct behavior:
-
-- `init` runs once, before every other category.
-- `main` runs once after `init`.
-- `test` runs once after `main`, but only when the .NET environment is `Development`.
-- `repeatable` runs last. DbUp uses `NullJournal` for these scripts, while a separate SHA-256 state table prevents execution when the embedded SQL has not changed.
-
-All application objects, including DbUp's `schemaversions` journal, live in the `fsnix` schema. The one-time categories share that journal. Put extensions and migration infrastructure in `init`, application tables in `main`, development-only fixtures in `test`, and idempotent objects such as `CREATE OR REPLACE VIEW` statements in `repeatable`.
-
-Static application CSS and JavaScript live under `wwwroot/style` and `wwwroot/js`; F# views only reference those assets.
-
-Application tables deliberately contain no nullable columns. Empty optional text and JSON values use `''` and `'{}'`, lockout absence uses PostgreSQL `-infinity`, and open-ended temporal ranges use explicit `timestamptz 'infinity'`. Projection views translate those storage sentinels back into optional application values.
-
-This refactor intentionally rewrites and relocates the original migrations instead of adding a compatibility migration. Recreate databases made with the previous migration layout before starting this version.
-
-`src/App/Database.Generated.fs` is committed so builds do not require a live database. After changing the scalar projection views, regenerate it against the migrated devenv database:
-
-```sh
-dotnet tool restore
-dotnet sqlhydra npgsql -t sqlhydra.toml -p src/App/App.fsproj
-```
+`make schema-check` regenerates into the workspace temporarily, compares it with the checked-in output, and restores the original files. It fails when the live migrated schema and generated contract differ. Normal compilation does not connect to PostgreSQL; it compiles against the checked-in generated file.
 
 ## Nix packaging
 

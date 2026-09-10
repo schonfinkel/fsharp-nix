@@ -1,16 +1,25 @@
 [general]
 connection = "Host=127.0.0.1;Port=5432;Database=fsnix;Username=fsnix;Password=fsnix"
 output = "Database.Generated.fs"
-namespace = "App.Database"
+namespace = "App.Database.Schema"
 cli_mutable = false
 
 [sqlhydra_query_integration]
 provider_db_type_attributes = true
 table_declarations = true
+left_joined_views = false
+
+[extensions]
+type_mappings = [ "App.Database" ]
 
 [filters]
 include = [
   "fsnix/current_feature_flag_definitions",
-  "fsnix/feature_flag_history"
+  "fsnix/feature_flag_history",
+  "fsnix/feature_flag_intervals",
+  "fsnix/feature_flags",
+  "fsnix/next_feature_flag_boundary",
+  "fsnix/users",
+  "fsnix/user_tokens"
 ]
 exclude = []

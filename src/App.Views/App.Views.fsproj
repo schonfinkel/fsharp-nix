@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Oxpecker" Version="2.1.1" />
+    <PackageReference Include="Oxpecker.Htmx" Version="4.0.0" />
+    <PackageReference Include="Oxpecker.ViewEngine" Version="2.1.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Models.fs" />
+    <Compile Include="Shared.fs" />
+    <Compile Include="Demo.fs" />
+    <Compile Include="Account.fs" />
+    <Compile Include="Admin.fs" />
+  </ItemGroup>
+</Project>

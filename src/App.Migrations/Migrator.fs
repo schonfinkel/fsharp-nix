@@ -63,11 +63,7 @@ module Migrator =
         (scripts: SqlScript array)
         =
         let builder =
-            DeployChanges.To
-                .PostgresqlDatabase(connectionString)
-                .WithScripts(scripts)
-                .WithTransaction()
-                .LogToConsole()
+            DeployChanges.To.PostgresqlDatabase(connectionString).WithScripts(scripts).WithTransaction().LogToConsole()
 
         let configured =
             match journal with
@@ -167,6 +163,10 @@ module Migrator =
 
         oneTimeResult |> Result.bind (fun () -> runRepeatables connectionString)
 
+    let private ensureSchema (connection: NpgsqlConnection) =
+        use command = new NpgsqlCommand($"CREATE SCHEMA IF NOT EXISTS {Schema}", connection)
+        command.ExecuteNonQuery() |> ignore
+
     let migrate (connectionString: string) (environmentName: string) : Result<unit, MigrationFailure> =
         if String.IsNullOrWhiteSpace connectionString then
             Error
@@ -183,6 +183,9 @@ module Migrator =
                 acquireLock.ExecuteNonQuery() |> ignore
 
                 try
+                    // DbUp creates its journal before executing the first migration, so the
+                    // journal's schema must already exist on a fresh database.
+                    ensureSchema migrationLock
                     runStages connectionString environmentName
                 finally
                     use releaseLock =

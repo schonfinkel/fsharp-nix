@@ -7,19 +7,20 @@
     <PackageReference Include="FsToolkit.ErrorHandling" Version="4.18.0" />
     <PackageReference Include="FsToolkit.ErrorHandling.TaskResult" Version="4.18.0" />
     <PackageReference Include="Microsoft.FeatureManagement.AspNetCore" Version="4.5.0" />
-    <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="Oxpecker" Version="2.1.1" />
     <PackageReference Include="Oxpecker.Htmx" Version="4.0.0" />
     <PackageReference Include="Oxpecker.ViewEngine" Version="2.1.0" />
-    <PackageReference Include="SqlHydra.Query" Version="3.4.0" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
+    <ProjectReference Include="..\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\App.Migrations\App.Migrations.fsproj" />
+    <ProjectReference Include="..\App.Views\App.Views.fsproj" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Database.Generated.fs" />
     <Compile Include="FeatureFlags.fs" />
-    <Compile Include="IdentityStore.fs" />
+    <Compile Include="FeatureEvents.fs" />
+    <Compile Include="Web.fs" />
     <Compile Include="Demo.fs" />
     <Compile Include="Account.fs" />
     <Compile Include="Bootstrap.fs" />

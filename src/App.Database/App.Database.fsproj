@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="SqlHydra.Query" Version="5.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="SchemaTypeMappings.fs" />
+    <Compile Include="Database.Generated.fs">
+      <Visible>False</Visible>
+    </Compile>
+    <Compile Include="FeatureFlagStore.fs" />
+    <Compile Include="FeatureChangeSource.fs" />
+    <Compile Include="IdentityStore.fs" />
+    <Compile Include="Services.fs" />
+  </ItemGroup>
+</Project>

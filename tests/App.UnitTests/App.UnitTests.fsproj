@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="UnitTests.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Expecto" Version="11.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\App\App.fsproj" />
+    <ProjectReference Include="..\..\src\App.Database\App.Database.fsproj" />
+    <ProjectReference Include="..\..\src\App.Domain\App.Domain.fsproj" />
+    <ProjectReference Include="..\..\src\App.Views\App.Views.fsproj" />
+    <ProjectReference Include="..\App.Testing\App.Testing.fsproj" />
+  </ItemGroup>
+
+</Project>
