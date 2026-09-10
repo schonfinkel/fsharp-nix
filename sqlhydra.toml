@@ -10,7 +10,7 @@ table_declarations = true
 
 [filters]
 include = [
-  "public/current_feature_flag_definitions",
-  "public/feature_flag_history"
+  "fsnix/current_feature_flag_definitions",
+  "fsnix/feature_flag_history"
 ]
 exclude = []

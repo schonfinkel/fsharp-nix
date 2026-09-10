@@ -1,4 +1,4 @@
-CREATE TABLE feature_flags (
+CREATE TABLE fsnix.feature_flags (
     name text NOT NULL,
     enabled boolean NOT NULL DEFAULT FALSE,
     filter_name text NOT NULL DEFAULT '',
@@ -9,12 +9,12 @@ CREATE TABLE feature_flags (
     CONSTRAINT feature_flags_pkey PRIMARY KEY (name, valid_during WITHOUT OVERLAPS)
 );
 
-CREATE INDEX feature_flags_name_idx ON feature_flags (name);
+CREATE INDEX feature_flags_name_idx ON fsnix.feature_flags (name);
 
 WITH migration_time AS (
     SELECT
         CURRENT_TIMESTAMP AS value)
-INSERT INTO feature_flags (name, enabled, filter_name, filter_parameters, valid_during)
+INSERT INTO fsnix.feature_flags (name, enabled, filter_name, filter_parameters, valid_during)
 SELECT
     name,
     enabled,
@@ -26,4 +26,3 @@ FROM
     CROSS JOIN (
         VALUES ('NewDashboard', FALSE),
             ('BetaCheckout', FALSE)) AS seeds (name, enabled);
-

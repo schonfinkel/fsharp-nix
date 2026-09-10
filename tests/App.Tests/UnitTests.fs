@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open App
+open Microsoft.AspNetCore.Identity
 open Microsoft.Extensions.Caching.Memory
 open Oxpecker.ViewEngine
 open Xunit
@@ -102,6 +103,20 @@ type FakeFeatureFlagStore(?scheduleFailure: StoreFailure) =
                 Task.FromResult(Ok())
 
 module UnitTests =
+    [<Fact>]
+    let ``development login password hash is valid`` () =
+        let hash =
+            "AQAAAAEAAYagAAAAEMoYqa1WkeGpOvW4HJDH1tdTStebCy7kT1nExUm64FaEi8kJttez9rCwS/lgnNHW8w=="
+
+        let result =
+            PasswordHasher<ApplicationUser>().VerifyHashedPassword(
+                ApplicationUser(),
+                hash,
+                "Test-Operator-42!"
+            )
+
+        Assert.NotEqual(PasswordVerificationResult.Failed, result)
+
     [<Fact>]
     let ``persisted feature names round trip explicitly`` () =
         for flag in FeatureFlag.all do

@@ -5,7 +5,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open App.Database
-open App.Database.``public``
+open App.Database.fsnix
 open Microsoft.Extensions.Caching.Memory
 open Microsoft.FeatureManagement
 open Npgsql
@@ -200,7 +200,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
 
                 use command =
                     new NpgsqlCommand(
-                        $"SELECT {currentColumns} FROM current_feature_flag_definitions WHERE name = @name",
+                        $"SELECT {currentColumns} FROM fsnix.current_feature_flag_definitions WHERE name = @name",
                         connection
                     )
 
@@ -222,7 +222,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
 
                 use command =
                     new NpgsqlCommand(
-                        $"SELECT {currentColumns} FROM current_feature_flag_definitions ORDER BY name",
+                        $"SELECT {currentColumns} FROM fsnix.current_feature_flag_definitions ORDER BY name",
                         connection
                     )
 
@@ -247,7 +247,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
 
                 use command =
                     new NpgsqlCommand(
-                        $"SELECT {currentColumns} FROM feature_flag_history WHERE name = @name ORDER BY valid_from DESC",
+                        $"SELECT {currentColumns} FROM fsnix.feature_flag_history WHERE name = @name ORDER BY valid_from DESC",
                         connection
                     )
 
@@ -280,7 +280,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
                         new NpgsqlCommand(
                             """
                             SELECT lower(valid_during), upper(valid_during)
-                            FROM feature_flags
+                            FROM fsnix.feature_flags
                             WHERE name = @name AND valid_during @> @effective_at
                             FOR UPDATE
                             """,
@@ -298,7 +298,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
 
                         use exists =
                             new NpgsqlCommand(
-                                "SELECT EXISTS (SELECT 1 FROM feature_flags WHERE name = @name)",
+                                "SELECT EXISTS (SELECT 1 FROM fsnix.feature_flags WHERE name = @name)",
                                 connection,
                                 transaction
                             )
@@ -324,7 +324,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
                             use shorten =
                                 new NpgsqlCommand(
                                     """
-                                    UPDATE feature_flags
+                                    UPDATE fsnix.feature_flags
                                     SET valid_during = tstzrange(lower(valid_during), @effective_at, '[)')
                                     WHERE name = @name AND lower(valid_during) = @lower_bound
                                     """,
@@ -344,7 +344,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
                                 use insert =
                                     new NpgsqlCommand(
                                         """
-                                        INSERT INTO feature_flags
+                                        INSERT INTO fsnix.feature_flags
                                             (name, enabled, filter_name, filter_parameters, valid_during)
                                         VALUES
                                             (@name, @enabled, '', '{}'::JSONB,

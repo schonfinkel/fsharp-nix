@@ -8,6 +8,7 @@ open Npgsql
 open Xunit
 
 [<Collection("postgres")>]
+[<Trait("Category", "Integration")>]
 type IdentityStoreTests(fixture: PostgreSqlFixture) =
     let reset () =
         task {

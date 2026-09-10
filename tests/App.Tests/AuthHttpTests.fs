@@ -35,6 +35,7 @@ type IdentityAppFactory(connectionString: string, featureStore: FakeFeatureFlagS
         |> ignore
 
 [<Collection("postgres")>]
+[<Trait("Category", "Integration")>]
 type AuthHttpTests(fixture: PostgreSqlFixture) =
     let decodeBase32 (value: string) =
         let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"

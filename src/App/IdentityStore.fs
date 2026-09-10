@@ -132,7 +132,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
             if isNull value then
                 use command =
                     new NpgsqlCommand(
-                        "DELETE FROM user_tokens WHERE user_id = @user_id AND login_provider = @provider AND name = @name",
+                        "DELETE FROM fsnix.user_tokens WHERE user_id = @user_id AND login_provider = @provider AND name = @name",
                         connection
                     )
 
@@ -145,7 +145,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 use command =
                     new NpgsqlCommand(
                         """
-                        INSERT INTO user_tokens (user_id, login_provider, name, value)
+                        INSERT INTO fsnix.user_tokens (user_id, login_provider, name, value)
                         VALUES (@user_id, @provider, @name, @value)
                         ON CONFLICT (user_id, login_provider, name)
                         DO UPDATE SET value = EXCLUDED.value
@@ -168,7 +168,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
 
             use command =
                 new NpgsqlCommand(
-                    "SELECT value FROM user_tokens WHERE user_id = @user_id AND login_provider = @provider AND name = @name",
+                    "SELECT value FROM fsnix.user_tokens WHERE user_id = @user_id AND login_provider = @provider AND name = @name",
                     connection
                 )
 
@@ -215,7 +215,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 use command =
                     new NpgsqlCommand(
                         """
-                        INSERT INTO users
+                        INSERT INTO fsnix.users
                             (id, username, normalized_username, email, normalized_email, email_confirmed,
                              password_hash, two_factor_enabled, security_stamp, concurrency_stamp,
                              lockout_end, lockout_enabled, access_failed_count)
@@ -247,7 +247,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 use command =
                     new NpgsqlCommand(
                         """
-                        UPDATE users
+                        UPDATE fsnix.users
                         SET username = @username,
                             normalized_username = @normalized_username,
                             email = @email,
@@ -289,7 +289,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
 
                 use command =
                     new NpgsqlCommand(
-                        "DELETE FROM users WHERE id = @id AND concurrency_stamp = @concurrency_stamp",
+                        "DELETE FROM fsnix.users WHERE id = @id AND concurrency_stamp = @concurrency_stamp",
                         connection
                     )
 
@@ -311,14 +311,14 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
             cancellationToken.ThrowIfCancellationRequested()
 
             match Guid.TryParse userId with
-            | true, id -> queryOne $"SELECT {columns} FROM users WHERE id = @id" "id" (box id) cancellationToken
+            | true, id -> queryOne $"SELECT {columns} FROM fsnix.users WHERE id = @id" "id" (box id) cancellationToken
             | false, _ -> Task.FromResult null
 
         member _.FindByNameAsync(normalizedUserName, cancellationToken) =
             cancellationToken.ThrowIfCancellationRequested()
 
             queryOne
-                $"SELECT {columns} FROM users WHERE normalized_username = @normalized_username"
+                $"SELECT {columns} FROM fsnix.users WHERE normalized_username = @normalized_username"
                 "normalized_username"
                 (box normalizedUserName)
                 cancellationToken
@@ -384,7 +384,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
             cancellationToken.ThrowIfCancellationRequested()
 
             queryOne
-                $"SELECT {columns} FROM users WHERE normalized_email = @normalized_email"
+                $"SELECT {columns} FROM fsnix.users WHERE normalized_email = @normalized_email"
                 "normalized_email"
                 (box normalizedEmail)
                 cancellationToken
@@ -454,7 +454,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                     new NpgsqlCommand(
                         """
                         SELECT value
-                        FROM user_tokens
+                        FROM fsnix.user_tokens
                         WHERE user_id = @user_id AND login_provider = @provider AND name = @name
                         FOR UPDATE
                         """,
@@ -486,7 +486,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                     use updateCommand =
                         new NpgsqlCommand(
                             """
-                            UPDATE user_tokens
+                            UPDATE fsnix.user_tokens
                             SET value = @value
                             WHERE user_id = @user_id AND login_provider = @provider AND name = @name
                             """,

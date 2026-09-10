@@ -2,7 +2,7 @@
   description = "F# Development Environment";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
+    nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst";
 
     devenv = {
       url = "github:cachix/devenv";
@@ -177,7 +177,7 @@
               port = 5432;
               listen_addresses = "127.0.0.1";
               initialScript = ''
-                ALTER USER ${app_name} CREATEDB;
+                ALTER USER ${app_name} CREATEDB CREATEROLE;
               '';
             };
 

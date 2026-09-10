@@ -184,18 +184,6 @@ module AccountViews =
                                 div (class' = "actions") { button (type' = "submit") { "Enable 2FA" } }
                             })
 
-                        script () {
-                            raw
-                                """
-                            (() => {
-                              const target = document.getElementById('qr-code');
-                              if (target && window.QRCode) {
-                                target.replaceChildren();
-                                new QRCode(target, { text: target.dataset.url, width: 192, height: 192 });
-                              }
-                            })();
-                            """
-                        }
                     | _ ->
                         p () { "Create an authenticator key to begin enrollment." }
 

@@ -17,6 +17,7 @@ type PostgreSqlFixture() =
     let connectionStringFor database =
         let builder = NpgsqlConnectionStringBuilder baseConnectionString
         builder.Database <- database
+        builder.SearchPath <- Migrator.Schema
         builder.ConnectionString
 
     let testConnectionString = connectionStringFor "fsnix_tests"
@@ -56,6 +57,7 @@ type PostgreSqlCollection() =
     interface ICollectionFixture<PostgreSqlFixture>
 
 [<Collection("postgres")>]
+[<Trait("Category", "Integration")>]
 type PostgresTests(fixture: PostgreSqlFixture) =
     let sameInstant (expected: DateTimeOffset) (actual: DateTimeOffset) =
         abs ((expected - actual).TotalMilliseconds) < 1.
@@ -146,7 +148,7 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                         """
                         SELECT COUNT(*)::TEXT
                         FROM information_schema.columns
-                        WHERE table_schema = 'public'
+                        WHERE table_schema = 'fsnix'
                           AND table_name IN (
                               'feature_flags',
                               'users',

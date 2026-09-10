@@ -9,7 +9,7 @@ module Version =
     let ns = "App.Database"
     SqlHydra.Query.VersionCheck.assertIsCompatible cli ns
 
-module ``public`` =
+module fsnix =
 
     type current_feature_flag_definitions =
         { [<ProviderDbType("Text")>]

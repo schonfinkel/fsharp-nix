@@ -19,7 +19,12 @@ devenv up -d
 
 The shell exports `ConnectionStrings__App` for the local `fsnix` database. The database listens only on `127.0.0.1:5432`; no Docker PostgreSQL instance is used.
 
-Bootstrap the first account, then run the application:
+Development migrations create a manual test account:
+
+- Email: `test.operator@example.test`
+- Password: `Test-Operator-42!`
+
+The account is development-only and must enroll an authenticator on its first login. Alternatively, bootstrap another account, then run the application:
 
 ```sh
 Bootstrap__Username=operator \
@@ -52,7 +57,7 @@ dotnet build fsnix.slnx
 dotnet test fsnix.slnx
 ```
 
-PostgreSQL integration tests use the already-running devenv server and recreate dedicated `fsnix_tests` and `fsnix_tests_production` databases. The local `fsnix` role has `CREATEDB` solely so the fixture can provision those databases; tests do not start containers. The authentication tests exercise bootstrap, lockout, password login, TOTP enrollment, MFA authorization, recovery login, one-time recovery-code redemption and regeneration, and authenticator reset through the real HTTP and PostgreSQL stack.
+Run the suites independently with `make test-unit` or `make test-integration`. PostgreSQL integration tests use the already-running devenv server and recreate dedicated `fsnix_tests` and `fsnix_tests_production` databases. The local `fsnix` role has `CREATEDB` solely so the fixture can provision those databases; tests do not start containers. The authentication tests exercise bootstrap, lockout, password login, TOTP enrollment, MFA authorization, recovery login, one-time recovery-code redemption and regeneration, and authenticator reset through the real HTTP and PostgreSQL stack.
 
 ## Migrations and generated database types
 
@@ -63,7 +68,9 @@ SQL migrations live in `src/App.Migrations/Migrations` and are embedded in the s
 - `test` runs once after `main`, but only when the .NET environment is `Development`.
 - `repeatable` runs last. DbUp uses `NullJournal` for these scripts, while a separate SHA-256 state table prevents execution when the embedded SQL has not changed.
 
-The one-time categories share DbUp's `schemaversions` journal. Put extensions and migration infrastructure in `init`, application tables in `main`, development-only fixtures in `test`, and idempotent objects such as `CREATE OR REPLACE VIEW` statements in `repeatable`.
+All application objects, including DbUp's `schemaversions` journal, live in the `fsnix` schema. The one-time categories share that journal. Put extensions and migration infrastructure in `init`, application tables in `main`, development-only fixtures in `test`, and idempotent objects such as `CREATE OR REPLACE VIEW` statements in `repeatable`.
+
+Static application CSS and JavaScript live under `wwwroot/style` and `wwwroot/js`; F# views only reference those assets.
 
 Application tables deliberately contain no nullable columns. Empty optional text and JSON values use `''` and `'{}'`, lockout absence uses PostgreSQL `-infinity`, and open-ended temporal ranges use explicit `timestamptz 'infinity'`. Projection views translate those storage sentinels back into optional application values.
 

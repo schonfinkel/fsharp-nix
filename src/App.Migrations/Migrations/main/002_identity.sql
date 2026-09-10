@@ -1,4 +1,4 @@
-CREATE TABLE users (
+CREATE TABLE fsnix.users (
     id uuid PRIMARY KEY DEFAULT uuid_generate_v4 (),
     username varchar(256) NOT NULL,
     normalized_username varchar(256) NOT NULL,
@@ -19,11 +19,10 @@ CREATE TABLE users (
     CONSTRAINT ck_users_access_failed_count CHECK (access_failed_count >= 0)
 );
 
-CREATE TABLE user_tokens (
-    user_id uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+CREATE TABLE fsnix.user_tokens (
+    user_id uuid NOT NULL REFERENCES fsnix.users (id) ON DELETE CASCADE,
     login_provider varchar(128) NOT NULL,
     name varchar(128) NOT NULL,
     value text NOT NULL DEFAULT '',
     PRIMARY KEY (user_id, login_provider, name)
 );
-

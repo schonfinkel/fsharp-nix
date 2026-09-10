@@ -72,6 +72,7 @@ type AppFactory(store: FakeFeatureFlagStore, connectionString: string, ?authenti
         |> ignore
 
 [<Collection("postgres")>]
+[<Trait("Category", "Integration")>]
 type HttpTests(fixture: PostgreSqlFixture) =
     let csrf (client: HttpClient) =
         task {

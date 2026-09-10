@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := build
 .DELETE_ON_ERROR:
 
+PROJECT_NAME ?= fsnix
 DOTNET ?= dotnet
 NIX ?= nix
 
@@ -12,7 +13,7 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj)
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.* NuGet.Config)
 
-.PHONY: build test migrate run nix-lock
+.PHONY: build test test-unit test-integration migrate run nix-lock
 
 build:
 	$(DOTNET) build $(SOLUTION)
@@ -20,11 +21,20 @@ build:
 test:
 	$(DOTNET) test $(SOLUTION)
 
+test-unit:
+	$(DOTNET) test $(SOLUTION) --filter 'Category!=Integration'
+
+test-integration:
+	$(DOTNET) test $(SOLUTION) --filter 'Category=Integration'
+
 migrate:
 	$(DOTNET) run --project src/App/App.fsproj -- --migrate
 
 run:
 	$(DOTNET) run --project src/App/App.fsproj
+
+db:
+	PGPASSWORD=${PROJECT_NAME} psql -U ${PROJECT_NAME} ${PROJECT_NAME}
 
 nix-lock: deps.json
 

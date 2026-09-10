@@ -18,6 +18,9 @@ type MigrationFailure =
 
 [<RequireQualifiedAccess>]
 module Migrator =
+    [<Literal>]
+    let Schema = "fsnix"
+
     type private MigrationDirectory =
         | Init
         | Main
@@ -60,12 +63,16 @@ module Migrator =
         (scripts: SqlScript array)
         =
         let builder =
-            DeployChanges.To.PostgresqlDatabase(connectionString).WithScripts(scripts).WithTransaction().LogToConsole()
+            DeployChanges.To
+                .PostgresqlDatabase(connectionString)
+                .WithScripts(scripts)
+                .WithTransaction()
+                .LogToConsole()
 
         let configured =
             match journal with
             | Some value -> builder.JournalTo value
-            | None -> builder
+            | None -> builder.JournalToPostgresqlTable(Schema, "schemaversions")
 
         let result = configured.Build().PerformUpgrade()
 
@@ -90,7 +97,7 @@ module Migrator =
         connection.Open()
 
         use command =
-            new NpgsqlCommand("SELECT script_name, content_hash FROM repeatable_migration_state", connection)
+            new NpgsqlCommand($"SELECT script_name, content_hash FROM {Schema}.repeatable_migration_state", connection)
 
         use reader = command.ExecuteReader()
         let applied = Dictionary<string, string>(StringComparer.Ordinal)
@@ -113,7 +120,7 @@ module Migrator =
             use command =
                 new NpgsqlCommand(
                     """
-                    INSERT INTO repeatable_migration_state (script_name, content_hash, applied_at)
+                    INSERT INTO fsnix.repeatable_migration_state (script_name, content_hash, applied_at)
                     VALUES (@script_name, @content_hash, CURRENT_TIMESTAMP)
                     ON CONFLICT (script_name)
                     DO UPDATE SET content_hash = EXCLUDED.content_hash,

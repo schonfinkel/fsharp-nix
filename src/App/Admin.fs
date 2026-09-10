@@ -53,10 +53,10 @@ module AdminViews =
                 input (type' = "checkbox", id = $"enabled-{name}", name = "enabled", value = "true")
                 label (for' = $"effective-{name}") { "Effective at (UTC; blank means now)" }
                 input (type' = "datetime-local", id = $"effective-{name}", name = "effectiveAt")
-                div (style = "margin-top: .8rem") { button (type' = "submit") { "Schedule change" } }
+                div (class' = "schedule-actions") { button (type' = "submit") { "Schedule change" } }
             }
 
-            h3 (style = "margin-top: 1.3rem") { "Future schedule" }
+            h3 (class' = "section-heading") { "Future schedule" }
 
             if List.isEmpty future then
                 p (class' = "muted") { "No future changes." }
@@ -66,7 +66,7 @@ module AdminViews =
                         li () { $"{timestamp (Some item.ValidFrom)} — {state item.Enabled}" }
                 }
 
-            h3 (style = "margin-top: 1.3rem") { "History" }
+            h3 (class' = "section-heading") { "History" }
 
             table () {
                 thead () {
