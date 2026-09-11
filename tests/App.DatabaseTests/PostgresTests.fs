@@ -4,58 +4,12 @@ open System
 open System.Threading
 open System.Threading.Tasks
 open App
+open App.Database
+open App.Domain
 open App.Migrations
+open Expecto
 open Npgsql
-open Xunit
 
-type PostgreSqlFixture() =
-    let baseConnectionString =
-        Environment.GetEnvironmentVariable "ConnectionStrings__App"
-        |> Option.ofObj
-        |> Option.defaultValue "Host=127.0.0.1;Port=5432;Database=fsnix;Username=fsnix;Password=fsnix"
-
-    let connectionStringFor database =
-        let builder = NpgsqlConnectionStringBuilder baseConnectionString
-        builder.Database <- database
-        builder.ConnectionString
-
-    let testConnectionString = connectionStringFor "fsnix_tests"
-    let productionTestConnectionString = connectionStringFor "fsnix_tests_production"
-
-    member _.ConnectionString = testConnectionString
-    member _.ProductionConnectionString = productionTestConnectionString
-
-    interface IAsyncLifetime with
-        member _.InitializeAsync() =
-            task {
-                let adminBuilder = NpgsqlConnectionStringBuilder baseConnectionString
-                adminBuilder.Database <- "postgres"
-                use connection = new NpgsqlConnection(adminBuilder.ConnectionString)
-                do! connection.OpenAsync()
-
-                NpgsqlConnection.ClearAllPools()
-
-                for commandText in
-                    [ "DROP DATABASE IF EXISTS fsnix_tests WITH (FORCE)"
-                      "DROP DATABASE IF EXISTS fsnix_tests_production WITH (FORCE)"
-                      "CREATE DATABASE fsnix_tests OWNER fsnix"
-                      "CREATE DATABASE fsnix_tests_production OWNER fsnix" ] do
-                    use command = new NpgsqlCommand(commandText, connection)
-                    let! _ = command.ExecuteNonQueryAsync()
-                    ()
-
-                match Migrator.migrate testConnectionString "Development" with
-                | Ok() -> ()
-                | Error failure -> raise (InvalidOperationException(failure.Message, Option.toObj failure.Exception))
-            }
-
-        member _.DisposeAsync() = Task.CompletedTask
-
-[<CollectionDefinition("postgres")>]
-type PostgreSqlCollection() =
-    interface ICollectionFixture<PostgreSqlFixture>
-
-[<Collection("postgres")>]
 type PostgresTests(fixture: PostgreSqlFixture) =
     let sameInstant (expected: DateTimeOffset) (actual: DateTimeOffset) =
         abs ((expected - actual).TotalMilliseconds) < 1.
@@ -99,12 +53,17 @@ type PostgresTests(fixture: PostgreSqlFixture) =
     let reset () =
         execute
             """
-            TRUNCATE feature_flags;
+            TRUNCATE feature_flag_intervals, feature_flags CASCADE;
             WITH seed_time AS (SELECT CURRENT_TIMESTAMP AS value)
-            INSERT INTO feature_flags (name, enabled, valid_during)
-            SELECT name, enabled, tstzrange(seed_time.value, 'infinity'::TIMESTAMPTZ, '[)')
+            INSERT INTO feature_flags (name)
+            SELECT name
+            FROM (VALUES ('NewDashboard'), ('BetaCheckout')) seed(name);
+
+            WITH seed_time AS (SELECT CURRENT_TIMESTAMP AS value)
+            INSERT INTO feature_flag_intervals (feature_name, enabled, valid_during)
+            SELECT name, FALSE, tstzrange(seed_time.value, NULL, '[)')
             FROM seed_time
-            CROSS JOIN (VALUES ('NewDashboard', FALSE), ('BetaCheckout', FALSE)) seed(name, enabled);
+            CROSS JOIN (VALUES ('NewDashboard'), ('BetaCheckout')) seed(name);
             """
 
     let run test =
@@ -113,7 +72,6 @@ type PostgresTests(fixture: PostgreSqlFixture) =
             return! test ()
         }
 
-    [<Fact>]
     member _.``migration seeds current definitions and is idempotent``() =
         run (fun () ->
             task {
@@ -140,39 +98,33 @@ type PostgresTests(fixture: PostgreSqlFixture) =
 
                 Assert.DoesNotContain(journal, fun name -> name.Contains ".repeatable.")
 
-                let! nullableColumns =
+                let! nullableIdentityColumns =
                     queryStrings
                         fixture.ConnectionString
                         """
-                        SELECT COUNT(*)::TEXT
+                        SELECT column_name
                         FROM information_schema.columns
-                        WHERE table_schema = 'public'
-                          AND table_name IN (
-                              'feature_flags',
-                              'users',
-                              'user_tokens',
-                              'repeatable_migration_state',
-                              'development_migration_marker'
-                          )
+                        WHERE table_schema = 'fsnix'
+                          AND table_name = 'users'
                           AND is_nullable = 'YES'
+                        ORDER BY column_name
                         """
 
-                Assert.Equal<string list>([ "0" ], nullableColumns)
+                Assert.Equal<string list>([ "lockout_end"; "password_hash" ], nullableIdentityColumns)
 
                 let! unboundedRanges =
                     queryStrings
                         fixture.ConnectionString
-                        "SELECT COUNT(*)::TEXT FROM feature_flags WHERE upper_inf(valid_during)"
+                        "SELECT COUNT(*)::TEXT FROM feature_flag_intervals WHERE upper_inf(valid_during)"
 
-                Assert.Equal<string list>([ "0" ], unboundedRanges)
+                Assert.Equal<string list>([ "2" ], unboundedRanges)
                 use dataSource = NpgsqlDataSource.Create fixture.ConnectionString
                 let store = PostgresFeatureFlagStore(dataSource) :> IFeatureFlagStore
                 let! definitions = store.GetAllCurrent CancellationToken.None
                 Assert.Equal(2, definitions.Length)
-                Assert.All(definitions, fun definition -> Assert.False definition.Enabled)
+                Assert.All(definitions, fun definition -> Assert.Equal(Disabled, definition.State))
             })
 
-    [<Fact>]
     member _.``production excludes test migrations and still applies repeatables``() =
         task {
             Assert.Equal(Ok(), Migrator.migrate fixture.ProductionConnectionString "Production")
@@ -207,7 +159,6 @@ type PostgresTests(fixture: PostgreSqlFixture) =
             )
         }
 
-    [<Fact>]
     member _.``immediate and future schedules split intervals``() =
         run (fun () ->
             task {
@@ -219,8 +170,8 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                 let! immediate =
                     store.Schedule(
                         { Flag = NewDashboard
-                          Enabled = true
-                          EffectiveTime = Now },
+                          State = Enabled
+                          EffectiveTime = Immediate },
                         now,
                         CancellationToken.None
                     )
@@ -228,20 +179,48 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                 let! scheduled =
                     store.Schedule(
                         { Flag = NewDashboard
-                          Enabled = false
-                          EffectiveTime = At future },
+                          State = Disabled
+                          EffectiveTime = ScheduledAt future },
                         now,
                         CancellationToken.None
                     )
 
-                Assert.Equal(Ok(), immediate)
-                Assert.Equal(Ok(), scheduled)
-                let! history = store.GetHistory(NewDashboard, CancellationToken.None)
+                Assert.Equal(Ok Changed, immediate)
+                Assert.Equal(Ok Changed, scheduled)
+                let! schedule = store.GetSchedule(NewDashboard, CancellationToken.None)
+                let history = schedule.Value.History
                 Assert.Equal(3, history.Length)
-                Assert.Contains(history, fun entry -> sameInstant entry.ValidFrom future && not entry.Enabled)
+                Assert.Contains(history, fun entry -> sameInstant entry.ValidFrom future && entry.State = Disabled)
             })
 
-    [<Fact>]
+    member _.``no-op scheduling neither writes nor publishes a notification``() =
+        run (fun () ->
+            task {
+                use listener = new NpgsqlConnection(fixture.ConnectionString)
+                do! listener.OpenAsync()
+                use listen = new NpgsqlCommand("LISTEN fsnix_feature_schedule_changed", listener)
+                let! _ = listen.ExecuteNonQueryAsync()
+                use dataSource = NpgsqlDataSource.Create fixture.ConnectionString
+                let store = PostgresFeatureFlagStore(dataSource) :> IFeatureFlagStore
+                let now = DateTimeOffset.UtcNow
+
+                let! scheduled =
+                    store.Schedule(
+                        { Flag = NewDashboard
+                          State = Disabled
+                          EffectiveTime = ScheduledAt(now.AddMinutes 5.) },
+                        now,
+                        CancellationToken.None
+                    )
+
+                Assert.Equal(Ok Unchanged, scheduled)
+                let! notified = listener.WaitAsync(TimeSpan.FromMilliseconds 100.)
+                Assert.False notified
+
+                let! schedule = store.GetSchedule(NewDashboard, CancellationToken.None)
+                Assert.Equal(1, schedule.Value.History.Length)
+            })
+
     member _.``earlier scheduling preserves an existing later boundary``() =
         run (fun () ->
             task {
@@ -254,8 +233,8 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                 let! _ =
                     store.Schedule(
                         { Flag = BetaCheckout
-                          Enabled = false
-                          EffectiveTime = At later },
+                          State = Enabled
+                          EffectiveTime = ScheduledAt later },
                         now,
                         CancellationToken.None
                     )
@@ -263,14 +242,15 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                 let! result =
                     store.Schedule(
                         { Flag = BetaCheckout
-                          Enabled = true
-                          EffectiveTime = At earlier },
+                          State = Enabled
+                          EffectiveTime = ScheduledAt earlier },
                         now,
                         CancellationToken.None
                     )
 
-                Assert.Equal(Ok(), result)
-                let! history = store.GetHistory(BetaCheckout, CancellationToken.None)
+                Assert.Equal(Ok Changed, result)
+                let! schedule = store.GetSchedule(BetaCheckout, CancellationToken.None)
+                let history = schedule.Value.History
 
                 let inserted =
                     history |> List.find (fun entry -> sameInstant entry.ValidFrom earlier)
@@ -278,7 +258,6 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                 Assert.True(inserted.ValidTo |> Option.exists (sameInstant later))
             })
 
-    [<Fact>]
     member _.``duplicate boundaries map to temporal conflict``() =
         run (fun () ->
             task {
@@ -289,15 +268,43 @@ type PostgresTests(fixture: PostgreSqlFixture) =
 
                 let change enabled =
                     { Flag = NewDashboard
-                      Enabled = enabled
-                      EffectiveTime = At boundary }
+                      State = FeatureState.ofBool enabled
+                      EffectiveTime = ScheduledAt boundary }
 
                 let! _ = store.Schedule(change true, now, CancellationToken.None)
+                let! unchanged = store.Schedule(change true, now, CancellationToken.None)
                 let! duplicate = store.Schedule(change false, now, CancellationToken.None)
-                Assert.Equal(Error TemporalConflict, duplicate)
+                Assert.Equal(Ok Unchanged, unchanged)
+                Assert.Equal(Error BoundaryExists, duplicate)
             })
 
-    [<Fact>]
+    member _.``concurrent duplicate schedules produce one change``() =
+        run (fun () ->
+            task {
+                use dataSource = NpgsqlDataSource.Create fixture.ConnectionString
+                let store = PostgresFeatureFlagStore(dataSource) :> IFeatureFlagStore
+                let now = DateTimeOffset.UtcNow
+                let boundary = now.AddHours 1.
+
+                let schedule () =
+                    store.Schedule(
+                        { Flag = NewDashboard
+                          State = Enabled
+                          EffectiveTime = ScheduledAt boundary },
+                        now,
+                        CancellationToken.None
+                    )
+
+                let! outcomes = Task.WhenAll(schedule (), schedule ())
+
+                Assert.Equal(1, outcomes |> Array.filter ((=) (Ok Changed)) |> Array.length)
+                Assert.Equal(1, outcomes |> Array.filter ((=) (Ok Unchanged)) |> Array.length)
+                let! schedule = store.GetSchedule(NewDashboard, CancellationToken.None)
+                let history = schedule.Value.History
+                Assert.Equal(2, history.Length)
+                Assert.Contains(history, fun interval -> sameInstant interval.ValidFrom boundary)
+            })
+
     member _.``database rejects overlapping and empty ranges``() =
         run (fun () ->
             task {
@@ -305,8 +312,8 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                     Assert.ThrowsAsync<PostgresException>(fun () ->
                         execute
                             """
-                            INSERT INTO feature_flags (name, enabled, valid_during)
-                            VALUES ('NewDashboard', TRUE, tstzrange(CURRENT_TIMESTAMP, 'infinity'::TIMESTAMPTZ, '[)'));
+                            INSERT INTO feature_flag_intervals (feature_name, enabled, valid_during)
+                            VALUES ('NewDashboard', TRUE, tstzrange(CURRENT_TIMESTAMP, NULL, '[)'));
                             """
                         :> System.Threading.Tasks.Task)
 
@@ -316,7 +323,8 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                     Assert.ThrowsAsync<PostgresException>(fun () ->
                         execute
                             """
-                            INSERT INTO feature_flags (name, enabled, valid_during)
+                            INSERT INTO feature_flags (name) VALUES ('AnotherFlag');
+                            INSERT INTO feature_flag_intervals (feature_name, enabled, valid_during)
                             VALUES ('AnotherFlag', TRUE, 'empty'::tstzrange);
                             """
                         :> System.Threading.Tasks.Task)

@@ -18,6 +18,9 @@ type MigrationFailure =
 
 [<RequireQualifiedAccess>]
 module Migrator =
+    [<Literal>]
+    let Schema = "fsnix"
+
     type private MigrationDirectory =
         | Init
         | Main
@@ -65,7 +68,7 @@ module Migrator =
         let configured =
             match journal with
             | Some value -> builder.JournalTo value
-            | None -> builder
+            | None -> builder.JournalToPostgresqlTable(Schema, "schemaversions")
 
         let result = configured.Build().PerformUpgrade()
 
@@ -90,7 +93,7 @@ module Migrator =
         connection.Open()
 
         use command =
-            new NpgsqlCommand("SELECT script_name, content_hash FROM repeatable_migration_state", connection)
+            new NpgsqlCommand($"SELECT script_name, content_hash FROM {Schema}.repeatable_migration_state", connection)
 
         use reader = command.ExecuteReader()
         let applied = Dictionary<string, string>(StringComparer.Ordinal)
@@ -113,7 +116,7 @@ module Migrator =
             use command =
                 new NpgsqlCommand(
                     """
-                    INSERT INTO repeatable_migration_state (script_name, content_hash, applied_at)
+                    INSERT INTO fsnix.repeatable_migration_state (script_name, content_hash, applied_at)
                     VALUES (@script_name, @content_hash, CURRENT_TIMESTAMP)
                     ON CONFLICT (script_name)
                     DO UPDATE SET content_hash = EXCLUDED.content_hash,
@@ -160,6 +163,10 @@ module Migrator =
 
         oneTimeResult |> Result.bind (fun () -> runRepeatables connectionString)
 
+    let private ensureSchema (connection: NpgsqlConnection) =
+        use command = new NpgsqlCommand($"CREATE SCHEMA IF NOT EXISTS {Schema}", connection)
+        command.ExecuteNonQuery() |> ignore
+
     let migrate (connectionString: string) (environmentName: string) : Result<unit, MigrationFailure> =
         if String.IsNullOrWhiteSpace connectionString then
             Error
@@ -176,6 +183,9 @@ module Migrator =
                 acquireLock.ExecuteNonQuery() |> ignore
 
                 try
+                    // DbUp creates its journal before executing the first migration, so the
+                    // journal's schema must already exist on a fresh database.
+                    ensureSchema migrationLock
                     runStages connectionString environmentName
                 finally
                     use releaseLock =

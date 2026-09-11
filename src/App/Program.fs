@@ -1,6 +1,9 @@
 ﻿namespace App
 
 open System
+open System.Threading.Tasks
+open App.Database
+open App.Domain
 open App.Migrations
 open Microsoft.AspNetCore.Antiforgery
 open Microsoft.AspNetCore.Authentication.Cookies
@@ -13,7 +16,6 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.FeatureManagement
-open Npgsql
 open Oxpecker
 
 type AppMarker = class end
@@ -57,15 +59,11 @@ module Application =
     let configureServices (builder: WebApplicationBuilder) =
         builder.Services.AddRouting() |> ignore
         builder.Services.AddAntiforgery() |> ignore
-        builder.Services.AddMemoryCache() |> ignore
         builder.Services.AddOxpecker() |> ignore
         builder.Services.AddSingleton(TimeProvider.System) |> ignore
 
-        builder.Services.AddSingleton<NpgsqlDataSource>(fun services ->
-            NpgsqlDataSource.Create(connectionString (services.GetRequiredService<IConfiguration>())))
+        DatabaseServices.addPostgres (connectionString builder.Configuration) builder.Services
         |> ignore
-
-        builder.Services.AddScoped<PostgresUserStore>() |> ignore
 
         builder.Services
             .AddIdentityCore<ApplicationUser>(fun options ->
@@ -107,16 +105,6 @@ module Application =
             ))
         |> ignore
 
-        builder.Services.AddSingleton<PostgresFeatureFlagStore>() |> ignore
-
-        builder.Services.AddSingleton<IFeatureFlagStore>(fun services ->
-            CachingFeatureFlagStore(
-                services.GetRequiredService<PostgresFeatureFlagStore>() :> IFeatureFlagStore,
-                services.GetRequiredService<Microsoft.Extensions.Caching.Memory.IMemoryCache>()
-            )
-            :> IFeatureFlagStore)
-        |> ignore
-
         // The database provider must win over the configuration provider added by FeatureManagement.
         builder.Services.AddSingleton<IFeatureDefinitionProvider, DatabaseFeatureDefinitionProvider>()
         |> ignore
@@ -124,15 +112,16 @@ module Application =
         builder.Services.AddFeatureManagement() |> ignore
 
     let applyMigrations (app: WebApplication) =
-        let dataSource = app.Services.GetRequiredService<NpgsqlDataSource>()
+        let connection = connectionString app.Configuration
 
-        match Migrator.migrate dataSource.ConnectionString app.Environment.EnvironmentName with
+        match Migrator.migrate connection app.Environment.EnvironmentName with
         | Ok() -> ()
         | Error failure -> raise (InvalidOperationException(failure.Message, Option.toObj failure.Exception))
 
     let endpoints =
         [ GET
               [ route "/" Demo.index
+                route "/events/features" FeatureEvents.stream
                 route "/demo/dashboard" (Demo.fragment NewDashboard)
                 route "/demo/checkout" (Demo.fragment BetaCheckout)
                 route "/account/login" Account.loginPage
@@ -190,6 +179,19 @@ module Application =
                 }))
         |> ignore
 
+        app.Use(fun (context: HttpContext) (next: RequestDelegate) ->
+            context.Response.OnStarting(fun () ->
+                context.Response.Headers["Content-Security-Policy"] <-
+                    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+
+                context.Response.Headers["X-Content-Type-Options"] <- "nosniff"
+                context.Response.Headers["Referrer-Policy"] <- "no-referrer"
+                Task.CompletedTask)
+            |> ignore
+
+            next.Invoke(context))
+        |> ignore
+
         app.UseStaticFiles() |> ignore
         app.UseRouting() |> ignore
         app.UseAuthentication() |> ignore
@@ -199,37 +201,43 @@ module Application =
         app
 
 module Program =
+    let run args =
+        task {
+            let migrateOnly = args |> Array.contains "--migrate"
+            let bootstrapOnly = args |> Array.contains "--bootstrap-user"
+
+            if migrateOnly then
+                let builder = Application.createBuilder args
+                let connection = Application.connectionString builder.Configuration
+
+                match Migrator.migrate connection builder.Environment.EnvironmentName with
+                | Ok() ->
+                    printfn "Database migrations applied successfully."
+                    return 0
+                | Error failure ->
+                    eprintfn "%s" failure.Message
+                    failure.Exception |> Option.iter (fun error -> eprintfn "%s" error.Message)
+                    return 1
+            elif bootstrapOnly then
+                let builder = Application.createBuilder args
+                Application.configureServices builder
+                use app = builder.Build()
+                Application.applyMigrations app
+
+                let! result = Bootstrap.run app.Services builder.Configuration
+
+                match result with
+                | Ok userId ->
+                    printfn "Bootstrap user %O created successfully." userId
+                    return 0
+                | Error message ->
+                    eprintfn "%s" message
+                    return 1
+            else
+                use app = Application.create args
+                do! app.RunAsync()
+                return 0
+        }
+
     [<EntryPoint>]
-    let main args =
-        let migrateOnly = args |> Array.contains "--migrate"
-        let bootstrapOnly = args |> Array.contains "--bootstrap-user"
-
-        if migrateOnly then
-            let builder = Application.createBuilder args
-            let connection = Application.connectionString builder.Configuration
-
-            match Migrator.migrate connection builder.Environment.EnvironmentName with
-            | Ok() ->
-                printfn "Database migrations applied successfully."
-                0
-            | Error failure ->
-                eprintfn "%s" failure.Message
-                failure.Exception |> Option.iter (fun error -> eprintfn "%s" error.Message)
-                1
-        elif bootstrapOnly then
-            let builder = Application.createBuilder args
-            Application.configureServices builder
-            use app = builder.Build()
-            Application.applyMigrations app
-
-            match Bootstrap.run app.Services builder.Configuration |> _.GetAwaiter().GetResult() with
-            | Ok userId ->
-                printfn "Bootstrap user %O created successfully." userId
-                0
-            | Error message ->
-                eprintfn "%s" message
-                1
-        else
-            let app = Application.create args
-            app.Run()
-            0
+    let main args = run args |> _.GetAwaiter().GetResult()

@@ -3,11 +3,11 @@ namespace App.Tests
 open System
 open System.Threading
 open App
+open App.Database
+open Expecto
 open Microsoft.AspNetCore.Identity
 open Npgsql
-open Xunit
 
-[<Collection("postgres")>]
 type IdentityStoreTests(fixture: PostgreSqlFixture) =
     let reset () =
         task {
@@ -30,7 +30,6 @@ type IdentityStoreTests(fixture: PostgreSqlFixture) =
         user.ConcurrencyStamp <- Guid.NewGuid().ToString("N")
         user
 
-    [<Fact>]
     member _.``store creates finds updates and detects stale writes``() =
         task {
             do! reset ()
@@ -62,7 +61,6 @@ type IdentityStoreTests(fixture: PostgreSqlFixture) =
             Assert.Contains(staleUpdate.Errors, fun error -> error.Code = "ConcurrencyFailure")
         }
 
-    [<Fact>]
     member _.``store maps duplicate normalized email and username``() =
         task {
             do! reset ()
@@ -83,7 +81,6 @@ type IdentityStoreTests(fixture: PostgreSqlFixture) =
             Assert.Contains(emailResult.Errors, fun error -> error.Code = "DuplicateEmail")
         }
 
-    [<Fact>]
     member _.``authenticator and hashed recovery codes round trip and redeem once``() =
         task {
             do! reset ()

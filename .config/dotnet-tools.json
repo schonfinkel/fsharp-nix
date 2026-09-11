@@ -3,7 +3,7 @@
   "isRoot": true,
   "tools": {
     "sqlhydra.cli": {
-      "version": "3.4.0",
+      "version": "5.0.0",
       "commands": [
         "sqlhydra"
       ],

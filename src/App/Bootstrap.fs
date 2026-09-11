@@ -2,6 +2,7 @@ namespace App
 
 open System
 open System.Threading.Tasks
+open App.Database
 open FsToolkit.ErrorHandling
 open Microsoft.AspNetCore.Identity
 open Microsoft.Extensions.Configuration
