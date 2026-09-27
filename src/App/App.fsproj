@@ -18,6 +18,7 @@
   <ItemGroup>
     <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
     <ProjectReference Include="..\App.Auth\App.Auth.fsproj" />
+    <ProjectReference Include="..\App.Cart\App.Cart.fsproj" />
     <ProjectReference Include="..\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\App.Migrations\App.Migrations.fsproj" />
     <ProjectReference Include="..\App.Views\App.Views.fsproj" />
@@ -32,6 +33,7 @@
     <Compile Include="IdentityTokens.fs" />
     <Compile Include="RuntimeHealth.fs" />
     <Compile Include="AccountFlowHandler.fs" />
+    <Compile Include="CartHandler.fs" />
     <Compile Include="Email.fs" />
     <Compile Include="Admin.fs" />
     <Compile Include="Migrations.fs" />
@@ -39,6 +41,10 @@
     <Compile Include="Health.fs" />
     <Compile Include="OperationalHealth.fs" />
     <Compile Include="AccountFlowEndpoints.fs" />
+    <Compile Include="CartEvents.fs" />
+    <Compile Include="CartEndpoints.fs" />
+    <Compile Include="CatalogEndpoints.fs" />
+    <Compile Include="CatalogAdminEndpoints.fs" />
     <Compile Include="ProbeAdmin.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

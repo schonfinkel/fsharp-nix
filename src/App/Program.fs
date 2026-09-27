@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.IO
 open System.Threading.Tasks
 open App.Auth
+open App.Cart
 open App.Database
 open App.Domain
 open ByzantineSystems.Automata.Core
@@ -163,12 +164,49 @@ module Application =
         |> Option.ofObj
         |> Option.defaultValue "Host=127.0.0.1;Port=5432;Database=fsnix;Username=fsnix;Password=fsnix"
 
+    /// <summary>The HMAC key for guest-cart (and later order-tracking) capability hashes.
+    /// Development falls back to a fixed non-secret key; production refuses to boot without an
+    /// explicitly configured key.</summary>
+    let capabilityHashKey (configuration: IConfiguration) (environmentName: string) : CapabilityHashKey =
+        let keyId =
+            configuration["Capabilities:HashKeyId"]
+            |> Option.ofObj
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            |> Option.defaultValue "dev-primary"
+
+        let keyBase64 =
+            configuration["Capabilities:HashKey"]
+            |> Option.ofObj
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            |> Option.orElseWith (fun () ->
+                if String.Equals(environmentName, "Production", StringComparison.OrdinalIgnoreCase) then
+                    invalidOp "Production requires Capabilities:HashKey (base64, at least 256 bits)."
+                else
+                    Some "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+
+        let bytes =
+            try
+                Convert.FromBase64String keyBase64.Value
+            with _ ->
+                invalidOp "Capabilities:HashKey must be base64-encoded."
+
+        CapabilityHashKey.create keyId bytes
+        |> Result.defaultWith (fun message -> invalidOp message)
+
     let configureServices (builder: WebApplicationBuilder) =
         builder.Services.AddRouting() |> ignore
         builder.Services.AddAntiforgery() |> ignore
         builder.Services.AddOxpecker() |> ignore
         builder.Services.AddSingleton(TimeProvider.System) |> ignore
         builder.Services.AddSingleton<RuntimeHealth>() |> ignore
+        builder.Services.AddSingleton<CatalogStore>() |> ignore
+
+        builder.Services.AddSingleton<ICartChangeSource, PostgresCartChangeSource>()
+        |> ignore
+
+        builder.Services.AddSingleton<CapabilityHashKey>(fun _ ->
+            capabilityHashKey builder.Configuration builder.Environment.EnvironmentName)
+        |> ignore
 
         // Identity tokens and protected token values depend on Data Protection; a durable,
         // shared key ring with a stable discriminator is mandatory in production so restarts
@@ -273,13 +311,17 @@ module Application =
                 PostgresSupervisionStore(provider.GetRequiredService<PostgresContext>()) :> ISupervisionEventStore)
             .AddScoped<IActionHandler<ProbeId, ProbeAction, ProbeActionError>, ProbeEffectHandler>()
             .AddScoped<IActionHandler<FlowId, FlowAction, FlowActionError>, AccountFlowEffectHandler>()
+            .AddScoped<IActionHandler<CartId, CartAction, CartActionError>, CartEffectHandler>()
             .AddSingleton<ProbeMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<ProbeMachineClient>())
             .AddSingleton<AccountFlowMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<AccountFlowMachineClient>())
+            .AddSingleton<CartMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<CartMachineClient>())
             .AddSingleton<OutboxDestination list>(fun provider ->
                 let probeClient = provider.GetRequiredService<ProbeMachineClient>()
                 let flowsClient = provider.GetRequiredService<AccountFlowMachineClient>()
+                let cartsClient = provider.GetRequiredService<CartMachineClient>()
 
                 [ OutboxDestination.forMachineProvider
                       Probe.MachineKey
@@ -290,10 +332,14 @@ module Application =
                       AccountFlow.MachineKey
                       EntityId.create
                       AccountFlowCodec.event
-                      (fun () -> flowsClient.Flows) ])
+                      (fun () -> flowsClient.Flows)
+                  OutboxDestination.forMachineProvider Cart.MachineKey EntityId.create CartCodec.event (fun () ->
+                      cartsClient.Carts) ])
             .AddHostedService<IntegrationOutboxRelay>()
             .AddHostedService<EmailDeliveryRelay>()
             .AddHostedService<FlowDeadlineScanner>()
+            .AddHostedService<CartAbandonmentScanner>()
+            .AddHostedService<CartMergeScanner>()
             .AddAutomata(
                 { MachineKey = Probe.MachineKey
                   Supervisor = AutomataSupervisorOptions.defaults Probe.MachineKey
@@ -315,6 +361,19 @@ module Application =
                     fun provider ->
                         AccountFlowCodec.buildWorker
                             (provider.GetRequiredService<ILoggerFactory>().CreateLogger "flows")
+                            (provider.GetRequiredService<PostgresContext>())
+                  ChartRegistry =
+                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+                  TimeProvider = TimeProvider.System }
+            )
+            .AddAutomata(
+                { MachineKey = Cart.MachineKey
+                  Supervisor = AutomataSupervisorOptions.defaults Cart.MachineKey
+                  Actions = ActionDelivery.registered<CartId, CartAction, CartActionError>
+                  MachineFactory =
+                    fun provider ->
+                        CartCodec.buildWorker
+                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "carts")
                             (provider.GetRequiredService<PostgresContext>())
                   ChartRegistry =
                     fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
@@ -351,6 +410,9 @@ module Application =
                 route "/events/features" FeatureEvents.stream
                 route "/demo/dashboard" (Demo.fragment NewDashboard)
                 route "/demo/checkout" (Demo.fragment BetaCheckout)
+                route "/catalog" CatalogEndpoints.search
+                route "/cart" CartEndpoints.page
+                route "/cart/events" CartEvents.stream
                 route "/account/login" Account.loginPage
                 route "/account/login/2fa" Account.twoFactorPage
                 route "/account/login/recovery" Account.recoveryLoginPage
@@ -365,6 +427,7 @@ module Application =
                 route "/admin/features" (Account.requireMfa Admin.index)
                 route "/admin/features/{name}" (Account.requireMfa Admin.featureCard)
                 route "/admin/operations" (Account.requireMfa OperationalHealthEndpoints.index)
+                route "/admin/catalog" (Account.requireMfa CatalogAdminEndpoints.index)
                 route "/admin/probe" (Account.requireMfa ProbeAdmin.index) ]
           POST
               [ route "/account/login" (Admin.requireValidAntiforgery Account.login)
@@ -394,6 +457,20 @@ module Application =
                     "/account/2fa/reset"
                     (Account.requireMfa (Admin.requireValidAntiforgery Account.resetAuthenticator))
                 route "/account/logout" (Account.requireAuthenticated (Admin.requireValidAntiforgery Account.logout))
+                route "/cart/items" (Admin.requireValidAntiforgery CartEndpoints.addItem)
+                route "/cart/items/{productId}" (Admin.requireValidAntiforgery CartEndpoints.updateItem)
+                route "/cart/items/{productId}/remove" (Admin.requireValidAntiforgery CartEndpoints.removeItem)
+                route "/cart/clear" (Admin.requireValidAntiforgery CartEndpoints.clear)
+                route "/cart/merge" (Account.requireAuthenticated (Admin.requireValidAntiforgery CartEndpoints.merge))
+                route
+                    "/admin/catalog/products"
+                    (Account.requireMfa (Admin.requireValidAntiforgery CatalogAdminEndpoints.save))
+                route
+                    "/admin/catalog/products/{productId}/retire"
+                    (Account.requireMfa (Admin.requireValidAntiforgery CatalogAdminEndpoints.retire))
+                route
+                    "/admin/catalog/products/{productId}/adjust-stock"
+                    (Account.requireMfa (Admin.requireValidAntiforgery CatalogAdminEndpoints.adjustStock))
                 route
                     "/admin/features/{name}/schedule"
                     (Account.requireMfa (Admin.requireValidAntiforgery Admin.schedule))

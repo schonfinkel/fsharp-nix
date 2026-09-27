@@ -20,5 +20,7 @@
     <Compile Include="Admin.fs" />
     <Compile Include="Probe.fs" />
     <Compile Include="OperationalHealth.fs" />
+    <Compile Include="Catalog.fs" />
+    <Compile Include="Cart.fs" />
   </ItemGroup>
 </Project>

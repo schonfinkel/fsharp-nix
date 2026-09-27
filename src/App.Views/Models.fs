@@ -102,3 +102,44 @@ type OperationalHealthModel =
       Outboxes: OutboxHealthModel list
       FlowRequests: FlowRequestHealthModel list
       Deadlines: DeadlineHealthModel list }
+
+type CatalogProductModel =
+    { ProductId: string
+      Sku: string
+      Name: string
+      Description: string
+      UnitPrice: string
+      OnHand: int
+      Active: bool }
+
+type CatalogModel =
+    { Query: string
+      Products: CatalogProductModel list }
+
+type ProductFormModel =
+    { ProductId: string option
+      Sku: string
+      Name: string
+      Description: string
+      Price: string
+      Currency: string
+      OnHand: string
+      Error: string option }
+
+type AdminCatalogModel =
+    { Products: CatalogProductModel list
+      Form: ProductFormModel }
+
+type CartLineModel =
+    { ProductId: string
+      Sku: string
+      Name: string
+      UnitPrice: string
+      Quantity: int }
+
+type CartModel =
+    { Epoch: int64
+      Lines: CartLineModel list
+      Count: int
+      Total: string
+      Error: string option }

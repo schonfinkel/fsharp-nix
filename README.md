@@ -12,6 +12,8 @@ This .NET 10 sample stores time-bounded feature definitions in PostgreSQL, evalu
 
 The demo and admin feature cards stay current through HTMX 4 server-sent events. Scheduling publishes a PostgreSQL notification, and each event stream also waits for the next persisted temporal boundary before telling the cards to refresh. PostgreSQL is queried directly as the cross-instance source of truth; there is no process-local feature cache to invalidate.
 
+The catalog is browsed and full-text searched from a relational `products`/`product_stock` schema (PostgreSQL `tsvector` GIN search) and managed through an MFA-protected operator page. Guest and customer carts are one Automata `carts` machine: a guest's identity is a 256-bit bearer capability whose purpose-scoped keyed hash is stored (the raw token never is), every mutation carries an epoch for optimistic concurrency (a stale epoch is a `409` with the authoritative fragment), and signing in merges a guest cart into the customer cart through a durable saga. Cart mutations return HTMX 4 fragments with out-of-band badge and alert swaps, and other tabs stay current through the cart SSE stream.
+
 ## Development
 
 Enter the flake-backed devenv shell and start its PostgreSQL service:
@@ -73,8 +75,9 @@ editing FSM state.
 
 Capability and redaction requirements are defined in [`docs/security-policy.md`](docs/security-policy.md).
 Capability primitives generate versioned 256-bit bearer values and purpose/entity-bound keyed
-digests; consumer-specific persistence and exchange endpoints are introduced with the cart and
-tracking features. Durable action failures and manual-review reasons use closed versioned codes,
+digests. The guest cart capability stores only a purpose-scoped keyed hash and is revoked after a
+successful merge; order-tracking capabilities and their exchange endpoint are introduced with the
+tracking feature. Durable action failures and manual-review reasons use closed versioned codes,
 and logs record exception types rather than unrestricted exception messages.
 
 ## Build and test

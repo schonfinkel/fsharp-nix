@@ -6,6 +6,7 @@ open System.Text.Json
 open System.Threading
 open App
 open App.Auth
+open App.Cart
 open App.Database
 open App.Domain
 open App.Views
@@ -473,11 +474,14 @@ module UnitTests =
         health.Succeeded RuntimeComponent.Boot
         health.Succeeded RuntimeComponent.ProbeMachine
         health.Succeeded RuntimeComponent.AccountFlowMachine
+        health.Succeeded RuntimeComponent.CartMachine
         Assert.True(health.Snapshot() |> RuntimeHealth.startupReady)
 
         health.Succeeded RuntimeComponent.IntegrationOutboxRelay
         health.Succeeded RuntimeComponent.EmailDeliveryRelay
         health.Succeeded RuntimeComponent.FlowDeadlineScanner
+        health.Succeeded RuntimeComponent.CartAbandonmentScanner
+        health.Succeeded RuntimeComponent.CartMergeScanner
         let snapshot = health.Snapshot()
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) snapshot)
 
@@ -489,6 +493,227 @@ module UnitTests =
         Assert.False(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) (health.Snapshot()))
         health.Succeeded RuntimeComponent.EmailDeliveryRelay
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) (health.Snapshot()))
+
+    let private cartProduct (suffix: byte) =
+        ProductId.create (Guid.Parse $"00000000-0000-0000-0000-0000000000{suffix:X2}")
+        |> Result.defaultWith Assert.Fail
+
+    let private makeCartLine (suffix: byte) (sku: string) (name: string) (amount: decimal) (quantity: int) : CartLine =
+        { ProductId = cartProduct suffix
+          Sku = Sku.create sku |> Result.defaultWith Assert.Fail
+          Name = NonEmptyString.create 200 name |> Result.defaultWith Assert.Fail
+          UnitPrice = Money.create amount "USD" |> Result.defaultWith Assert.Fail
+          Quantity = Quantity.create quantity |> Result.defaultWith Assert.Fail }
+
+    let private expectCart state event =
+        match Chart.resolve Cart.chartValue state event with
+        | Ok resolution -> resolution
+        | Error error -> Assert.Fail $"Expected the cart event to resolve, got %A{error}."
+
+    let private expectCartRejected state event =
+        match Chart.resolve Cart.chartValue state event with
+        | Error _ -> ()
+        | Ok resolution -> Assert.Fail $"Expected the cart event to be rejected, got %A{resolution}."
+
+    let ``cart add starts an active cart`` () =
+        let line = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 1
+        let resolution = expectCart CartState.Empty (LineAdded(line, 0L))
+
+        match resolution.Next with
+        | CartState.Active cart ->
+            Assert.Equal(1L, cart.Epoch)
+            Assert.Equal([ line ], cart.Lines)
+            Assert.Equal([ RecordCartTouch(1L, true) ], resolution.Actions)
+        | other -> Assert.Fail $"Expected active, got %A{other}."
+
+    let ``cart add clamps quantity to maximum`` () =
+        let line = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 5
+
+        let nearlyFull =
+            { line with
+                Quantity = Quantity.create 998 |> Result.defaultWith Assert.Fail }
+
+        let active = CartState.Active { Epoch = 1L; Lines = [ nearlyFull ] }
+        let resolution = expectCart active (LineAdded(line, 1L))
+
+        match resolution.Next with
+        | CartState.Active cart ->
+            let total = cart.Lines |> List.sumBy (fun line -> Quantity.value line.Quantity)
+            Assert.Equal(Quantity.maxValue, total)
+        | other -> Assert.Fail $"Expected active, got %A{other}."
+
+    let ``stale epoch mutations are rejected`` () =
+        let line = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 1
+        let active = CartState.Active { Epoch = 1L; Lines = [ line ] }
+        expectCartRejected active (LineAdded(line, 5L))
+        expectCartRejected active (Cleared 0L)
+        expectCartRejected active (LineRemoved(cartProduct 1uy, 3L))
+
+    let ``abandonment timer fires only for the current generation`` () =
+        let line = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 1
+        let active = CartState.Active { Epoch = 2L; Lines = [ line ] }
+
+        let stale = expectCart active (AbandonmentTimerFired(1L, DateTimeOffset.UtcNow))
+        Assert.Equal(active, stale.Next)
+        Assert.Empty stale.Actions
+
+        let current = expectCart active (AbandonmentTimerFired(2L, DateTimeOffset.UtcNow))
+
+        match current.Next with
+        | CartState.Abandoned cart -> Assert.Equal(2L, cart.Epoch)
+        | other -> Assert.Fail $"Expected abandoned, got %A{other}."
+
+    let ``cart merge unions lines and clamps quantities`` () =
+        let coffee = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 3
+        let mug = makeCartLine 2uy "MUG" "Mug" 12.00m 1
+        let report = Cart.merge [ coffee ] [ coffee; mug ]
+        Assert.Equal(2, report.Result.Length)
+        Assert.Equal(1, report.Added)
+        Assert.Equal(1, report.Updated)
+
+        let coffeeQuantity =
+            report.Result
+            |> List.find (fun line -> line.ProductId = coffee.ProductId)
+            |> fun line -> Quantity.value line.Quantity
+
+        Assert.Equal(6, coffeeQuantity)
+
+    let ``apply merge fills an empty customer cart`` () =
+        let coffee = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 2
+        let mergeId = Guid.NewGuid()
+
+        let resolution =
+            expectCart CartState.Empty (ApplyMerge(mergeId, "guest:x", [ coffee ]))
+
+        match resolution.Next with
+        | CartState.Active cart ->
+            Assert.Equal(1L, cart.Epoch)
+            Assert.Equal([ coffee ], cart.Lines)
+
+            Assert.True(
+                resolution.Actions
+                |> List.exists (fun action -> action = NotifyMergeApplied(mergeId, "guest:x"))
+            )
+        | other -> Assert.Fail $"Expected active, got %A{other}."
+
+    let ``money wire round trips exact amount and currency`` () =
+        let money = Money.create 24.90m "USD" |> Result.defaultWith Assert.Fail
+        Assert.Equal("24.90 USD", Money.format money)
+        Assert.Equal(Ok money, Money.tryOfWire "24.90" "USD")
+        Assert.True(Result.isError (Money.create 1m "NOT-A-CURRENCY"))
+
+    let ``capability locate digest is purpose scoped and entity free`` () =
+        let key =
+            CapabilityHashKey.create "primary" (Array.init 32 byte)
+            |> Result.defaultWith Assert.Fail
+
+        let purpose =
+            CapabilityPurpose.create "guest-cart" |> Result.defaultWith Assert.Fail
+
+        let otherPurpose =
+            CapabilityPurpose.create "order-tracking" |> Result.defaultWith Assert.Fail
+
+        let raw = Capability.generate ()
+        let located = Capability.locateDigest key purpose raw
+        Assert.Equal(32, located.Length)
+        Assert.Equal(located, Capability.locateDigest key purpose raw)
+        Assert.NotEqual(located, Capability.locateDigest key otherPurpose raw)
+
+    let ``cart codecs cover every case without secret fields`` () =
+        let canary = "CANARY-bearer-token-42"
+        let line = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 2
+        let quantity = Quantity.create 2 |> Result.defaultWith Assert.Fail
+        let mergeId = Guid.NewGuid()
+
+        let states =
+            [ CartState.Empty
+              CartState.Active { Epoch = 1L; Lines = [ line ] }
+              CartState.MergeFrozen
+                  { Epoch = 1L
+                    Lines = [ line ]
+                    MergeId = mergeId
+                    Target = "customer:x"
+                    Submitted = false }
+              CartState.MergedInto
+                  { MergeId = mergeId
+                    Target = "customer:x" }
+              CartState.Converted
+              CartState.Abandoned { Epoch = 1L; Lines = [ line ] } ]
+
+        let events =
+            [ LineAdded(line, 0L)
+              QuantityChanged(cartProduct 1uy, quantity, 1L)
+              LineRemoved(cartProduct 1uy, 1L)
+              Cleared 1L
+              MergeRequested(mergeId, "customer:x")
+              MergeSnapshotCaptured mergeId
+              MergeApplied mergeId
+              MergeFailed mergeId
+              ApplyMerge(mergeId, "guest:x", [ line ])
+              AbandonmentTimerFired(1L, DateTimeOffset.UtcNow) ]
+
+        let actions =
+            [ RecordCartTouch(1L, true)
+              CaptureMergeSnapshot(mergeId, "customer:x", [ line ])
+              SubmitMergeSnapshot(mergeId, "customer:x", [ line ])
+              NotifyMergeApplied(mergeId, "guest:x")
+              RevokeGuestCapability mergeId ]
+
+        let errors =
+            [ CartActionError.InvalidCartEntityId
+              CartActionError.CapabilityLookupFailed
+              CartActionError.MergeSnapshotAlreadyCaptured
+              CartActionError.MergeTargetNotFound
+              CartActionError.CallbackEncodingFailed
+              CartActionError.ActionReceiptMismatch ]
+
+        Assert.Equal(unionCaseCount<CartState> (), states.Length)
+        Assert.Equal(unionCaseCount<CartEvent> (), events.Length)
+        Assert.Equal(unionCaseCount<CartAction> (), actions.Length)
+        Assert.Equal(unionCaseCount<CartActionError> (), errors.Length)
+
+        states
+        |> List.iter (fun value ->
+            CartCodec.state.Encode value
+            |> Result.defaultWith string
+            |> assertSafeJson canary)
+
+        events
+        |> List.iter (fun value ->
+            CartCodec.event.Encode value
+            |> Result.defaultWith string
+            |> assertSafeJson canary)
+
+        actions
+        |> List.iter (fun value ->
+            CartCodec.action.Encode value
+            |> Result.defaultWith string
+            |> assertSafeJson canary)
+
+        errors
+        |> List.iter (fun value ->
+            CartCodec.error.Encode value
+            |> Result.defaultWith string
+            |> assertSafeJson canary)
+
+    let ``cart codecs round trip an active cart`` () =
+        let line = makeCartLine 1uy "COFFEE" "Coffee" 24.90m 2
+        let state = CartState.Active { Epoch = 1L; Lines = [ line ] }
+
+        match CartCodec.state.Encode state with
+        | Error error -> Assert.Fail $"State failed to encode: %A{error}."
+        | Ok json ->
+            Assert.Contains("\"tag\":\"active-v1\"", json)
+            Assert.Contains("\"unitPriceAmount\":\"24.9\"", json)
+            Assert.Contains("\"unitPriceCurrency\":\"USD\"", json)
+
+            match CartCodec.state.Decode json with
+            | Ok decoded -> Assert.Equal(state, decoded)
+            | Error error -> Assert.Fail $"State failed to decode: %A{error}."
+
+        match CartCodec.state.Decode "{\"tag\":\"active-v1\",\"epoch\":1,\"lines\":[{\"productId\":\"x\"}]}" with
+        | Error _ -> ()
+        | Ok value -> Assert.Fail $"A malformed active cart decoded as %A{value}."
 
     let tests =
         testList
@@ -529,4 +754,18 @@ module UnitTests =
               testCase "safe diagnostics redact exception messages" ``safe diagnostics do not log exception messages``
               testCase
                   "runtime readiness requires fresh components"
-                  ``runtime readiness requires fresh successful components`` ]
+                  ``runtime readiness requires fresh successful components``
+              testCase "cart add starts an active cart" ``cart add starts an active cart``
+              testCase "cart add clamps quantity" ``cart add clamps quantity to maximum``
+              testCase "stale epoch mutations are rejected" ``stale epoch mutations are rejected``
+              testCase
+                  "abandonment timer matches the current generation"
+                  ``abandonment timer fires only for the current generation``
+              testCase "cart merge unions and clamps" ``cart merge unions lines and clamps quantities``
+              testCase "apply merge fills an empty cart" ``apply merge fills an empty customer cart``
+              testCase "money wire round trips" ``money wire round trips exact amount and currency``
+              testCase
+                  "capability locate digest is purpose scoped"
+                  ``capability locate digest is purpose scoped and entity free``
+              testCase "cart codecs contain no secret fields" ``cart codecs cover every case without secret fields``
+              testCase "cart codecs round trip an active cart" ``cart codecs round trip an active cart`` ]
