@@ -1,0 +1,10 @@
+<Project>
+
+    <PropertyGroup>
+        <!-- ByzantineSystems.Automata 0.5.0 requires FSharp.Core >= 10.1.401 while the .NET 10
+             SDK's implicit reference is 10.1.400. Implicit reference off, explicit version in
+             every project. -->
+        <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+    </PropertyGroup>
+
+</Project>

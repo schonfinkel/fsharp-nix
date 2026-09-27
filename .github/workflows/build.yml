@@ -37,7 +37,7 @@ jobs:
     - name: Install Nix Cache
       uses: DeterminateSystems/magic-nix-cache-action@main
 
-    - name: Build
-      run: nix develop .#ci --impure -c dotnet build fsnix.slnx
+    - name: Build and test with pinned services
+      run: nix build --impure .#devenv-test
     - name: Check Nix outputs and formatting
       run: nix flake check

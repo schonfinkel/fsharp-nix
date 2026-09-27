@@ -17,29 +17,65 @@ open Microsoft.AspNetCore.Mvc.Testing
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.DependencyInjection.Extensions
+open Microsoft.Extensions.Hosting
 open Microsoft.FeatureManagement
 open Npgsql
 
 type IdentityAppFactory(connectionString: string, featureStore: FakeFeatureFlagStore, environmentName: string) =
     inherit WebApplicationFactory<AppMarker>()
 
+    let emailTransport = FakeEmailTransport()
+
     new(connectionString, featureStore) = new IdentityAppFactory(connectionString, featureStore, "Development")
 
+    /// <summary>The deterministic transport every test app uses in place of SMTP. The hosted
+    /// email relay is removed so tests drive delivery passes explicitly.</summary>
+    member _.EmailTransport = emailTransport
+
     override _.ConfigureWebHost(builder: IWebHostBuilder) =
-        builder
-            .UseEnvironment(environmentName)
-            .UseContentRoot(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../src/App")))
-            .ConfigureServices(fun services ->
-                services.RemoveAll<NpgsqlDataSource>() |> ignore
+        let keyRingPath = Path.Combine(Path.GetTempPath(), "fsnix-http-test-keyring")
+        Directory.CreateDirectory keyRingPath |> ignore
 
-                services.AddSingleton<NpgsqlDataSource>(fun _ -> NpgsqlDataSource.Create connectionString)
-                |> ignore
+        let configured =
+            builder
+                .UseEnvironment(environmentName)
+                .UseContentRoot(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../src/App")))
+                .UseSetting("ConnectionStrings:App", connectionString)
+                .UseSetting("DataProtection:KeyRingPath", keyRingPath)
 
-                services.AddSingleton<IFeatureFlagStore>(featureStore :> IFeatureFlagStore)
-                |> ignore
+        // Production startup validation requires an explicit, non-loopback SMTP provider.
+        let configured =
+            if environmentName = "Production" then
+                configured
+                    .UseSetting("Email:Host", "smtp.example.test")
+                    .UseSetting("Email:UseTls", "true")
+                    .UseSetting("Email:PublicOrigin", "https://app.example.test")
+            else
+                configured
 
-                services.AddSingleton<IFeatureDefinitionProvider, DatabaseFeatureDefinitionProvider>()
-                |> ignore)
+        configured.ConfigureServices(fun services ->
+            services.RemoveAll<NpgsqlDataSource>() |> ignore
+
+            services.AddSingleton<NpgsqlDataSource>(fun _ -> NpgsqlDataSource.Create connectionString)
+            |> ignore
+
+            services.RemoveAll<IEmailTransport>() |> ignore
+
+            services.AddSingleton<IEmailTransport>(emailTransport :> IEmailTransport)
+            |> ignore
+
+            services
+            |> Seq.toList
+            |> List.filter (fun descriptor ->
+                descriptor.ServiceType = typeof<IHostedService>
+                && descriptor.ImplementationType = typeof<EmailDeliveryRelay>)
+            |> List.iter (fun descriptor -> services.Remove descriptor |> ignore)
+
+            services.AddSingleton<IFeatureFlagStore>(featureStore :> IFeatureFlagStore)
+            |> ignore
+
+            services.AddSingleton<IFeatureDefinitionProvider, DatabaseFeatureDefinitionProvider>()
+            |> ignore)
         |> ignore
 
 type AuthHttpTests(fixture: PostgreSqlFixture) =
@@ -224,6 +260,10 @@ type AuthHttpTests(fixture: PostgreSqlFixture) =
             Assert.Equal(HttpStatusCode.Redirect, passwordOnlyAdmin.StatusCode)
             Assert.Equal("/account/2fa", passwordOnlyAdmin.Headers.Location.OriginalString)
 
+            let! passwordOnlyOperations = client.GetAsync "/admin/operations"
+            Assert.Equal(HttpStatusCode.Redirect, passwordOnlyOperations.StatusCode)
+            Assert.Equal("/account/2fa", passwordOnlyOperations.Headers.Location.OriginalString)
+
             let! enrollmentPage = client.GetStringAsync "/account/2fa"
             let keyFields = Dictionary<string, string>()
             keyFields["__RequestVerificationToken"] <- csrf enrollmentPage
@@ -257,6 +297,9 @@ type AuthHttpTests(fixture: PostgreSqlFixture) =
             let! adminPage = mfaAdmin.Content.ReadAsStringAsync()
             Assert.Equal(HttpStatusCode.OK, mfaAdmin.StatusCode)
             Assert.Contains("Feature schedule", adminPage)
+
+            let! mfaOperations = client.GetAsync "/admin/operations"
+            Assert.Equal(HttpStatusCode.OK, mfaOperations.StatusCode)
 
             let logoutFields = Dictionary<string, string>()
             logoutFields["__RequestVerificationToken"] <- csrf adminPage

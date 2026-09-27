@@ -14,10 +14,16 @@ type_mappings = [ "App.Database" ]
 
 [filters]
 include = [
+  "fsnix/action_receipts",
+  "fsnix/account_email_outbox",
+  "fsnix/account_flow_requests",
+  "fsnix/account_operation_markers",
   "fsnix/current_feature_flag_definitions",
   "fsnix/feature_flag_history",
   "fsnix/feature_flag_intervals",
   "fsnix/feature_flags",
+  "fsnix/flow_deadlines",
+  "fsnix/integration_outbox",
   "fsnix/next_feature_flag_boundary",
   "fsnix/users",
   "fsnix/user_tokens"

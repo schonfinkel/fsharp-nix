@@ -53,6 +53,7 @@ type AppFactory(store: FakeFeatureFlagStore, connectionString: string, ?authenti
     override _.ConfigureWebHost(builder: IWebHostBuilder) =
         builder
             .UseContentRoot(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../src/App")))
+            .UseSetting("ConnectionStrings:App", connectionString)
             .ConfigureServices(fun services ->
                 services.RemoveAll<NpgsqlDataSource>() |> ignore
 

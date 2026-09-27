@@ -29,10 +29,12 @@ module SharedViews =
                     div (class' = "account") {
                         a (href = "/") { "Demo" }
                         a (href = "/admin/features") { "Admin" }
+                        a (href = "/admin/operations") { "Operations" }
 
                         if context.User.Identity.IsAuthenticated then
                             span (class' = "muted") { context.User.Identity.Name }
                             a (href = "/account/2fa") { "2FA" }
+                            a (href = "/account/email") { "Email" }
 
                             form (action = "/account/logout", method = "post") {
                                 context.GetAntiforgeryInput()
@@ -40,6 +42,7 @@ module SharedViews =
                             }
                         else
                             a (href = "/account/login") { "Sign in" }
+                            a (href = "/account/register") { "Register" }
                     }
                 }
 

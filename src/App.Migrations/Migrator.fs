@@ -167,6 +167,23 @@ module Migrator =
         use command = new NpgsqlCommand($"CREATE SCHEMA IF NOT EXISTS {Schema}", connection)
         command.ExecuteNonQuery() |> ignore
 
+    /// <summary>
+    /// The one-time and repeatable script names this environment's migration would apply, in
+    /// run order. Boot checks compare these against the journals so a web pod refuses to
+    /// serve against a schema a deployment job has not migrated yet.
+    /// </summary>
+    let expectedScriptNames (environmentName: string) : string list =
+        let oneTimeStages =
+            if String.Equals(environmentName, "Development", StringComparison.OrdinalIgnoreCase) then
+                [ Init; Main; Test ]
+            else
+                [ Init; Main ]
+
+        [ oneTimeStages
+          |> List.collect (embeddedScripts >> Array.map _.Name >> List.ofArray)
+          Repeatable |> embeddedScripts |> Array.map _.Name |> List.ofArray ]
+        |> List.concat
+
     let migrate (connectionString: string) (environmentName: string) : Result<unit, MigrationFailure> =
         if String.IsNullOrWhiteSpace connectionString then
             Error

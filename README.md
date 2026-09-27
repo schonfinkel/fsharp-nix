@@ -23,6 +23,8 @@ devenv up -d
 
 The shell exports `ConnectionStrings__App` for the local `fsnix` database. The database listens only on `127.0.0.1:5432`; no Docker PostgreSQL instance is used.
 
+The environment also runs [Mailpit](https://github.com/axllent/mailpit) for development email: the application relays account emails over SMTP to `127.0.0.1:1025`, and the mailbox UI plus REST API are on <http://127.0.0.1:8025>. The `Email__*` shell variables point the application at it; production configures its own SMTP provider explicitly (startup rejects loopback hosts and missing TLS outside Development).
+
 Development migrations create a manual test account:
 
 - Email: `test.operator@example.test`
@@ -38,21 +40,42 @@ dotnet run --project src/App/App.fsproj -- --bootstrap-user
 run-app
 ```
 
-Both bootstrap and normal startup apply every pending migration before continuing. The equivalent run command outside the devenv script shortcut is:
+Apply migrations before bootstrap or normal startup. Both runtime modes perform read-only schema and migration-journal checks and refuse to start when the database is missing or stale:
 
 ```sh
+make migrate
 dotnet run --project src/App/App.fsproj
 ```
 
-`make migrate` (or `dotnet run --project src/App/App.fsproj -- --migrate`) remains available as a deployment preflight that applies migrations and exits.
+`make migrate` (or `dotnet run --project src/App/App.fsproj -- --migrate`) is the only application mode that mutates schemas. Run it once as the deployment owner before starting runtime instances.
 
-Open <http://localhost:5000/> for the demo or <http://localhost:5000/admin/features> for feature administration. The latter redirects to email/password sign-in and requires authenticator enrollment before granting access. There is no public registration route; run `--bootstrap-user` again with unique credentials when another account is required.
+Open <http://localhost:5000/> for the demo, <http://localhost:5000/account/register> to register, or <http://localhost:5000/admin/features> for feature administration. New accounts must confirm their email before using account recovery. Password-reset requests return a uniform response regardless of whether the address exists. Authenticated users can start email changes from `/account/email`; confirmation and password changes are applied only after the antiforgery-protected form submission.
 
 Authenticator setup renders an `otpauth://` QR code with the locally vendored [QRCode.js 1.0.0](https://github.com/davidshimjs/qrcodejs) asset. Recovery codes are shown once, stored only as SHA-256 hashes, and atomically consumed. Authenticator reset and recovery-code regeneration require a session carrying the `amr=mfa` claim; password-only sessions cannot administer features or weaken MFA.
 
 For local testing without an authenticator app, run `make totp`, paste the manual authenticator key when prompted, and enter the generated six-digit code in the application. Treat the key as a password and never commit it.
 
-The application defaults to the `Development` .NET environment. Set `DOTNET_ENVIRONMENT=Production` in production. Serve the application over HTTPS and persist ASP.NET Core Data Protection keys when running more than one instance or replacing instances.
+The application defaults to the `Development` .NET environment. Set `DOTNET_ENVIRONMENT=Production` in production. Production startup requires `DataProtection__KeyRingPath` to name durable storage shared by every instance and retains the stable `fsnix` application discriminator across deployments. It likewise requires an explicit `Email__Host`, `Email__UseTls=true`, and `Email__PublicOrigin`. Protect that storage at rest with the platform's encrypted volume or secret-store controls; the application does not treat a writable plaintext host path as key encryption. Serve the application over HTTPS.
+
+## Health and security
+
+The application exposes three minimal, anonymous, non-cacheable probes. `/health/live` reports
+only that the HTTP process is serving, `/health/startup` confirms boot checks and machine-client
+registration, and `/health/ready` additionally checks PostgreSQL plus recent successful passes by
+the integration-outbox relay, email relay, and deadline scanner. Worker freshness defaults to 30
+seconds and can be changed with `Health__WorkerMaximumAgeSeconds`.
+
+MFA-authenticated operators can inspect aggregate runtime, outbox, account-flow, and deadline
+health at `/admin/operations`. The page never renders payloads, destination addresses, callback or
+entity identifiers, lease owners, or durable error text. Dead rows are an operational warning,
+not a readiness failure; recovery uses audited re-enqueue/reconciliation commands rather than
+editing FSM state.
+
+Capability and redaction requirements are defined in [`docs/security-policy.md`](docs/security-policy.md).
+Capability primitives generate versioned 256-bit bearer values and purpose/entity-bound keyed
+digests; consumer-specific persistence and exchange endpoints are introduced with the cart and
+tracking features. Durable action failures and manual-review reasons use closed versioned codes,
+and logs record exception types rather than unrestricted exception messages.
 
 ## Build and test
 
@@ -63,7 +86,7 @@ dotnet build fsnix.slnx
 make test
 ```
 
-Tests use Expecto 11 and are split into focused executable projects. Run the suites independently with `make test-unit`, `make test-database`, or `make test-http`; `make test-integration` depends on the latter two. The Make targets form an independent dependency graph, so `make -j3 test` can run all three executables concurrently when desired. Additional Expecto arguments can be passed after `--` to any test project, such as `dotnet run --project tests/App.DatabaseTests/App.DatabaseTests.fsproj -- --filter scheduling`.
+Tests use Expecto 11 and are split into focused executable projects. Run the suites independently with `make test-unit`, `make test-database`, or `make test-http`; `make test-integration` depends on the latter two. Use `make test` for the supported serial order because concurrent integration executables can exceed the development PostgreSQL connection limit. CI runs the serial suite and schema check through the flake's `devenv-test` derivation against the pinned PostgreSQL/extension stack. Additional Expecto arguments can be passed after `--` to any test project, such as `dotnet run --project tests/App.DatabaseTests/App.DatabaseTests.fsproj -- --filter scheduling`.
 
 `App.UnitTests` contains fast domain/application/view tests, `App.DatabaseTests` exercises persistence and migrations, `App.HttpTests` covers the real HTTP/htmx and authentication stack, and `App.Testing` contains shared fakes, assertions, and database fixtures. PostgreSQL integration cases use the already-running devenv server. Every case creates a uniquely named database, runs independently in parallel within its executable, and drops its database afterward. The local `fsnix` role has `CREATEDB` solely so the test fixture can provision those databases; tests do not start containers. The authentication tests exercise bootstrap, lockout, password login, TOTP enrollment, MFA authorization, recovery login, one-time recovery-code redemption and regeneration, and authenticator reset through the real HTTP and PostgreSQL stack.
 

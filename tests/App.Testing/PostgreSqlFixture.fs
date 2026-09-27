@@ -5,6 +5,8 @@ open App.Migrations
 open Expecto
 open Npgsql
 
+module AutomataMigrator = ByzantineSystems.Automata.Storage.Postgres.Migrator
+
 type PostgreSqlFixture(?includeProduction: bool) =
     let baseConnectionString =
         Environment.GetEnvironmentVariable "ConnectionStrings__App"
@@ -15,6 +17,12 @@ type PostgreSqlFixture(?includeProduction: bool) =
         let builder = NpgsqlConnectionStringBuilder baseConnectionString
         builder.Database <- database
         builder.SearchPath <- Migrator.Schema
+        builder.ConnectionString
+
+    let automataConnectionStringFor database =
+        let builder = NpgsqlConnectionStringBuilder baseConnectionString
+        builder.Database <- database
+        builder.SearchPath <- "public"
         builder.ConnectionString
 
     let suffix = Guid.NewGuid().ToString("N")[..15]
@@ -62,6 +70,14 @@ type PostgreSqlFixture(?includeProduction: bool) =
 
             if schemaExists :?> bool then
                 invalidOp "A newly created test database unexpectedly contained the application schema."
+
+            match
+                AutomataMigrator.migrate
+                    Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance
+                    (automataConnectionStringFor testDatabase)
+            with
+            | Ok _ -> ()
+            | Error failure -> raise (InvalidOperationException $"Automata fsm migration failed: %A{failure}")
 
             match Migrator.migrate testConnectionString "Development" with
             | Ok() -> ()
