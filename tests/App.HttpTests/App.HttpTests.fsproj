@@ -9,8 +9,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="FSharp.Core" Version="10.1.401" />
     <Compile Include="HttpTests.fs" />
+    <Compile Include="FakeEmailTransport.fs" />
     <Compile Include="AuthHttpTests.fs" />
+    <Compile Include="AccountFlowHttpTests.fs" />
+    <Compile Include="HealthHttpTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

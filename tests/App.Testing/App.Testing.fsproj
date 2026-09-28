@@ -6,13 +6,16 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="FSharp.Core" Version="10.1.401" />
     <Compile Include="Assertions.fs" />
     <Compile Include="FakeFeatureFlagStore.fs" />
     <Compile Include="PostgreSqlFixture.fs" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="ByzantineSystems.Automata.Storage.Postgres" Version="0.5.0" />
     <PackageReference Include="Expecto" Version="11.1.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>
 

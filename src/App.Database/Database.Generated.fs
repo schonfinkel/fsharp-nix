@@ -9,7 +9,380 @@ module Version =
     let ns = "App.Database.Schema"
     SqlHydra.Query.VersionCheck.assertIsCompatible cli ns
 
+module fsm =
+
+    type belief_cold =
+        { [<ProviderDbType("Text")>]
+          machine_id: Option<string>
+          [<ProviderDbType("Text")>]
+          entity_id: Option<string>
+          [<ProviderDbType("Jsonb")>]
+          state: Option<string>
+          [<ProviderDbType("Bigint")>]
+          epoch: Option<int64>
+          [<ProviderDbType("Bigint")>]
+          command_id: Option<int64>
+          [<ProviderDbType("Integer")>]
+          chart_version: Option<int>
+          [<ProviderDbType("TimestampTzRange")>]
+          valid_during: Option<NpgsqlTypes.NpgsqlRange<System.DateTime>>
+          [<ProviderDbType("TimestampTzRange")>]
+          system_time: Option<NpgsqlTypes.NpgsqlRange<System.DateTime>>
+          [<ProviderDbType("TimestampTz")>]
+          cutoff: Option<System.DateTime> }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "machine_id"
+                    Value = box this.machine_id
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "entity_id"
+                    Value = box this.entity_id
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "state"
+                    Value = box this.state
+                    ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "epoch"
+                    Value = box this.epoch
+                    ProviderDbType = Some "Bigint" }
+                  { WriteColumn.Name = "command_id"
+                    Value = box this.command_id
+                    ProviderDbType = Some "Bigint" }
+                  { WriteColumn.Name = "chart_version"
+                    Value = box this.chart_version
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "valid_during"
+                    Value = box this.valid_during
+                    ProviderDbType = Some "TimestampTzRange" }
+                  { WriteColumn.Name = "system_time"
+                    Value = box this.system_time
+                    ProviderDbType = Some "TimestampTzRange" }
+                  { WriteColumn.Name = "cutoff"
+                    Value = box this.cutoff
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    let belief_cold = table<belief_cold>
+
 module fsnix =
+
+    type account_email_outbox =
+        { [<ProviderDbType("Bigint")>]
+          email_id: int64
+          [<ProviderDbType("Uuid")>]
+          flow_id: System.Guid
+          [<ProviderDbType("Integer")>]
+          generation: int
+          [<ProviderDbType("Bytea")>]
+          protected_payload: Option<byte[]>
+          [<ProviderDbType("Integer")>]
+          encryption_version: int
+          [<ProviderDbType("Text")>]
+          status: string
+          [<ProviderDbType("Integer")>]
+          attempts: int
+          [<ProviderDbType("Integer")>]
+          max_attempts: int
+          [<ProviderDbType("TimestampTz")>]
+          available_at: System.DateTime
+          [<ProviderDbType("Text")>]
+          lease_owner: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          lease_until: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          sent_at: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          failed_at: Option<System.DateTime>
+          [<ProviderDbType("Text")>]
+          last_error: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          created_at: System.DateTime }
+
+        interface IHasWrite<account_email_outbox_write> with
+            /// This row's writable columns, as `writeEntity` takes them: `toWrite row`.
+            member this.ToWrite() : account_email_outbox_write =
+                { flow_id = this.flow_id
+                  generation = this.generation
+                  protected_payload = this.protected_payload
+                  encryption_version = this.encryption_version
+                  status = this.status
+                  attempts = this.attempts
+                  max_attempts = this.max_attempts
+                  available_at = this.available_at
+                  lease_owner = this.lease_owner
+                  lease_until = this.lease_until
+                  sent_at = this.sent_at
+                  failed_at = this.failed_at
+                  last_error = this.last_error
+                  created_at = this.created_at }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "flow_id"
+                    Value = box this.flow_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "generation"
+                    Value = box this.generation
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "protected_payload"
+                    Value = box this.protected_payload
+                    ProviderDbType = Some "Bytea" }
+                  { WriteColumn.Name = "encryption_version"
+                    Value = box this.encryption_version
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "status"
+                    Value = box this.status
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "attempts"
+                    Value = box this.attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "max_attempts"
+                    Value = box this.max_attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "available_at"
+                    Value = box this.available_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "lease_owner"
+                    Value = box this.lease_owner
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_until"
+                    Value = box this.lease_until
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "sent_at"
+                    Value = box this.sent_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "failed_at"
+                    Value = box this.failed_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "last_error"
+                    Value = box this.last_error
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "created_at"
+                    Value = box this.created_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    /// The columns of `account_email_outbox` a caller may write; the database owns the rest.
+    and account_email_outbox_write =
+        { [<ProviderDbType("Uuid")>]
+          flow_id: System.Guid
+          [<ProviderDbType("Integer")>]
+          generation: int
+          [<ProviderDbType("Bytea")>]
+          protected_payload: Option<byte[]>
+          [<ProviderDbType("Integer")>]
+          encryption_version: int
+          [<ProviderDbType("Text")>]
+          status: string
+          [<ProviderDbType("Integer")>]
+          attempts: int
+          [<ProviderDbType("Integer")>]
+          max_attempts: int
+          [<ProviderDbType("TimestampTz")>]
+          available_at: System.DateTime
+          [<ProviderDbType("Text")>]
+          lease_owner: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          lease_until: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          sent_at: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          failed_at: Option<System.DateTime>
+          [<ProviderDbType("Text")>]
+          last_error: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          created_at: System.DateTime }
+
+        interface IWriteOf<account_email_outbox> with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "flow_id"
+                    Value = box this.flow_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "generation"
+                    Value = box this.generation
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "protected_payload"
+                    Value = box this.protected_payload
+                    ProviderDbType = Some "Bytea" }
+                  { WriteColumn.Name = "encryption_version"
+                    Value = box this.encryption_version
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "status"
+                    Value = box this.status
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "attempts"
+                    Value = box this.attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "max_attempts"
+                    Value = box this.max_attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "available_at"
+                    Value = box this.available_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "lease_owner"
+                    Value = box this.lease_owner
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_until"
+                    Value = box this.lease_until
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "sent_at"
+                    Value = box this.sent_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "failed_at"
+                    Value = box this.failed_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "last_error"
+                    Value = box this.last_error
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "created_at"
+                    Value = box this.created_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    let account_email_outbox = table<account_email_outbox>
+
+    type account_flow_requests =
+        { [<ProviderDbType("Uuid")>]
+          flow_id: System.Guid
+          [<ProviderDbType("Text")>]
+          flow_kind: string
+          [<ProviderDbType("Uuid")>]
+          user_id: System.Guid
+          [<ProviderDbType("Text")>]
+          destination_email: string
+          [<ProviderDbType("Text")>]
+          status: string
+          [<ProviderDbType("Integer")>]
+          generation: int
+          [<ProviderDbType("Integer")>]
+          resend_count: int
+          [<ProviderDbType("TimestampTz")>]
+          expires_at: System.DateTime
+          [<ProviderDbType("Uuid")>]
+          superseded_by: Option<System.Guid>
+          [<ProviderDbType("TimestampTz")>]
+          created_at: System.DateTime
+          [<ProviderDbType("TimestampTz")>]
+          updated_at: System.DateTime
+          [<ProviderDbType("Bytea")>]
+          idempotency_key_hash: Option<byte[]>
+          [<ProviderDbType("Bytea")>]
+          request_hash: Option<byte[]> }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "flow_id"
+                    Value = box this.flow_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "flow_kind"
+                    Value = box this.flow_kind
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "user_id"
+                    Value = box this.user_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "destination_email"
+                    Value = box this.destination_email
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "status"
+                    Value = box this.status
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "generation"
+                    Value = box this.generation
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "resend_count"
+                    Value = box this.resend_count
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "expires_at"
+                    Value = box this.expires_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "superseded_by"
+                    Value = box this.superseded_by
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "created_at"
+                    Value = box this.created_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "updated_at"
+                    Value = box this.updated_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "idempotency_key_hash"
+                    Value = box this.idempotency_key_hash
+                    ProviderDbType = Some "Bytea" }
+                  { WriteColumn.Name = "request_hash"
+                    Value = box this.request_hash
+                    ProviderDbType = Some "Bytea" } ]
+
+    let account_flow_requests = table<account_flow_requests>
+
+    type account_operation_markers =
+        { [<ProviderDbType("Uuid")>]
+          operation_id: System.Guid
+          [<ProviderDbType("Uuid")>]
+          user_id: System.Guid
+          [<ProviderDbType("Uuid")>]
+          flow_id: Option<System.Guid>
+          [<ProviderDbType("Text")>]
+          operation: string
+          [<ProviderDbType("TimestampTz")>]
+          completed_at: System.DateTime }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "operation_id"
+                    Value = box this.operation_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "user_id"
+                    Value = box this.user_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "flow_id"
+                    Value = box this.flow_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "operation"
+                    Value = box this.operation
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "completed_at"
+                    Value = box this.completed_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    let account_operation_markers = table<account_operation_markers>
+
+    type action_receipts =
+        { [<ProviderDbType("Text")>]
+          machine_id: string
+          [<ProviderDbType("Bigint")>]
+          command_id: int64
+          [<ProviderDbType("Integer")>]
+          ordinal: int
+          [<ProviderDbType("Text")>]
+          action_kind: string
+          [<ProviderDbType("Bytea")>]
+          payload_hash: byte[]
+          [<ProviderDbType("Jsonb")>]
+          outcome: string
+          [<ProviderDbType("TimestampTz")>]
+          completed_at: System.DateTime }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "machine_id"
+                    Value = box this.machine_id
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "command_id"
+                    Value = box this.command_id
+                    ProviderDbType = Some "Bigint" }
+                  { WriteColumn.Name = "ordinal"
+                    Value = box this.ordinal
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "action_kind"
+                    Value = box this.action_kind
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "payload_hash"
+                    Value = box this.payload_hash
+                    ProviderDbType = Some "Bytea" }
+                  { WriteColumn.Name = "outcome"
+                    Value = box this.outcome
+                    ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "completed_at"
+                    Value = box this.completed_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    let action_receipts = table<action_receipts>
 
     type current_feature_flag_definitions =
         { [<ProviderDbType("Text")>]
@@ -113,6 +486,308 @@ module fsnix =
                     ProviderDbType = Some "Text" } ]
 
     let feature_flags = table<feature_flags>
+
+    type flow_deadlines =
+        { [<ProviderDbType("Bigint")>]
+          deadline_id: int64
+          [<ProviderDbType("Uuid")>]
+          flow_id: System.Guid
+          [<ProviderDbType("Text")>]
+          timer_kind: string
+          [<ProviderDbType("Integer")>]
+          generation: int
+          [<ProviderDbType("TimestampTz")>]
+          deadline: System.DateTime
+          [<ProviderDbType("Text")>]
+          gate_callback_key: string
+          [<ProviderDbType("Text")>]
+          status: string
+          [<ProviderDbType("Text")>]
+          lease_owner: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          lease_until: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          fired_at: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          created_at: System.DateTime }
+
+        interface IHasWrite<flow_deadlines_write> with
+            /// This row's writable columns, as `writeEntity` takes them: `toWrite row`.
+            member this.ToWrite() : flow_deadlines_write =
+                { flow_id = this.flow_id
+                  timer_kind = this.timer_kind
+                  generation = this.generation
+                  deadline = this.deadline
+                  gate_callback_key = this.gate_callback_key
+                  status = this.status
+                  lease_owner = this.lease_owner
+                  lease_until = this.lease_until
+                  fired_at = this.fired_at
+                  created_at = this.created_at }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "flow_id"
+                    Value = box this.flow_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "timer_kind"
+                    Value = box this.timer_kind
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "generation"
+                    Value = box this.generation
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "deadline"
+                    Value = box this.deadline
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "gate_callback_key"
+                    Value = box this.gate_callback_key
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "status"
+                    Value = box this.status
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_owner"
+                    Value = box this.lease_owner
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_until"
+                    Value = box this.lease_until
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "fired_at"
+                    Value = box this.fired_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "created_at"
+                    Value = box this.created_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    /// The columns of `flow_deadlines` a caller may write; the database owns the rest.
+    and flow_deadlines_write =
+        { [<ProviderDbType("Uuid")>]
+          flow_id: System.Guid
+          [<ProviderDbType("Text")>]
+          timer_kind: string
+          [<ProviderDbType("Integer")>]
+          generation: int
+          [<ProviderDbType("TimestampTz")>]
+          deadline: System.DateTime
+          [<ProviderDbType("Text")>]
+          gate_callback_key: string
+          [<ProviderDbType("Text")>]
+          status: string
+          [<ProviderDbType("Text")>]
+          lease_owner: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          lease_until: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          fired_at: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          created_at: System.DateTime }
+
+        interface IWriteOf<flow_deadlines> with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "flow_id"
+                    Value = box this.flow_id
+                    ProviderDbType = Some "Uuid" }
+                  { WriteColumn.Name = "timer_kind"
+                    Value = box this.timer_kind
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "generation"
+                    Value = box this.generation
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "deadline"
+                    Value = box this.deadline
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "gate_callback_key"
+                    Value = box this.gate_callback_key
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "status"
+                    Value = box this.status
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_owner"
+                    Value = box this.lease_owner
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_until"
+                    Value = box this.lease_until
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "fired_at"
+                    Value = box this.fired_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "created_at"
+                    Value = box this.created_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    let flow_deadlines = table<flow_deadlines>
+
+    type integration_outbox =
+        { [<ProviderDbType("Bigint")>]
+          outbox_id: int64
+          [<ProviderDbType("Text")>]
+          callback_key: string
+          [<ProviderDbType("Text")>]
+          machine_id: string
+          [<ProviderDbType("Text")>]
+          entity_id: string
+          [<ProviderDbType("Jsonb")>]
+          event: string
+          [<ProviderDbType("Text")>]
+          status: string
+          [<ProviderDbType("Integer")>]
+          attempts: int
+          [<ProviderDbType("Text")>]
+          last_error: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          created_at: System.DateTime
+          [<ProviderDbType("TimestampTz")>]
+          sent_at: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          available_at: System.DateTime
+          [<ProviderDbType("Text")>]
+          lease_owner: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          lease_until: Option<System.DateTime>
+          [<ProviderDbType("Integer")>]
+          max_attempts: int
+          [<ProviderDbType("TimestampTz")>]
+          failed_at: Option<System.DateTime> }
+
+        interface IHasWrite<integration_outbox_write> with
+            /// This row's writable columns, as `writeEntity` takes them: `toWrite row`.
+            member this.ToWrite() : integration_outbox_write =
+                { callback_key = this.callback_key
+                  machine_id = this.machine_id
+                  entity_id = this.entity_id
+                  event = this.event
+                  status = this.status
+                  attempts = this.attempts
+                  last_error = this.last_error
+                  created_at = this.created_at
+                  sent_at = this.sent_at
+                  available_at = this.available_at
+                  lease_owner = this.lease_owner
+                  lease_until = this.lease_until
+                  max_attempts = this.max_attempts
+                  failed_at = this.failed_at }
+
+        interface IWriteColumns with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "callback_key"
+                    Value = box this.callback_key
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "machine_id"
+                    Value = box this.machine_id
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "entity_id"
+                    Value = box this.entity_id
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "event"
+                    Value = box this.event
+                    ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "status"
+                    Value = box this.status
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "attempts"
+                    Value = box this.attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "last_error"
+                    Value = box this.last_error
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "created_at"
+                    Value = box this.created_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "sent_at"
+                    Value = box this.sent_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "available_at"
+                    Value = box this.available_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "lease_owner"
+                    Value = box this.lease_owner
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_until"
+                    Value = box this.lease_until
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "max_attempts"
+                    Value = box this.max_attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "failed_at"
+                    Value = box this.failed_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    /// The columns of `integration_outbox` a caller may write; the database owns the rest.
+    and integration_outbox_write =
+        { [<ProviderDbType("Text")>]
+          callback_key: string
+          [<ProviderDbType("Text")>]
+          machine_id: string
+          [<ProviderDbType("Text")>]
+          entity_id: string
+          [<ProviderDbType("Jsonb")>]
+          event: string
+          [<ProviderDbType("Text")>]
+          status: string
+          [<ProviderDbType("Integer")>]
+          attempts: int
+          [<ProviderDbType("Text")>]
+          last_error: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          created_at: System.DateTime
+          [<ProviderDbType("TimestampTz")>]
+          sent_at: Option<System.DateTime>
+          [<ProviderDbType("TimestampTz")>]
+          available_at: System.DateTime
+          [<ProviderDbType("Text")>]
+          lease_owner: Option<string>
+          [<ProviderDbType("TimestampTz")>]
+          lease_until: Option<System.DateTime>
+          [<ProviderDbType("Integer")>]
+          max_attempts: int
+          [<ProviderDbType("TimestampTz")>]
+          failed_at: Option<System.DateTime> }
+
+        interface IWriteOf<integration_outbox> with
+            member this.WriteColumns =
+                [ { WriteColumn.Name = "callback_key"
+                    Value = box this.callback_key
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "machine_id"
+                    Value = box this.machine_id
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "entity_id"
+                    Value = box this.entity_id
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "event"
+                    Value = box this.event
+                    ProviderDbType = Some "Jsonb" }
+                  { WriteColumn.Name = "status"
+                    Value = box this.status
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "attempts"
+                    Value = box this.attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "last_error"
+                    Value = box this.last_error
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "created_at"
+                    Value = box this.created_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "sent_at"
+                    Value = box this.sent_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "available_at"
+                    Value = box this.available_at
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "lease_owner"
+                    Value = box this.lease_owner
+                    ProviderDbType = Some "Text" }
+                  { WriteColumn.Name = "lease_until"
+                    Value = box this.lease_until
+                    ProviderDbType = Some "TimestampTz" }
+                  { WriteColumn.Name = "max_attempts"
+                    Value = box this.max_attempts
+                    ProviderDbType = Some "Integer" }
+                  { WriteColumn.Name = "failed_at"
+                    Value = box this.failed_at
+                    ProviderDbType = Some "TimestampTz" } ]
+
+    let integration_outbox = table<integration_outbox>
 
     type next_feature_flag_boundary =
         { [<ProviderDbType("TimestampTz")>]

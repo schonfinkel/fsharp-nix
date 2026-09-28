@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="FSharp.Core" Version="10.1.401" />
     <Compile Include="UnitTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

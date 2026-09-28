@@ -56,6 +56,185 @@ module AccountViews =
 
                         div (class' = "actions") { button (type' = "submit") { "Sign in" } }
                     })
+
+                p () { a (href = "/account/forgot-password") { "Forgot your password?" } }
+                p () { a (href = "/account/register") { "Create an account" } }
+            })
+
+    let register (context: HttpContext) (model: RegisterModel) =
+        panel
+            "Create an account"
+            (Fragment() {
+                errorMessage model.Error
+
+                antiforgeryForm
+                    context
+                    "/account/register"
+                    (Fragment() {
+                        input (type' = "hidden", name = "idempotencyKey", value = model.IdempotencyKey)
+                        label (for' = "register-email") { "Email" }
+
+                        input (
+                            type' = "email",
+                            id = "register-email",
+                            name = "email",
+                            value = model.Email,
+                            required = true
+                        )
+
+                        label (for' = "register-password") { "Password" }
+
+                        (input (type' = "password", id = "register-password", name = "password", required = true))
+                            .attr("autocomplete", "new-password")
+                            .attr ("minlength", "12")
+
+                        label (for' = "register-confirm-password") { "Confirm password" }
+
+                        (input (
+                            type' = "password",
+                            id = "register-confirm-password",
+                            name = "confirmPassword",
+                            required = true
+                        ))
+                            .attr ("autocomplete", "new-password")
+
+                        div (class' = "actions") { button (type' = "submit") { "Register" } }
+                    })
+            })
+
+    let forgotPassword (context: HttpContext) (model: AccountRequestModel) =
+        panel
+            "Reset your password"
+            (Fragment() {
+                errorMessage model.Error
+
+                for message in Option.toList model.Message do
+                    ((p ()).attr("class", "success").attr ("role", "status")) { message }
+
+                antiforgeryForm
+                    context
+                    "/account/forgot-password"
+                    (Fragment() {
+                        input (type' = "hidden", name = "idempotencyKey", value = model.IdempotencyKey)
+                        label (for' = "reset-email") { "Email" }
+
+                        input (
+                            type' = "email",
+                            id = "reset-email",
+                            name = "email",
+                            value = model.Email,
+                            required = true
+                        )
+
+                        div (class' = "actions") { button (type' = "submit") { "Send reset link" } }
+                    })
+            })
+
+    let resend (context: HttpContext) (model: AccountRequestModel) =
+        panel
+            "Resend an account email"
+            (Fragment() {
+                errorMessage model.Error
+
+                for message in Option.toList model.Message do
+                    ((p ()).attr("class", "success").attr ("role", "status")) { message }
+
+                antiforgeryForm
+                    context
+                    "/account/resend"
+                    (Fragment() {
+                        input (type' = "hidden", name = "idempotencyKey", value = model.IdempotencyKey)
+                        label (for' = "resend-email") { "Email" }
+
+                        input (
+                            type' = "email",
+                            id = "resend-email",
+                            name = "email",
+                            value = model.Email,
+                            required = true
+                        )
+
+                        label (for' = "flow-kind") { "Email type" }
+
+                        select (id = "flow-kind", name = "kind") {
+                            option (value = "email-verification") { "Verify email" }
+                            option (value = "password-reset") { "Password reset" }
+                        }
+
+                        div (class' = "actions") { button (type' = "submit") { "Resend email" } }
+                    })
+            })
+
+    let emailAction (context: HttpContext) (title: string) (action: string) (model: AccountTokenModel) =
+        panel
+            title
+            (Fragment() {
+                errorMessage model.Error
+
+                antiforgeryForm
+                    context
+                    action
+                    (Fragment() {
+                        input (type' = "hidden", name = "flowId", value = model.FlowId)
+                        input (type' = "hidden", name = "token", value = model.Token)
+                        div (class' = "actions") { button (type' = "submit") { title } }
+                    })
+            })
+
+    let resetPassword (context: HttpContext) (model: PasswordResetModel) =
+        panel
+            "Choose a new password"
+            (Fragment() {
+                errorMessage model.Error
+
+                antiforgeryForm
+                    context
+                    "/account/reset-password"
+                    (Fragment() {
+                        input (type' = "hidden", name = "flowId", value = model.FlowId)
+                        input (type' = "hidden", name = "token", value = model.Token)
+                        label (for' = "new-password") { "New password" }
+
+                        (input (type' = "password", id = "new-password", name = "password", required = true))
+                            .attr("autocomplete", "new-password")
+                            .attr ("minlength", "12")
+
+                        label (for' = "confirm-password") { "Confirm new password" }
+
+                        (input (type' = "password", id = "confirm-password", name = "confirmPassword", required = true))
+                            .attr ("autocomplete", "new-password")
+
+                        div (class' = "actions") { button (type' = "submit") { "Reset password" } }
+                    })
+            })
+
+    let changeEmail (context: HttpContext) (model: AccountRequestModel) =
+        panel
+            "Change email address"
+            (Fragment() {
+                errorMessage model.Error
+
+                for message in Option.toList model.Message do
+                    ((p ()).attr("class", "success").attr ("role", "status")) { message }
+
+                antiforgeryForm
+                    context
+                    "/account/email"
+                    (Fragment() {
+                        input (type' = "hidden", name = "idempotencyKey", value = model.IdempotencyKey)
+                        label (for' = "new-email") { "New email address" }
+                        input (type' = "email", id = "new-email", name = "email", value = model.Email, required = true)
+                        div (class' = "actions") { button (type' = "submit") { "Send confirmation" } }
+                    })
+            })
+
+    let notice (title: string) (model: AccountNoticeModel) =
+        panel
+            title
+            (Fragment() {
+                errorMessage model.Error
+                ((p ()).attr ("role", "status")) { model.Message }
+                p () { a (href = "/account/login") { "Return to sign in" } }
             })
 
     let twoFactor (context: HttpContext) (model: TwoFactorModel) =

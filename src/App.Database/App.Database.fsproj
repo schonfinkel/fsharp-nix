@@ -3,12 +3,18 @@
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="FSharp.Core" Version="10.1.401" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="ByzantineSystems.Automata.Resilience" Version="0.5.0" />
+    <PackageReference Include="ByzantineSystems.Automata.Runtime" Version="0.5.0" />
+    <PackageReference Include="ByzantineSystems.Automata.Storage" Version="0.5.0" />
+    <PackageReference Include="ByzantineSystems.Automata.Storage.Postgres" Version="0.5.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="SqlHydra.Query" Version="5.0.0" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
+    <ProjectReference Include="..\App.Auth\App.Auth.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="SchemaTypeMappings.fs" />
@@ -17,7 +23,17 @@
     </Compile>
     <Compile Include="FeatureFlagStore.fs" />
     <Compile Include="FeatureChangeSource.fs" />
+    <Compile Include="AutomataStore.fs" />
+    <Compile Include="AccountFlowCodec.fs" />
+    <Compile Include="AccountFlowEffects.fs" />
+    <Compile Include="AccountOperations.fs" />
+    <Compile Include="AccountFlowRequests.fs" />
+    <Compile Include="FlowDeadlines.fs" />
     <Compile Include="IdentityStore.fs" />
+    <Compile Include="Outbox.fs" />
+    <Compile Include="EmailOutbox.fs" />
+    <Compile Include="OperationalHealth.fs" />
+    <Compile Include="Probe.fs" />
     <Compile Include="Services.fs" />
   </ItemGroup>
 </Project>

@@ -3,6 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="FSharp.Core" Version="10.1.401" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Oxpecker" Version="2.1.1" />
     <PackageReference Include="Oxpecker.Htmx" Version="4.0.0" />
@@ -17,5 +18,7 @@
     <Compile Include="Demo.fs" />
     <Compile Include="Account.fs" />
     <Compile Include="Admin.fs" />
+    <Compile Include="Probe.fs" />
+    <Compile Include="OperationalHealth.fs" />
   </ItemGroup>
 </Project>

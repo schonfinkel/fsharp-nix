@@ -2,12 +2,14 @@ namespace App.Database
 
 open System
 open System.Collections.Generic
+open System.Data.Common
 open System.Security.Cryptography
 open System.Text
 open System.Threading
 open System.Threading.Tasks
 open App.Database.Schema
 open App.Database.Schema.fsnix
+open Microsoft.AspNetCore.DataProtection
 open Microsoft.AspNetCore.Identity
 open Npgsql
 open SqlHydra.Query
@@ -30,9 +32,26 @@ type ApplicationUser() =
     member val AccessFailedCount = 0 with get, set
 
 [<Sealed>]
-type PostgresUserStore(dataSource: NpgsqlDataSource) =
+type PostgresUserStore
+    (dataSource: NpgsqlDataSource, accountOperations: AccountOperationContext, dataProtection: IDataProtectionProvider)
+    =
     let errors = IdentityErrorDescriber()
     let db = QueryContextFactory.Create dataSource
+
+    let protector = dataProtection.CreateProtector "fsnix.user-tokens:v1"
+
+    /// <summary>Token values are protected at rest. Rows written before protection carry no
+    /// prefix and keep reading as plaintext so deployed legacy rows can be rotated on write.</summary>
+    let protectToken (value: string) = "p1:" + protector.Protect value
+
+    let unprotectToken (value: string) =
+        match value.StartsWith("p1:", StringComparison.Ordinal) with
+        | true ->
+            try
+                Some(protector.Unprotect(value.Substring 3))
+            with :? CryptographicException ->
+                None
+        | false -> Some value
 
     let userFromRow (row: users) =
         let user = ApplicationUser()
@@ -103,7 +122,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                     { user_id = user.Id
                       login_provider = provider
                       name = name
-                      value = value }
+                      value = protectToken value }
 
                 let! _ =
                     insertTask db {
@@ -130,7 +149,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                         cancel cancellationToken
                 }
 
-            return Option.toObj value
+            return value |> Option.bind unprotectToken |> Option.toObj
         }
 
     let hashRecoveryCode (code: string) =
@@ -159,18 +178,61 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 if String.IsNullOrWhiteSpace user.ConcurrencyStamp then
                     user.ConcurrencyStamp <- Guid.NewGuid().ToString("N")
 
-                try
-                    let! _ =
-                        insertTask db {
-                            into fsnix.users
-                            entity (rowFromUser user)
-                            cancel cancellationToken
-                        }
+                match accountOperations.TryTake() with
+                | Some(RegisterFlow registered as operation) when registered.UserId = user.Id ->
+                    // The registration transaction: user row, flow request, deadline, start
+                    // callback, and marker commit together or not at all.
+                    try
+                        use connection = dataSource.CreateConnection()
+                        do! connection.OpenAsync(cancellationToken)
+                        use! transaction = connection.BeginTransactionAsync(cancellationToken)
 
-                    return IdentityResult.Success
-                with :? PostgresException as exceptionValue when
-                    exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
-                    return duplicateResult exceptionValue user
+                        let txContext = new QueryContext(connection, PostgresEmitter())
+                        txContext.Transaction <- Some(transaction :> DbTransaction)
+
+                        let! _ =
+                            insertTask txContext {
+                                into fsnix.users
+                                entity (rowFromUser user)
+                                cancel cancellationToken
+                            }
+
+                        let! applied = AccountOperationSql.apply connection transaction operation cancellationToken
+
+                        match applied with
+                        | Ok() ->
+                            do! transaction.CommitAsync(CancellationToken.None)
+                            return IdentityResult.Success
+                        | Error message ->
+                            return
+                                raise (
+                                    InvalidOperationException(
+                                        $"Account operation '%s{AccountOperation.describe operation}' failed: %s{message}"
+                                    )
+                                )
+                    with :? PostgresException as exceptionValue when
+                        exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
+                        return duplicateResult exceptionValue user
+                | Some operation ->
+                    return
+                        raise (
+                            InvalidOperationException(
+                                $"Account operation '%s{AccountOperation.describe operation}' does not match this user creation."
+                            )
+                        )
+                | None ->
+                    try
+                        let! _ =
+                            insertTask db {
+                                into fsnix.users
+                                entity (rowFromUser user)
+                                cancel cancellationToken
+                            }
+
+                        return IdentityResult.Success
+                    with :? PostgresException as exceptionValue when
+                        exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
+                        return duplicateResult exceptionValue user
             }
 
         member _.UpdateAsync(user, cancellationToken) =
@@ -180,34 +242,93 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                 let nextStamp = Guid.NewGuid().ToString("N")
                 let row = rowFromUser user
 
-                try
-                    let! affected =
-                        updateTask db {
-                            for persisted in fsnix.users do
-                                set persisted.username row.username
-                                set persisted.normalized_username row.normalized_username
-                                set persisted.email row.email
-                                set persisted.normalized_email row.normalized_email
-                                set persisted.email_confirmed row.email_confirmed
-                                set persisted.password_hash row.password_hash
-                                set persisted.two_factor_enabled row.two_factor_enabled
-                                set persisted.security_stamp row.security_stamp
-                                set persisted.concurrency_stamp nextStamp
-                                set persisted.lockout_end row.lockout_end
-                                set persisted.lockout_enabled row.lockout_enabled
-                                set persisted.access_failed_count row.access_failed_count
-                                where (persisted.id = user.Id && persisted.concurrency_stamp = previousStamp)
-                                cancel cancellationToken
-                        }
+                match accountOperations.TryTake() with
+                | Some(CompleteFlow completed as operation) when completed.UserId = user.Id ->
+                    // The completion transaction: user update, request completion, marker, and
+                    // sanitized callback commit together or not at all.
+                    try
+                        use connection = dataSource.CreateConnection()
+                        do! connection.OpenAsync(cancellationToken)
+                        use! transaction = connection.BeginTransactionAsync(cancellationToken)
 
-                    if affected = 1 then
-                        user.ConcurrencyStamp <- nextStamp
-                        return IdentityResult.Success
-                    else
-                        return IdentityResult.Failed(errors.ConcurrencyFailure())
-                with :? PostgresException as exceptionValue when
-                    exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
-                    return duplicateResult exceptionValue user
+                        let txContext = new QueryContext(connection, PostgresEmitter())
+                        txContext.Transaction <- Some(transaction :> DbTransaction)
+
+                        let! affected =
+                            updateTask txContext {
+                                for persisted in fsnix.users do
+                                    set persisted.username row.username
+                                    set persisted.normalized_username row.normalized_username
+                                    set persisted.email row.email
+                                    set persisted.normalized_email row.normalized_email
+                                    set persisted.email_confirmed row.email_confirmed
+                                    set persisted.password_hash row.password_hash
+                                    set persisted.two_factor_enabled row.two_factor_enabled
+                                    set persisted.security_stamp row.security_stamp
+                                    set persisted.concurrency_stamp nextStamp
+                                    set persisted.lockout_end row.lockout_end
+                                    set persisted.lockout_enabled row.lockout_enabled
+                                    set persisted.access_failed_count row.access_failed_count
+                                    where (persisted.id = user.Id && persisted.concurrency_stamp = previousStamp)
+                                    cancel cancellationToken
+                            }
+
+                        if affected = 1 then
+                            let! applied = AccountOperationSql.apply connection transaction operation cancellationToken
+
+                            match applied with
+                            | Ok() ->
+                                do! transaction.CommitAsync(CancellationToken.None)
+                                user.ConcurrencyStamp <- nextStamp
+                                return IdentityResult.Success
+                            | Error message ->
+                                return
+                                    raise (
+                                        InvalidOperationException(
+                                            $"Account operation '%s{AccountOperation.describe operation}' failed: %s{message}"
+                                        )
+                                    )
+                        else
+                            return IdentityResult.Failed(errors.ConcurrencyFailure())
+                    with :? PostgresException as exceptionValue when
+                        exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
+                        return duplicateResult exceptionValue user
+                | Some operation ->
+                    return
+                        raise (
+                            InvalidOperationException(
+                                $"Account operation '%s{AccountOperation.describe operation}' does not match this user update."
+                            )
+                        )
+                | None ->
+                    try
+                        let! affected =
+                            updateTask db {
+                                for persisted in fsnix.users do
+                                    set persisted.username row.username
+                                    set persisted.normalized_username row.normalized_username
+                                    set persisted.email row.email
+                                    set persisted.normalized_email row.normalized_email
+                                    set persisted.email_confirmed row.email_confirmed
+                                    set persisted.password_hash row.password_hash
+                                    set persisted.two_factor_enabled row.two_factor_enabled
+                                    set persisted.security_stamp row.security_stamp
+                                    set persisted.concurrency_stamp nextStamp
+                                    set persisted.lockout_end row.lockout_end
+                                    set persisted.lockout_enabled row.lockout_enabled
+                                    set persisted.access_failed_count row.access_failed_count
+                                    where (persisted.id = user.Id && persisted.concurrency_stamp = previousStamp)
+                                    cancel cancellationToken
+                            }
+
+                        if affected = 1 then
+                            user.ConcurrencyStamp <- nextStamp
+                            return IdentityResult.Success
+                        else
+                            return IdentityResult.Failed(errors.ConcurrencyFailure())
+                    with :? PostgresException as exceptionValue when
+                        exceptionValue.SqlState = PostgresErrorCodes.UniqueViolation ->
+                        return duplicateResult exceptionValue user
             }
 
         member _.DeleteAsync(user, cancellationToken) =
@@ -418,7 +539,10 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                     if isNull storedValue || storedValue = DBNull.Value then
                         Array.empty
                     else
-                        string storedValue |> _.Split(';', StringSplitOptions.RemoveEmptyEntries)
+                        string storedValue
+                        |> unprotectToken
+                        |> Option.map (fun value -> value.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                        |> Option.defaultValue Array.empty
 
                 match codes |> Array.tryFindIndex (fixedTimeEqual submittedHash) with
                 | None ->
@@ -431,7 +555,7 @@ type PostgresUserStore(dataSource: NpgsqlDataSource) =
                     let! _ =
                         updateTask context {
                             for token in fsnix.user_tokens do
-                                set token.value remaining
+                                set token.value (protectToken remaining)
 
                                 where (
                                     token.user_id = user.Id

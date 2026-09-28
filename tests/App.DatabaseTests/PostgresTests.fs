@@ -92,6 +92,12 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                     [ "App.Migrations.Migrations.init.001_extensions_and_repeatable_state.sql"
                       "App.Migrations.Migrations.main.001_feature_flags.sql"
                       "App.Migrations.Migrations.main.002_identity.sql"
+                      "App.Migrations.Migrations.main.003_automata_integration.sql"
+                      "App.Migrations.Migrations.main.004_outbox_delivery_hardening.sql"
+                      "App.Migrations.Migrations.main.005_account_flows.sql"
+                      "App.Migrations.Migrations.main.006_account_flow_uniqueness.sql"
+                      "App.Migrations.Migrations.main.007_email_delivery.sql"
+                      "App.Migrations.Migrations.main.008_account_flow_request_idempotency.sql"
                       "App.Migrations.Migrations.test.001_development_marker.sql" ],
                     journal
                 )
@@ -144,7 +150,13 @@ type PostgresTests(fixture: PostgreSqlFixture) =
             Assert.Equal<string list>(
                 [ "App.Migrations.Migrations.init.001_extensions_and_repeatable_state.sql"
                   "App.Migrations.Migrations.main.001_feature_flags.sql"
-                  "App.Migrations.Migrations.main.002_identity.sql" ],
+                  "App.Migrations.Migrations.main.002_identity.sql"
+                  "App.Migrations.Migrations.main.003_automata_integration.sql"
+                  "App.Migrations.Migrations.main.004_outbox_delivery_hardening.sql"
+                  "App.Migrations.Migrations.main.005_account_flows.sql"
+                  "App.Migrations.Migrations.main.006_account_flow_uniqueness.sql"
+                  "App.Migrations.Migrations.main.007_email_delivery.sql"
+                  "App.Migrations.Migrations.main.008_account_flow_request_idempotency.sql" ],
                 journal
             )
 

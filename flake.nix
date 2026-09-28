@@ -43,7 +43,7 @@
         }:
         let
           app_name = "fsnix";
-          dotnet = pkgs.dotnet-sdk_10;
+          net10 = pkgs.dotnet-sdk_10;
           version = "1.0.0";
           app = pkgs.buildDotnetModule {
             pname = app_name;
@@ -65,7 +65,7 @@
             };
             projectFile = "src/App/App.fsproj";
             nugetDeps = ./deps.json;
-            dotnet-sdk = dotnet;
+            dotnet-sdk = net10;
             dotnet-runtime = pkgs.dotnet-aspnetcore_10;
             executables = [ "App" ];
             doCheck = false;
@@ -122,7 +122,7 @@
             ci = pkgs.mkShell {
               name = "ci-shell";
               buildInputs = [
-                dotnet
+                net10
                 pkgs.gnumake
               ];
 
@@ -147,7 +147,7 @@
             packages = with pkgs; [
               bash
               gnumake
-              postgresql_18
+              postgresql_19
 
               # for dotnet
               netcoredbg
@@ -157,12 +157,33 @@
 
             languages.dotnet = {
               enable = true;
-              package = dotnet;
+              package = net10;
             };
 
+            # Development email capture: the app relays its encrypted outbox over SMTP to
+            # Mailpit, which serves the mailbox UI and REST API on 8025. Chaos is enabled (all
+            # probabilities default to 0) so SMTP failure behavior can be exercised through the
+            # UI or API; duplicate suppression stays off because it would hide SMTP's real
+            # at-least-once semantics.
+            services.mailpit = {
+              enable = true;
+              smtpListenAddress = "127.0.0.1:1025";
+              uiListenAddress = "127.0.0.1:8025";
+              additionalArgs = [ "--enable-chaos" ];
+            };
+
+            # Mirrors the Automata repository's development database exactly:
+            # same nixpkgs pin (flake.lock), same PostgreSQL 19 build, same
+            # extension set and server settings. The pinned server is a
+            # development dependency of ByzantineSystems.Automata 0.5.0 and
+            # must not be updated independently of it (PLAN.md, P0 gate).
             services.postgres = {
               enable = true;
-              package = pkgs.postgresql_18;
+              package = pkgs.postgresql_19;
+              extensions = ext: [
+                ext.pg_cron
+                ext.pgmq
+              ];
               initdbArgs = [
                 "--locale=C"
                 "--encoding=UTF8"
@@ -174,6 +195,34 @@
                   pass = app_name;
                 }
               ];
+              settings = {
+                shared_preload_libraries = pkgs.lib.concatStringsSep "," [
+                  "auto_explain"
+                  "pg_cron"
+                  "pg_stat_statements"
+                ];
+                session_preload_libraries = "auto_explain";
+                "auto_explain.log_min_duration" = 150;
+                "auto_explain.log_analyze" = true;
+                log_min_duration_statement = 0;
+                log_statement = "all";
+                "cron.database_name" = "${app_name}";
+                compute_query_id = "on";
+                "pg_stat_statements.max" = 10000;
+                "pg_stat_statements.track" = "all";
+                shared_buffers = "1GB";
+                work_mem = "16MB";
+                huge_pages = "try";
+                effective_io_concurrency = 16;
+                maintenance_io_concurrency = 16;
+              }
+              // lib.optionalAttrs pkgs.stdenv.isLinux {
+                io_method = "io_uring";
+              }
+              // lib.optionalAttrs pkgs.stdenv.isDarwin {
+                io_method = "worker";
+                io_workers = 8;
+              };
               port = 5432;
               listen_addresses = "127.0.0.1";
               initialScript = ''
@@ -183,6 +232,16 @@
 
             env.ConnectionStrings__App = "Host=127.0.0.1;Port=5432;Database=${app_name};Username=${app_name};Password=${app_name}";
 
+            # Development email delivery through the Mailpit service above. Production
+            # overrides every value explicitly; startup validation rejects loopback hosts and
+            # missing TLS outside Development.
+            env.Email__Host = "127.0.0.1";
+            env.Email__Port = "1025";
+            env.Email__UseTls = "false";
+            env.Email__FromAddress = "fsnix@example.test";
+            env.Email__FromName = "fsnix (dev)";
+            env.Email__PublicOrigin = "http://localhost:5000";
+
             scripts = {
               migrate.exec = "dotnet run --project src/App/App.fsproj -- --migrate";
               db-connect.exec = "psql postgresql://${app_name}:${app_name}@127.0.0.1:5432/${app_name}";
@@ -191,6 +250,11 @@
 
             enterShell = ''
               echo "Starting Development Environment..."
+            '';
+
+            enterTest = ''
+              make test
+              make schema-check
             '';
           };
         };
