@@ -9,11 +9,18 @@ type RuntimeComponent =
     | ProbeMachine
     | AccountFlowMachine
     | CartMachine
+    | OrderMachine
+    | PaymentMachine
+    | ShipmentMachine
+    | RefundMachine
+    | ReturnMachine
+    | ReturnWindowScanner
     | IntegrationOutboxRelay
     | EmailDeliveryRelay
     | FlowDeadlineScanner
     | CartAbandonmentScanner
     | CartMergeScanner
+    | ReservationExpiryScanner
 
 [<RequireQualifiedAccess>]
 module RuntimeComponent =
@@ -23,11 +30,18 @@ module RuntimeComponent =
         | RuntimeComponent.ProbeMachine -> "probe-machine"
         | RuntimeComponent.AccountFlowMachine -> "account-flow-machine"
         | RuntimeComponent.CartMachine -> "cart-machine"
+        | RuntimeComponent.OrderMachine -> "order-machine"
+        | RuntimeComponent.PaymentMachine -> "payment-machine"
+        | RuntimeComponent.ShipmentMachine -> "shipment-machine"
+        | RuntimeComponent.RefundMachine -> "refund-machine"
+        | RuntimeComponent.ReturnMachine -> "return-machine"
+        | RuntimeComponent.ReturnWindowScanner -> "return-window-scanner"
         | RuntimeComponent.IntegrationOutboxRelay -> "integration-outbox-relay"
         | RuntimeComponent.EmailDeliveryRelay -> "email-delivery-relay"
         | RuntimeComponent.FlowDeadlineScanner -> "flow-deadline-scanner"
         | RuntimeComponent.CartAbandonmentScanner -> "cart-abandonment-scanner"
         | RuntimeComponent.CartMergeScanner -> "cart-merge-scanner"
+        | RuntimeComponent.ReservationExpiryScanner -> "reservation-expiry-scanner"
 
 [<RequireQualifiedAccess>]
 type RuntimeFailure =
@@ -68,11 +82,18 @@ type RuntimeHealth(timeProvider: TimeProvider) =
               RuntimeComponent.ProbeMachine
               RuntimeComponent.AccountFlowMachine
               RuntimeComponent.CartMachine
+              RuntimeComponent.OrderMachine
+              RuntimeComponent.PaymentMachine
+              RuntimeComponent.ShipmentMachine
+              RuntimeComponent.RefundMachine
+              RuntimeComponent.ReturnMachine
+              RuntimeComponent.ReturnWindowScanner
               RuntimeComponent.IntegrationOutboxRelay
               RuntimeComponent.EmailDeliveryRelay
               RuntimeComponent.FlowDeadlineScanner
               RuntimeComponent.CartAbandonmentScanner
-              RuntimeComponent.CartMergeScanner ]
+              RuntimeComponent.CartMergeScanner
+              RuntimeComponent.ReservationExpiryScanner ]
             |> Seq.map (fun service -> KeyValuePair(service, initial service))
         )
 
@@ -126,7 +147,11 @@ module RuntimeHealth =
         [ RuntimeComponent.Boot
           RuntimeComponent.ProbeMachine
           RuntimeComponent.AccountFlowMachine
-          RuntimeComponent.CartMachine ]
+          RuntimeComponent.CartMachine
+          RuntimeComponent.OrderMachine
+          RuntimeComponent.PaymentMachine
+          RuntimeComponent.ShipmentMachine ]
+        @ [ RuntimeComponent.RefundMachine; RuntimeComponent.ReturnMachine ]
         |> List.forall (fun service -> snapshot[service].Phase = RuntimePhase.Healthy)
 
     let workersReady
@@ -139,6 +164,8 @@ module RuntimeHealth =
           RuntimeComponent.FlowDeadlineScanner
           RuntimeComponent.CartAbandonmentScanner
           RuntimeComponent.CartMergeScanner ]
+        @ [ RuntimeComponent.ReservationExpiryScanner
+            RuntimeComponent.ReturnWindowScanner ]
         |> List.forall (fun service ->
             let observation = snapshot[service]
 

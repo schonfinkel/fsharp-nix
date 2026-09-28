@@ -160,6 +160,12 @@ module CartWire =
           [<JsonPropertyName("deadline")>]
           Deadline: int64 }
 
+    type CartConvertedDto =
+        { [<JsonPropertyName("tag")>]
+          Tag: string
+          [<JsonPropertyName("orderId")>]
+          OrderId: string }
+
     type RecordCartTouchDto =
         { [<JsonPropertyName("tag")>]
           Tag: string
@@ -220,6 +226,9 @@ module CartCodec =
 
         [<Literal>]
         let AbandonmentTimerFiredEvent = "abandonment-timer-fired-v1"
+
+        [<Literal>]
+        let CartConvertedEvent = "cart-converted-v1"
 
         [<Literal>]
         let RecordCartTouchAction = "record-cart-touch-v1"
@@ -558,6 +567,12 @@ module CartCodec =
                       Deadline = deadline.ToUnixTimeMilliseconds() }
 
                 box timer
+            | CartConverted orderId ->
+                let converted: CartWire.CartConvertedDto =
+                    { Tag = Tags.CartConvertedEvent
+                      OrderId = orderId }
+
+                box converted
 
         encodeValue eventTypeName dto
 
@@ -628,6 +643,13 @@ module CartCodec =
                             )
                         with _ ->
                             Error(decodeFailure eventTypeName "'deadline' epoch was invalid.")))
+            | t when t = Tags.CartConvertedEvent ->
+                decodeExact<CartWire.CartConvertedDto> eventTypeName json
+                |> Result.bind (fun dto ->
+                    if dto.Tag <> tag || String.IsNullOrWhiteSpace dto.OrderId then
+                        Error(decodeFailure eventTypeName "'orderId' must be non-empty.")
+                    else
+                        Ok(CartConverted dto.OrderId))
             | _ -> Error(unknownTag eventTypeName tag))
 
     let private actionTypeName = "CartAction"
@@ -767,7 +789,7 @@ module CartCodec =
     let private build (log: ILogger) storeArg =
         machine<CartId, CartState, CartEvent, CartAction, CartActionError> (machineId Cart.MachineKey) {
             chart Cart.chartValue
-            chartVersion 1
+            chartVersion 2
             initialState Cart.initialState
             store storeArg
             logger log

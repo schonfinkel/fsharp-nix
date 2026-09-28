@@ -143,3 +143,36 @@ type CartModel =
       Count: int
       Total: string
       Error: string option }
+
+type CheckoutModel =
+    { OrderKey: string
+      Email: string
+      Recipient: string
+      Line1: string
+      Line2: string
+      City: string
+      Region: string
+      PostalCode: string
+      CountryCode: string
+      Error: string option }
+
+type OrderPayModel =
+    { Attempt: string
+      Methods: (string * string) list }
+
+type ReturnLineModel =
+    { LineId: string
+      Name: string
+      Available: int
+      ReturnKey: string }
+
+type OrderStatusModel =
+    { OrderId: string
+      Status: string
+      Total: string
+      CanCancel: bool
+      TooLateToCancel: bool
+      Pay: OrderPayModel option
+      ReturnLines: ReturnLineModel list
+      ReturnStatuses: (string * string) list
+      Error: string option }

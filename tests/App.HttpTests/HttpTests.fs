@@ -22,8 +22,9 @@ open Microsoft.Extensions.Options
 open Npgsql
 open Oxpecker.Htmx
 
-type TestAuthenticationState(authenticated: bool) =
+type TestAuthenticationState(authenticated: bool, userId: Guid) =
     member _.Authenticated = authenticated
+    member _.UserId = userId
 
 type TestAuthenticationHandler
     (
@@ -37,7 +38,7 @@ type TestAuthenticationHandler
     override _.HandleAuthenticateAsync() =
         if state.Authenticated then
             let claims =
-                [ Claim(ClaimTypes.NameIdentifier, Guid.Empty.ToString())
+                [ Claim(ClaimTypes.NameIdentifier, state.UserId.ToString("D"))
                   Claim(ClaimTypes.Name, "test-admin")
                   Claim("amr", "mfa") ]
 
@@ -47,7 +48,7 @@ type TestAuthenticationHandler
         else
             AuthenticateResult.NoResult() |> System.Threading.Tasks.Task.FromResult
 
-type AppFactory(store: FakeFeatureFlagStore, connectionString: string, ?authenticated: bool) =
+type AppFactory(store: FakeFeatureFlagStore, connectionString: string, ?authenticated: bool, ?userId: Guid) =
     inherit WebApplicationFactory<AppMarker>()
 
     override _.ConfigureWebHost(builder: IWebHostBuilder) =
@@ -60,7 +61,9 @@ type AppFactory(store: FakeFeatureFlagStore, connectionString: string, ?authenti
                 services.AddSingleton<NpgsqlDataSource>(fun _ -> NpgsqlDataSource.Create connectionString)
                 |> ignore
 
-                services.AddSingleton(TestAuthenticationState(defaultArg authenticated true))
+                services.AddSingleton(
+                    TestAuthenticationState(defaultArg authenticated true, defaultArg userId Guid.Empty)
+                )
                 |> ignore
 
                 services

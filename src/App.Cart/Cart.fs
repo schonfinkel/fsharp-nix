@@ -64,6 +64,7 @@ type CartEvent =
     | MergeFailed of mergeId: Guid
     | ApplyMerge of mergeId: Guid * sourceCartId: string * lines: CartLine list
     | AbandonmentTimerFired of generation: CartEpoch * deadline: DateTimeOffset
+    | CartConverted of orderId: string
 
 /// <summary>Consequential local effects of the cart machine. Each is idempotent, executed
 /// through an action receipt and, where a machine must react, an integration-outbox callback.
@@ -221,7 +222,7 @@ module Cart =
 
     let private lineAddedEvent state event =
         match state, event with
-        | Empty, LineAdded(_, expected) -> expected = InitialEpoch
+        | (Empty | Converted), LineAdded(_, expected) -> expected = InitialEpoch
         | Active cart, LineAdded(_, expected)
         | Abandoned cart, LineAdded(_, expected) -> expected = cart.Epoch
         | _ -> false
@@ -275,6 +276,11 @@ module Cart =
         | ApplyMerge _ -> true
         | _ -> false
 
+    let private cartConvertedEvent state event =
+        match state, event with
+        | (Active _ | Abandoned _), CartConverted orderId -> not (String.IsNullOrWhiteSpace orderId)
+        | _ -> false
+
     /// <summary>Events that are absorbed as no-ops when their guarded transition cannot fire:
     /// stale timers and late or duplicate merge callbacks. Client mutations are never absorbed,
     /// so a stale epoch or illegal transition is rejected rather than silently dropped.</summary>
@@ -287,6 +293,7 @@ module Cart =
         | MergeRequested _
         | ApplyMerge _ -> false
         | AbandonmentTimerFired _
+        | CartConverted _
         | MergeSnapshotCaptured _
         | MergeApplied _
         | MergeFailed _ -> true
@@ -375,6 +382,8 @@ module Cart =
                         withLines report.Result nextEpoch
                     | _ -> [], state)
 
+                on cartConvertedEvent (fun _ _ -> [], Converted)
+
                 // Duplicate starts, stale epochs, and stale timers are absorbed.
                 internalOn absorbEvent (fun _ _ -> [])
             }
@@ -417,7 +426,12 @@ module Cart =
             }
 
             state "converted" {
-                // Reachable only from P3; no command mutates a converted cart.
+                // A new checkout session may begin a fresh cart at the initial epoch.
+                on lineAddedEvent (fun _ event ->
+                    match event with
+                    | LineAdded(line, _) -> [ RecordCartTouch(1L, true) ], withLines [ line ] 1L
+                    | _ -> [], Converted)
+
                 internalOn absorbEvent (fun _ _ -> [])
             }
 
@@ -472,6 +486,8 @@ module Cart =
                         [ NotifyMergeApplied(mergeId, source); RecordCartTouch(nextEpoch, hasLines) ],
                         withLines report.Result nextEpoch
                     | _ -> [], state)
+
+                on cartConvertedEvent (fun _ _ -> [], Converted)
 
                 internalOn absorbEvent (fun _ _ -> [])
             }

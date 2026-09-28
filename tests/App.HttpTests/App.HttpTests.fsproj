@@ -16,6 +16,8 @@
     <Compile Include="AccountFlowHttpTests.fs" />
     <Compile Include="HealthHttpTests.fs" />
     <Compile Include="CartHttpTests.fs" />
+    <Compile Include="OrderHttpTests.fs" />
+    <Compile Include="PaymentHttpTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -29,6 +31,8 @@
     <ProjectReference Include="..\..\src\App.Cart\App.Cart.fsproj" />
     <ProjectReference Include="..\..\src\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\..\src\App.Domain\App.Domain.fsproj" />
+    <ProjectReference Include="..\..\src\App.Orders\App.Orders.fsproj" />
+    <ProjectReference Include="..\..\src\App.Payments\App.Payments.fsproj" />
     <ProjectReference Include="..\App.Testing\App.Testing.fsproj" />
   </ItemGroup>
 
