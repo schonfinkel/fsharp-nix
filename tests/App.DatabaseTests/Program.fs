@@ -90,7 +90,24 @@ let private tests =
                 DatabaseTest.isolated false "guest capability is key scoped" (fun fixture ->
                     CartGuestCapabilitiesTests(fixture).``a different key cannot resolve the capability`` ())
                 DatabaseTest.isolated false "merge snapshot is insert-once" (fun fixture ->
-                    CartMergeTests(fixture).``capture is insert-once and applied snapshots leave the pending set`` ()) ] ]
+                    CartMergeTests(fixture).``capture is insert-once and applied snapshots leave the pending set`` ()) ]
+          testList
+              "stock reservations"
+              [ DatabaseTest.isolated false "last unit race reserves once" (fun fixture ->
+                    OrderReservationTests(fixture).``concurrent last-unit reservations allow exactly one order`` ())
+                DatabaseTest.isolated false "release fences delayed reserve" (fun fixture ->
+                    OrderReservationTests(fixture).``release fences a delayed reserve action`` ())
+                DatabaseTest.isolated false "opposite order multi SKU reservation" (fun fixture ->
+                    OrderReservationTests(fixture).``opposite order multi SKU reservations do not deadlock`` ())
+                DatabaseTest.isolated false "order snapshots are immutable" (fun fixture ->
+                    OrderReservationTests(fixture).``order snapshots are immutable and idempotently captured`` ())
+                DatabaseTest.isolated false "stock commit is idempotent" (fun fixture ->
+                    OrderReservationTests(fixture).``stock commit is idempotent and cannot be released`` ()) ]
+          testList
+              "payment operations"
+              [ DatabaseTest.isolated false "authorization is provider-idempotent" (fun fixture ->
+                    PaymentOperationTests.``authorization persists one provider operation and one order callback``
+                        fixture) ] ]
     |> testSequenced
 
 [<EntryPoint>]

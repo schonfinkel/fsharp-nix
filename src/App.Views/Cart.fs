@@ -74,6 +74,9 @@ module CartViews =
 
                 p (class' = "total") { $"Total: {model.Total}" }
 
+                if context.User.Identity.IsAuthenticated then
+                    a (href = "/checkout") { "Proceed to checkout" }
+
                 form(action = "/cart/clear", method = "post")
                     .hxPost("/cart/clear")
                     .hxTarget("#cart-panel")

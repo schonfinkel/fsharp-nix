@@ -7,6 +7,8 @@ open App.Auth
 open App.Cart
 open App.Database
 open App.Domain
+open App.Orders
+open App.Payments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
@@ -147,6 +149,152 @@ type CartMachineClient(context: PostgresContext, loggerFactory: ILoggerFactory, 
                 health.Stopped RuntimeComponent.CartMachine
             }
             :> Task
+
+type OrderMachineClient(context: PostgresContext, loggerFactory: ILoggerFactory, health: RuntimeHealth) =
+    let logger = loggerFactory.CreateLogger "OrderMachineClient"
+    let mutable client = None
+
+    member _.Orders =
+        client
+        |> Option.defaultWith (fun () -> invalidOp "the order machine client has not started")
+
+    interface IHostedService with
+        member _.StartAsync(ct: CancellationToken) =
+            task {
+                health.Starting RuntimeComponent.OrderMachine
+
+                let machine =
+                    match OrderCodec.buildClient logger context with
+                    | Ok machine -> machine
+                    | Error _ ->
+                        health.Failed(RuntimeComponent.OrderMachine, RuntimeFailure.InvalidChart)
+                        invalidOp "order client machine is invalid"
+
+                match! Machine.startAsync machine (PostgresChartRegistry { Context = context }) ct with
+                | Ok(Startup.Started _) ->
+                    client <- Some machine
+                    health.Succeeded RuntimeComponent.OrderMachine
+                | Ok(Startup.Refused _) ->
+                    health.Failed(RuntimeComponent.OrderMachine, RuntimeFailure.StartupRefused)
+                    return raise (InvalidOperationException "order client refused to boot")
+                | Error _ ->
+                    health.Failed(RuntimeComponent.OrderMachine, RuntimeFailure.StartupFailed)
+                    return raise (InvalidOperationException "order client failed to start")
+            }
+            :> Task
+
+        member _.StopAsync(ct: CancellationToken) =
+            task {
+                match client with
+                | Some machine -> do! Machine.stopAsync machine ct
+                | None -> ()
+
+                client <- None
+                health.Stopped RuntimeComponent.OrderMachine
+            }
+            :> Task
+
+type PaymentMachineClient(context: PostgresContext, loggerFactory: ILoggerFactory, health: RuntimeHealth) =
+    let logger = loggerFactory.CreateLogger "PaymentMachineClient"
+    let mutable client = None
+
+    member _.Payments =
+        client
+        |> Option.defaultWith (fun () -> invalidOp "the payment machine client has not started")
+
+    interface IHostedService with
+        member _.StartAsync(ct: CancellationToken) =
+            task {
+                health.Starting RuntimeComponent.PaymentMachine
+
+                let machine =
+                    match PaymentCodec.buildClient logger context with
+                    | Ok machine -> machine
+                    | Error _ ->
+                        health.Failed(RuntimeComponent.PaymentMachine, RuntimeFailure.InvalidChart)
+                        invalidOp "payment client machine is invalid"
+
+                match! Machine.startAsync machine (PostgresChartRegistry { Context = context }) ct with
+                | Ok(Startup.Started _) ->
+                    client <- Some machine
+                    health.Succeeded RuntimeComponent.PaymentMachine
+                | Ok(Startup.Refused _) ->
+                    health.Failed(RuntimeComponent.PaymentMachine, RuntimeFailure.StartupRefused)
+                    return raise (InvalidOperationException "payment client refused to boot")
+                | Error _ ->
+                    health.Failed(RuntimeComponent.PaymentMachine, RuntimeFailure.StartupFailed)
+                    return raise (InvalidOperationException "payment client failed to start")
+            }
+            :> Task
+
+        member _.StopAsync(ct: CancellationToken) =
+            task {
+                match client with
+                | Some machine -> do! Machine.stopAsync machine ct
+                | None -> ()
+
+                client <- None
+                health.Stopped RuntimeComponent.PaymentMachine
+            }
+            :> Task
+
+type ReservationExpiryScanner
+    (
+        dataSource: NpgsqlDataSource,
+        orders: OrderMachineClient,
+        logger: ILogger<ReservationExpiryScanner>,
+        health: RuntimeHealth
+    ) =
+    inherit BackgroundService()
+    let suffix = Guid.NewGuid().ToString("N")[..7]
+
+    let options =
+        ReservationDeadlines.defaults $"reservation-expiry-{Environment.MachineName}-{suffix}"
+
+    override _.ExecuteAsync(ct: CancellationToken) =
+        task {
+            try
+                while not ct.IsCancellationRequested do
+                    try
+                        let! claimed = ReservationDeadlines.claim dataSource options ct
+
+                        for row in claimed do
+                            let! gate = ReservationDeadlines.gateState dataSource row.Gate ct
+
+                            if gate = "sent" then
+                                let key = $"reservation-expiry:v1:{row.Id}"
+
+                                let! result =
+                                    Machine.enqueue
+                                        orders.Orders
+                                        (entityId row.OrderId)
+                                        (EventEnvelope.create key (ReservationExpired(row.Generation, row.Deadline)))
+                                        ct
+
+                                match result with
+                                | Ok _ -> do! ReservationDeadlines.settle dataSource options row.Id "fired" ct
+                                | Error _ -> do! ReservationDeadlines.settle dataSource options row.Id "pending" ct
+                            elif gate = "pending" then
+                                do! ReservationDeadlines.settle dataSource options row.Id "pending" ct
+                            else
+                                do! ReservationDeadlines.settle dataSource options row.Id "cancelled" ct
+
+                        health.Succeeded RuntimeComponent.ReservationExpiryScanner
+                    with
+                    | :? OperationCanceledException when ct.IsCancellationRequested -> ()
+                    | error ->
+                        health.Failed(RuntimeComponent.ReservationExpiryScanner, RuntimeFailure.PassFailed)
+
+                        logger.LogError(
+                            "reservation expiry scanner failed ({ExceptionType})",
+                            SafeDiagnostics.exceptionType error
+                        )
+
+                    do! Task.Delay(TimeSpan.FromMilliseconds 500., ct)
+            with :? OperationCanceledException ->
+                health.Stopped RuntimeComponent.ReservationExpiryScanner
+        }
+        :> Task
 
 /// <summary>
 /// Fires due cart-abandonment deadlines. Each deadline is armed by the epoch that recorded the

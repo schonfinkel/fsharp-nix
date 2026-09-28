@@ -83,3 +83,48 @@ module PriceVersion =
             Ok(PriceVersion value)
 
     let value (PriceVersion value) = value
+
+/// <summary>Stable identifier for one immutable order line.</summary>
+[<Struct>]
+type OrderLineId = private OrderLineId of Guid
+
+module OrderLineId =
+    let create (value: Guid) =
+        if value = Guid.Empty then
+            Error "An order-line id must not be empty."
+        else
+            Ok(OrderLineId value)
+
+    let value (OrderLineId value) = value
+
+    let wireString id = (value id).ToString("D")
+
+/// <summary>Stable identifier for a stock reservation ledger row.</summary>
+[<Struct>]
+type ReservationId = private ReservationId of Guid
+
+module ReservationId =
+    let create (value: Guid) =
+        if value = Guid.Empty then
+            Error "A reservation id must not be empty."
+        else
+            Ok(ReservationId value)
+
+    let value (ReservationId value) = value
+
+    let wireString id = (value id).ToString("D")
+
+/// <summary>Reference to a restricted immutable checkout snapshot.</summary>
+[<Struct>]
+type OrderSnapshotId = private OrderSnapshotId of Guid
+
+module OrderSnapshotId =
+    let create (value: Guid) =
+        if value = Guid.Empty then
+            Error "An order snapshot id must not be empty."
+        else
+            Ok(OrderSnapshotId value)
+
+    let value (OrderSnapshotId value) = value
+
+    let wireString id = (value id).ToString("D")

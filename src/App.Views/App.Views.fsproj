@@ -22,5 +22,6 @@
     <Compile Include="OperationalHealth.fs" />
     <Compile Include="Catalog.fs" />
     <Compile Include="Cart.fs" />
+    <Compile Include="Checkout.fs" />
   </ItemGroup>
 </Project>

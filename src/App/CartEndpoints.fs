@@ -166,7 +166,8 @@ module CartEndpoints =
         | MergeApplied _
         | MergeFailed _
         | ApplyMerge _
-        | AbandonmentTimerFired _ -> None
+        | AbandonmentTimerFired _
+        | CartConverted _ -> None
 
     let private send (context: HttpContext) (cartId: CartId) (event: CartEvent) (successMessage: string) : Task =
         task {

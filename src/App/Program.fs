@@ -8,6 +8,8 @@ open App.Auth
 open App.Cart
 open App.Database
 open App.Domain
+open App.Orders
+open App.Payments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.DependencyInjection
 open ByzantineSystems.Automata.Storage
@@ -201,6 +203,9 @@ module Application =
         builder.Services.AddSingleton<RuntimeHealth>() |> ignore
         builder.Services.AddSingleton<CatalogStore>() |> ignore
 
+        builder.Services.AddSingleton(CheckoutPricing.load builder.Configuration)
+        |> ignore
+
         builder.Services.AddSingleton<ICartChangeSource, PostgresCartChangeSource>()
         |> ignore
 
@@ -312,16 +317,28 @@ module Application =
             .AddScoped<IActionHandler<ProbeId, ProbeAction, ProbeActionError>, ProbeEffectHandler>()
             .AddScoped<IActionHandler<FlowId, FlowAction, FlowActionError>, AccountFlowEffectHandler>()
             .AddScoped<IActionHandler<CartId, CartAction, CartActionError>, CartEffectHandler>()
+            .AddScoped<IActionHandler<OrderId, OrderAction, OrderActionError>, OrderEffectHandler>()
+            .AddScoped<IActionHandler<PaymentId, PaymentAction, PaymentActionError>, PaymentEffectHandler>()
+            .AddSingleton<SimulatedPaymentGateway>()
+            .AddSingleton<IPaymentGateway>(fun provider ->
+                provider.GetRequiredService<SimulatedPaymentGateway>() :> IPaymentGateway)
             .AddSingleton<ProbeMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<ProbeMachineClient>())
             .AddSingleton<AccountFlowMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<AccountFlowMachineClient>())
             .AddSingleton<CartMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<CartMachineClient>())
+            .AddSingleton<OrderMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<OrderMachineClient>())
+            .AddSingleton<PaymentMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<PaymentMachineClient>())
+            .AddHostedService<ReservationExpiryScanner>()
             .AddSingleton<OutboxDestination list>(fun provider ->
                 let probeClient = provider.GetRequiredService<ProbeMachineClient>()
                 let flowsClient = provider.GetRequiredService<AccountFlowMachineClient>()
                 let cartsClient = provider.GetRequiredService<CartMachineClient>()
+                let ordersClient = provider.GetRequiredService<OrderMachineClient>()
+                let paymentsClient = provider.GetRequiredService<PaymentMachineClient>()
 
                 [ OutboxDestination.forMachineProvider
                       Probe.MachineKey
@@ -334,7 +351,14 @@ module Application =
                       AccountFlowCodec.event
                       (fun () -> flowsClient.Flows)
                   OutboxDestination.forMachineProvider Cart.MachineKey EntityId.create CartCodec.event (fun () ->
-                      cartsClient.Carts) ])
+                      cartsClient.Carts)
+                  OutboxDestination.forMachineProvider Orders.MachineKey EntityId.create OrderCodec.event (fun () ->
+                      ordersClient.Orders)
+                  OutboxDestination.forMachineProvider
+                      Payments.MachineKey
+                      EntityId.create
+                      PaymentCodec.event
+                      (fun () -> paymentsClient.Payments) ])
             .AddHostedService<IntegrationOutboxRelay>()
             .AddHostedService<EmailDeliveryRelay>()
             .AddHostedService<FlowDeadlineScanner>()
@@ -379,6 +403,32 @@ module Application =
                     fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
                   TimeProvider = TimeProvider.System }
             )
+            .AddAutomata(
+                { MachineKey = Orders.MachineKey
+                  Supervisor = AutomataSupervisorOptions.defaults Orders.MachineKey
+                  Actions = ActionDelivery.registered<OrderId, OrderAction, OrderActionError>
+                  MachineFactory =
+                    fun provider ->
+                        OrderCodec.buildWorker
+                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "orders")
+                            (provider.GetRequiredService<PostgresContext>())
+                  ChartRegistry =
+                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+                  TimeProvider = TimeProvider.System }
+            )
+            .AddAutomata(
+                { MachineKey = Payments.MachineKey
+                  Supervisor = AutomataSupervisorOptions.defaults Payments.MachineKey
+                  Actions = ActionDelivery.registered<PaymentId, PaymentAction, PaymentActionError>
+                  MachineFactory =
+                    fun provider ->
+                        PaymentCodec.buildWorker
+                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "payments")
+                            (provider.GetRequiredService<PostgresContext>())
+                  ChartRegistry =
+                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+                  TimeProvider = TimeProvider.System }
+            )
             .AddAutomataMaintenance(
                 { MaintenanceOptions.defaults (fun provider ->
                       PostgresMaintenance(provider.GetRequiredService<PostgresContext>())) with
@@ -412,6 +462,8 @@ module Application =
                 route "/demo/checkout" (Demo.fragment BetaCheckout)
                 route "/catalog" CatalogEndpoints.search
                 route "/cart" CartEndpoints.page
+                route "/checkout" (Account.requireAuthenticated OrderEndpoints.page)
+                route "/orders/{orderId}" (Account.requireAuthenticated OrderEndpoints.show)
                 route "/cart/events" CartEvents.stream
                 route "/account/login" Account.loginPage
                 route "/account/login/2fa" Account.twoFactorPage
@@ -461,6 +513,13 @@ module Application =
                 route "/cart/items/{productId}" (Admin.requireValidAntiforgery CartEndpoints.updateItem)
                 route "/cart/items/{productId}/remove" (Admin.requireValidAntiforgery CartEndpoints.removeItem)
                 route "/cart/clear" (Admin.requireValidAntiforgery CartEndpoints.clear)
+                route "/checkout" (Account.requireAuthenticated (Admin.requireValidAntiforgery OrderEndpoints.submit))
+                route
+                    "/orders/{orderId}/authorize"
+                    (Account.requireAuthenticated (Admin.requireValidAntiforgery OrderEndpoints.authorize))
+                route
+                    "/orders/{orderId}/cancel"
+                    (Account.requireAuthenticated (Admin.requireValidAntiforgery OrderEndpoints.cancel))
                 route "/cart/merge" (Account.requireAuthenticated (Admin.requireValidAntiforgery CartEndpoints.merge))
                 route
                     "/admin/catalog/products"

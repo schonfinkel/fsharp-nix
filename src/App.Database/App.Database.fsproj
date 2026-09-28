@@ -16,6 +16,8 @@
     <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
     <ProjectReference Include="..\App.Auth\App.Auth.fsproj" />
     <ProjectReference Include="..\App.Cart\App.Cart.fsproj" />
+    <ProjectReference Include="..\App.Orders\App.Orders.fsproj" />
+    <ProjectReference Include="..\App.Payments\App.Payments.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="SchemaTypeMappings.fs" />
@@ -42,6 +44,14 @@
     <Compile Include="CartDeadlines.fs" />
     <Compile Include="CartChangeSource.fs" />
     <Compile Include="CartEffects.fs" />
+    <Compile Include="OrderCodec.fs" />
+    <Compile Include="OrderSnapshots.fs" />
+    <Compile Include="StockReservations.fs" />
+    <Compile Include="ReservationDeadlines.fs" />
+    <Compile Include="PaymentGateway.fs" />
+    <Compile Include="PaymentCodec.fs" />
+    <Compile Include="OrderEffects.fs" />
+    <Compile Include="PaymentEffects.fs" />
     <Compile Include="Services.fs" />
   </ItemGroup>
 </Project>

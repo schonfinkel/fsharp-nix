@@ -80,7 +80,24 @@ let private tests =
                 DatabaseTest.isolated false "cart event stream starts with refresh" (fun fixture ->
                     CartHttpTests(fixture).``cart event stream starts with a refresh event`` ())
                 DatabaseTest.isolated false "merge saga converges into customer cart" (fun fixture ->
-                    CartHttpTests(fixture).``merge saga converges a guest cart into the customer cart`` ()) ] ]
+                    CartHttpTests(fixture).``merge saga converges a guest cart into the customer cart`` ()) ]
+          testList
+              "orders"
+              [ DatabaseTest.isolated false "checkout reserves and replays" (fun fixture ->
+                    OrderHttpTests(fixture).``checkout reserves stock waits for payment and replays`` ())
+                DatabaseTest.isolated false "reservation failure" (fun fixture ->
+                    OrderHttpTests(fixture).``checkout reports reservation failure without an authorization intent`` ())
+                DatabaseTest.isolated false "cancellation and ownership" (fun fixture ->
+                    OrderHttpTests(fixture)
+                        .``customer cancellation releases reservations and denies another customer`` ()) ]
+          testList
+              "payments"
+              [ DatabaseTest.isolated false "pay step places the order" (fun fixture ->
+                    PaymentHttpTests(fixture).``pay step authorizes commits stock and rejects late cancellation`` ())
+                DatabaseTest.isolated false "declined payment retries" (fun fixture ->
+                    PaymentHttpTests(fixture).``declined payment returns to the pay step and a retry succeeds`` ())
+                DatabaseTest.isolated false "unknown cancellation unwinds" (fun fixture ->
+                    PaymentHttpTests(fixture).``cancelling an unknown authorization resolves and unwinds payment`` ()) ] ]
     |> testSequenced
 
 [<EntryPoint>]
