@@ -74,7 +74,23 @@ let private tests =
                     IdentityStoreTests(fixture)
                         .``account handoff commits atomically and a mismatched completion rolls back`` ())
                 DatabaseTest.isolated false "purpose-specific tokens survive restart" (fun fixture ->
-                    IdentityStoreTests(fixture).``purpose-specific identity tokens survive an application restart`` ()) ] ]
+                    IdentityStoreTests(fixture).``purpose-specific identity tokens survive an application restart`` ()) ]
+          testList
+              "catalog and cart stores"
+              [ DatabaseTest.isolated false "catalog browses and searches" (fun fixture ->
+                    CatalogStoreTests(fixture).``seed catalog browses and searches`` ())
+                DatabaseTest.isolated false "catalog update bumps price version" (fun fixture ->
+                    CatalogStoreTests(fixture).``update bumps the price version`` ())
+                DatabaseTest.isolated false "stock adjustment rejects negative" (fun fixture ->
+                    CatalogStoreTests(fixture).``adjust stock rejects a negative balance`` ())
+                DatabaseTest.isolated false "catalog create rejects duplicate sku" (fun fixture ->
+                    CatalogStoreTests(fixture).``create rejects a duplicate sku`` ())
+                DatabaseTest.isolated false "guest capability resolves and revokes" (fun fixture ->
+                    CartGuestCapabilitiesTests(fixture).``issue resolves and revokes`` ())
+                DatabaseTest.isolated false "guest capability is key scoped" (fun fixture ->
+                    CartGuestCapabilitiesTests(fixture).``a different key cannot resolve the capability`` ())
+                DatabaseTest.isolated false "merge snapshot is insert-once" (fun fixture ->
+                    CartMergeTests(fixture).``capture is insert-once and applied snapshots leave the pending set`` ()) ] ]
     |> testSequenced
 
 [<EntryPoint>]

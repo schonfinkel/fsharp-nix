@@ -8,9 +8,12 @@ type RuntimeComponent =
     | Boot
     | ProbeMachine
     | AccountFlowMachine
+    | CartMachine
     | IntegrationOutboxRelay
     | EmailDeliveryRelay
     | FlowDeadlineScanner
+    | CartAbandonmentScanner
+    | CartMergeScanner
 
 [<RequireQualifiedAccess>]
 module RuntimeComponent =
@@ -19,9 +22,12 @@ module RuntimeComponent =
         | RuntimeComponent.Boot -> "boot"
         | RuntimeComponent.ProbeMachine -> "probe-machine"
         | RuntimeComponent.AccountFlowMachine -> "account-flow-machine"
+        | RuntimeComponent.CartMachine -> "cart-machine"
         | RuntimeComponent.IntegrationOutboxRelay -> "integration-outbox-relay"
         | RuntimeComponent.EmailDeliveryRelay -> "email-delivery-relay"
         | RuntimeComponent.FlowDeadlineScanner -> "flow-deadline-scanner"
+        | RuntimeComponent.CartAbandonmentScanner -> "cart-abandonment-scanner"
+        | RuntimeComponent.CartMergeScanner -> "cart-merge-scanner"
 
 [<RequireQualifiedAccess>]
 type RuntimeFailure =
@@ -61,9 +67,12 @@ type RuntimeHealth(timeProvider: TimeProvider) =
             [ RuntimeComponent.Boot
               RuntimeComponent.ProbeMachine
               RuntimeComponent.AccountFlowMachine
+              RuntimeComponent.CartMachine
               RuntimeComponent.IntegrationOutboxRelay
               RuntimeComponent.EmailDeliveryRelay
-              RuntimeComponent.FlowDeadlineScanner ]
+              RuntimeComponent.FlowDeadlineScanner
+              RuntimeComponent.CartAbandonmentScanner
+              RuntimeComponent.CartMergeScanner ]
             |> Seq.map (fun service -> KeyValuePair(service, initial service))
         )
 
@@ -116,7 +125,8 @@ module RuntimeHealth =
     let startupReady (snapshot: Map<RuntimeComponent, RuntimeObservation>) =
         [ RuntimeComponent.Boot
           RuntimeComponent.ProbeMachine
-          RuntimeComponent.AccountFlowMachine ]
+          RuntimeComponent.AccountFlowMachine
+          RuntimeComponent.CartMachine ]
         |> List.forall (fun service -> snapshot[service].Phase = RuntimePhase.Healthy)
 
     let workersReady
@@ -126,7 +136,9 @@ module RuntimeHealth =
         =
         [ RuntimeComponent.IntegrationOutboxRelay
           RuntimeComponent.EmailDeliveryRelay
-          RuntimeComponent.FlowDeadlineScanner ]
+          RuntimeComponent.FlowDeadlineScanner
+          RuntimeComponent.CartAbandonmentScanner
+          RuntimeComponent.CartMergeScanner ]
         |> List.forall (fun service ->
             let observation = snapshot[service]
 

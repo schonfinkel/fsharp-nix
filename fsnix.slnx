@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/App/App.fsproj" />
     <Project Path="src/App.Auth/App.Auth.fsproj" />
+    <Project Path="src/App.Cart/App.Cart.fsproj" />
     <Project Path="src/App.Database/App.Database.fsproj" />
     <Project Path="src/App.Domain/App.Domain.fsproj" />
     <Project Path="src/App.Migrations/App.Migrations.fsproj" />

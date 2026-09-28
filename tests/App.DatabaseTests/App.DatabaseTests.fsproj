@@ -15,6 +15,7 @@
     <Compile Include="ProbeTests.fs" />
     <Compile Include="EmailOutboxTests.fs" />
     <Compile Include="AccountFlowRequestTests.fs" />
+    <Compile Include="CatalogAndCartTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

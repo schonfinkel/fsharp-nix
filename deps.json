@@ -445,6 +445,11 @@
     "hash": "sha256-0qI4MqqpSLqaAazEK1cm40xfmVlY8bMNRcDnxws6ctU="
   },
   {
+    "pname": "NodaMoney",
+    "version": "2.8.0",
+    "hash": "sha256-Q4pdbKqU0fn6QB52ZGoo4LzRgTKAtVMKoIqHtu/TNH8="
+  },
+  {
     "pname": "Npgsql",
     "version": "10.0.1",
     "hash": "sha256-cb4z+WH9qynS6n4I43FzSiifWLzgH26HAP/DnZvsjak="

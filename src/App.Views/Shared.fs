@@ -28,6 +28,11 @@ module SharedViews =
 
                     div (class' = "account") {
                         a (href = "/") { "Demo" }
+                        a (href = "/catalog") { "Catalog" }
+                        a (href = "/cart") { "Cart" }
+
+                        span (id = "cart-count", class' = "badge") { }
+
                         a (href = "/admin/features") { "Admin" }
                         a (href = "/admin/operations") { "Operations" }
 
@@ -46,8 +51,12 @@ module SharedViews =
                     }
                 }
 
+                div (id = "cart-alert", class' = "cart-alert") { }
+
                 main () { content }
             }
         }
 
     let featureEventStream = div().hxSseConnect("/events/features").hxSwap ("none") { }
+
+    let cartEventStream = div().hxSseConnect("/cart/events").hxSwap ("none") { }

@@ -4,12 +4,15 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="FSharp.Core" Version="10.1.401" />
+    <PackageReference Include="NodaMoney" Version="2.8.0" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Primitives.fs" />
     <Compile Include="Capabilities.fs" />
     <Compile Include="Security.fs" />
     <Compile Include="IdentityIds.fs" />
+    <Compile Include="Money.fs" />
+    <Compile Include="CommerceIds.fs" />
     <Compile Include="FlowKinds.fs" />
     <Compile Include="FeatureFlags.fs" />
   </ItemGroup>

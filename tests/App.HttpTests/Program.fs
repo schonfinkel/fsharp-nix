@@ -66,7 +66,21 @@ let private tests =
               [ DatabaseTest.isolated false "public probes are minimal" (fun fixture ->
                     HealthHttpTests(fixture).``public health probes are minimal and no-store`` ())
                 DatabaseTest.isolated false "operations are aggregate and MFA protected" (fun fixture ->
-                    HealthHttpTests(fixture).``operational health requires MFA and renders only aggregates`` ()) ] ]
+                    HealthHttpTests(fixture).``operational health requires MFA and renders only aggregates`` ()) ]
+          testList
+              "catalog and cart"
+              [ DatabaseTest.isolated false "guest cart adds and persists" (fun fixture ->
+                    CartHttpTests(fixture).``guest cart adds an item and persists it via the cookie`` ())
+                DatabaseTest.isolated false "stale epoch mutation conflicts" (fun fixture ->
+                    CartHttpTests(fixture).``stale epoch mutation returns conflict`` ())
+                DatabaseTest.isolated false "catalog search finds products" (fun fixture ->
+                    CartHttpTests(fixture).``catalog search finds products`` ())
+                DatabaseTest.isolated false "catalog administration requires MFA" (fun fixture ->
+                    CartHttpTests(fixture).``catalog administration requires mfa`` ())
+                DatabaseTest.isolated false "cart event stream starts with refresh" (fun fixture ->
+                    CartHttpTests(fixture).``cart event stream starts with a refresh event`` ())
+                DatabaseTest.isolated false "merge saga converges into customer cart" (fun fixture ->
+                    CartHttpTests(fixture).``merge saga converges a guest cart into the customer cart`` ()) ] ]
     |> testSequenced
 
 [<EntryPoint>]

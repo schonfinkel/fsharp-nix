@@ -15,6 +15,7 @@
   <ItemGroup>
     <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
     <ProjectReference Include="..\App.Auth\App.Auth.fsproj" />
+    <ProjectReference Include="..\App.Cart\App.Cart.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="SchemaTypeMappings.fs" />
@@ -34,6 +35,13 @@
     <Compile Include="EmailOutbox.fs" />
     <Compile Include="OperationalHealth.fs" />
     <Compile Include="Probe.fs" />
+    <Compile Include="Catalog.fs" />
+    <Compile Include="CartCodec.fs" />
+    <Compile Include="CartGuestCapabilities.fs" />
+    <Compile Include="CartMerge.fs" />
+    <Compile Include="CartDeadlines.fs" />
+    <Compile Include="CartChangeSource.fs" />
+    <Compile Include="CartEffects.fs" />
     <Compile Include="Services.fs" />
   </ItemGroup>
 </Project>

@@ -116,6 +116,21 @@ module Capability =
         writer.Write value.Length
         writer.Write value
 
+    /// <summary>A purpose-scoped keyed hash that does not bind the entity. It locates the row
+    /// for an opaque bearer capability (guest cart) whose entity id is only known after lookup.
+    /// The entity-bound <c>digest</c>/<c>verify</c> remain the authority for entity-scoped
+    /// capabilities such as order tracking.</summary>
+    let locateDigest (key: CapabilityHashKey) (purpose: CapabilityPurpose) (capability: RawCapability) =
+        use stream = new MemoryStream()
+        use writer = new BinaryWriter(stream, Encoding.UTF8, true)
+        writeField writer (Encoding.UTF8.GetBytes "capability-locate-v1")
+        writeField writer (Encoding.UTF8.GetBytes(CapabilityPurpose.value purpose))
+        writeField writer capability.Bytes
+        writer.Flush()
+
+        use hmac = new HMACSHA256(key.Bytes)
+        hmac.ComputeHash(stream.GetBuffer(), 0, int stream.Length)
+
     let digest
         (key: CapabilityHashKey)
         (purpose: CapabilityPurpose)
