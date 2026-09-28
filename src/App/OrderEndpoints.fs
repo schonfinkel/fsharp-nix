@@ -73,6 +73,12 @@ module OrderEndpoints =
         | PaymentPending _ -> "Authorizing payment"
         | StockCommitPending _ -> "Committing stock"
         | Placed _ -> "Order placed"
+        | HeldForReview _ -> "Under operator review"
+        | FulfilmentPending _ -> "Preparing shipment"
+        | Processing _ -> "Processing"
+        | PartiallyShipped _ -> "Partially shipped"
+        | Shipped _ -> "Shipped"
+        | OrderState.Delivered _ -> "Delivered"
         | CancellationPending _ -> "Cancelling order"
         | Cancelled -> "Cancelled"
         | ReservationFailed _ -> "Stock could not be reserved"
@@ -86,6 +92,12 @@ module OrderEndpoints =
         | PaymentPending order -> Money.format order.Reserved.Pending.Totals.Total
         | StockCommitPending order -> Money.format order.Reserved.Pending.Totals.Total
         | Placed order -> Money.format order.Reserved.Pending.Totals.Total
+        | HeldForReview order -> Money.format order.Fulfilment.PlacedOrder.Reserved.Pending.Totals.Total
+        | FulfilmentPending order
+        | Processing order
+        | PartiallyShipped order
+        | Shipped order
+        | OrderState.Delivered order -> Money.format order.PlacedOrder.Reserved.Pending.Totals.Total
         | CancellationPending order -> Money.format order.Order.Totals.Total
         | Initial
         | Cancelled
@@ -101,6 +113,12 @@ module OrderEndpoints =
         | Initial
         | StockCommitPending _
         | Placed _
+        | HeldForReview _
+        | FulfilmentPending _
+        | Processing _
+        | PartiallyShipped _
+        | Shipped _
+        | OrderState.Delivered _
         | CancellationPending _
         | Cancelled
         | ReservationFailed _
@@ -110,7 +128,13 @@ module OrderEndpoints =
     let private tooLateToCancel state =
         match state with
         | StockCommitPending _
-        | Placed _ -> true
+        | Placed _
+        | HeldForReview _
+        | FulfilmentPending _
+        | Processing _
+        | PartiallyShipped _
+        | Shipped _
+        | OrderState.Delivered _ -> true
         | _ -> false
 
     let sandboxMethods =

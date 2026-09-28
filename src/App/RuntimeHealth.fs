@@ -11,6 +11,7 @@ type RuntimeComponent =
     | CartMachine
     | OrderMachine
     | PaymentMachine
+    | ShipmentMachine
     | IntegrationOutboxRelay
     | EmailDeliveryRelay
     | FlowDeadlineScanner
@@ -28,6 +29,7 @@ module RuntimeComponent =
         | RuntimeComponent.CartMachine -> "cart-machine"
         | RuntimeComponent.OrderMachine -> "order-machine"
         | RuntimeComponent.PaymentMachine -> "payment-machine"
+        | RuntimeComponent.ShipmentMachine -> "shipment-machine"
         | RuntimeComponent.IntegrationOutboxRelay -> "integration-outbox-relay"
         | RuntimeComponent.EmailDeliveryRelay -> "email-delivery-relay"
         | RuntimeComponent.FlowDeadlineScanner -> "flow-deadline-scanner"
@@ -76,6 +78,7 @@ type RuntimeHealth(timeProvider: TimeProvider) =
               RuntimeComponent.CartMachine
               RuntimeComponent.OrderMachine
               RuntimeComponent.PaymentMachine
+              RuntimeComponent.ShipmentMachine
               RuntimeComponent.IntegrationOutboxRelay
               RuntimeComponent.EmailDeliveryRelay
               RuntimeComponent.FlowDeadlineScanner
@@ -137,7 +140,8 @@ module RuntimeHealth =
           RuntimeComponent.AccountFlowMachine
           RuntimeComponent.CartMachine
           RuntimeComponent.OrderMachine
-          RuntimeComponent.PaymentMachine ]
+          RuntimeComponent.PaymentMachine
+          RuntimeComponent.ShipmentMachine ]
         |> List.forall (fun service -> snapshot[service].Phase = RuntimePhase.Healthy)
 
     let workersReady

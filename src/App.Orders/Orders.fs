@@ -42,6 +42,29 @@ type PlacedOrder =
     { Reserved: ReservedOrder
       ProviderReference: string }
 
+type OrderShipmentPlan =
+    { ShipmentId: ShipmentId
+      CaptureId: CaptureId
+      PaymentOperationId: PaymentOperationId
+      Allocation: ShipmentCaptureAllocation }
+
+type OrderShipmentStatus =
+    { Plan: OrderShipmentPlan
+      Created: bool
+      CreationFailed: bool
+      Dispatched: bool
+      Delivered: bool
+      CaptureSucceeded: bool }
+
+type FulfilmentOrder =
+    { PlacedOrder: PlacedOrder
+      AddressSnapshotId: OrderSnapshotId
+      Shipments: OrderShipmentStatus list }
+
+type HeldForReviewOrder =
+    { Fulfilment: FulfilmentOrder
+      Reason: string }
+
 /// <summary>Cancellation completes only after both durable effects settle: stock release and
 /// payment unwinding. Either may arrive first; both are idempotent.</summary>
 type CancellationPendingOrder =
@@ -58,6 +81,12 @@ type OrderState =
     | PaymentPending of PaymentPendingOrder
     | StockCommitPending of StockCommitPendingOrder
     | Placed of PlacedOrder
+    | HeldForReview of HeldForReviewOrder
+    | FulfilmentPending of FulfilmentOrder
+    | Processing of FulfilmentOrder
+    | PartiallyShipped of FulfilmentOrder
+    | Shipped of FulfilmentOrder
+    | Delivered of FulfilmentOrder
     | CancellationPending of CancellationPendingOrder
     | Cancelled
     | ReservationFailed of code: string
@@ -85,6 +114,15 @@ type OrderEvent =
     | StockCommitted
     | StockCommitFailed of reason: string
     | MarkManualReview of string
+    | FulfilmentRequested of OrderShipmentPlan list
+    | ShipmentCreated of shipmentId: ShipmentId * allocationId: ShipmentAllocationId
+    | ShipmentCreationFailed of shipmentId: ShipmentId * allocationId: ShipmentAllocationId * reason: string
+    | ShipmentDispatched of shipmentId: ShipmentId * allocationId: ShipmentAllocationId
+    | ShipmentDelivered of shipmentId: ShipmentId * allocationId: ShipmentAllocationId
+    | PaymentCaptured of captureId: CaptureId * operationId: PaymentOperationId
+    | HoldRequested of reason: string
+    | ReleaseHoldRequested
+    | AddressSnapshotChanged of OrderSnapshotId
 
 type OrderAction =
     | ReserveStock of ReservationPendingOrder
@@ -93,6 +131,13 @@ type OrderAction =
     | RequestAuthorization of method: PaymentMethodReference * attempt: PaymentOperationId * amount: Money
     | RequestPaymentCancellation of reason: string
     | CommitStock of ReservationId list
+    | CreateShipment of shipment: OrderShipmentPlan * addressSnapshotId: OrderSnapshotId
+    | RequestCapture of
+        shipmentId: ShipmentId *
+        allocation: ShipmentCaptureAllocation *
+        captureId: CaptureId *
+        operationId: PaymentOperationId *
+        providerReference: string
 
 [<RequireQualifiedAccess>]
 type OrderActionError =
@@ -113,6 +158,9 @@ module Orders =
     [<Literal>]
     let ActionQueue = "order_actions"
 
+    [<Literal>]
+    let ChartVersion = 3
+
     let initialState = Initial
 
     let orderId (id: Guid) : OrderId = entityId $"order:{id:D}"
@@ -125,6 +173,12 @@ module Orders =
         | PaymentPending _ -> stateId "payment-pending"
         | StockCommitPending _ -> stateId "stock-commit-pending"
         | Placed _ -> stateId "placed"
+        | HeldForReview _ -> stateId "held-for-review"
+        | FulfilmentPending _ -> stateId "fulfilment-pending"
+        | Processing _ -> stateId "processing"
+        | PartiallyShipped _ -> stateId "partially-shipped"
+        | Shipped _ -> stateId "shipped"
+        | Delivered _ -> stateId "delivered"
         | CancellationPending _ -> stateId "cancellation-pending"
         | Cancelled -> stateId "cancelled"
         | ReservationFailed _ -> stateId "reservation-failed"
@@ -193,11 +247,281 @@ module Orders =
         | PaymentDeclined _
         | PaymentSettled
         | StockCommitted
-        | StockCommitFailed _ -> true
+        | StockCommitFailed _
+        | ShipmentCreated _
+        | ShipmentCreationFailed _
+        | ShipmentDispatched _
+        | ShipmentDelivered _
+        | PaymentCaptured _ -> true
         | OrderSubmitted _
         | CancelRequested
         | AuthorizePaymentRequested _
-        | MarkManualReview _ -> false
+        | MarkManualReview _
+        | FulfilmentRequested _
+        | HoldRequested _
+        | ReleaseHoldRequested
+        | AddressSnapshotChanged _ -> false
+
+    let private duplicateBy selector values =
+        values |> List.countBy selector |> List.exists (fun (_, count) -> count > 1)
+
+    let private validFulfilmentPlan (placed: PlacedOrder) (plan: OrderShipmentPlan list) =
+        let expectedCurrency = Money.currencyCode placed.Reserved.Pending.Totals.Total
+        let allAllocations = plan |> List.map _.Allocation
+
+        let allocationMoney =
+            allAllocations
+            |> List.collect (fun allocation ->
+                [ allocation.Merchandise
+                  allocation.Shipping
+                  allocation.Tax
+                  allocation.Total ])
+
+        let currenciesMatch =
+            allocationMoney
+            |> List.forall (fun money -> Money.currencyCode money = expectedCurrency)
+
+        let allocationTotalsAreConsistent =
+            allAllocations
+            |> List.forall (fun allocation ->
+                allocation.Total = allocation.Merchandise + allocation.Shipping + allocation.Tax)
+
+        let totalMatches =
+            currenciesMatch
+            && (allAllocations
+                |> List.map _.Total
+                |> List.fold Money.add (Money.zero expectedCurrency |> Result.defaultWith invalidOp)) = placed.Reserved.Pending.Totals.Total
+
+        let expectedQuantities =
+            placed.Reserved.Pending.Lines
+            |> List.map (fun line -> line.LineId, Quantity.value line.Quantity)
+            |> Map.ofList
+
+        let allocatedLines = allAllocations |> List.collect _.Lines
+
+        let allocatedQuantities =
+            allocatedLines
+            |> List.groupBy _.LineId
+            |> List.map (fun (lineId, lines) -> lineId, lines |> List.sumBy _.Quantity)
+            |> Map.ofList
+
+        not plan.IsEmpty
+        && not (duplicateBy _.ShipmentId plan)
+        && not (duplicateBy (fun shipment -> shipment.Allocation.AllocationId) plan)
+        && not (duplicateBy _.CaptureId plan)
+        && not (duplicateBy _.PaymentOperationId plan)
+        && (allAllocations |> List.forall (fun allocation -> not allocation.Lines.IsEmpty))
+        && (allocatedLines
+            |> List.forall (fun line -> line.Quantity > 0 && Map.containsKey line.LineId expectedQuantities))
+        && expectedQuantities = allocatedQuantities
+        && currenciesMatch
+        && allocationTotalsAreConsistent
+        && totalMatches
+
+    let private fulfilmentOfState =
+        function
+        | FulfilmentPending fulfilment
+        | Processing fulfilment
+        | PartiallyShipped fulfilment
+        | Shipped fulfilment
+        | Delivered fulfilment -> Some fulfilment
+        | HeldForReview held -> Some held.Fulfilment
+        | _ -> None
+
+    let private classifyFulfilment fulfilment =
+        if
+            fulfilment.Shipments
+            |> List.forall (fun shipment -> shipment.Delivered && shipment.CaptureSucceeded)
+        then
+            Delivered fulfilment
+        elif fulfilment.Shipments |> List.forall _.Dispatched then
+            Shipped fulfilment
+        elif fulfilment.Shipments |> List.exists _.Dispatched then
+            PartiallyShipped fulfilment
+        elif fulfilment.Shipments |> List.forall _.Created then
+            Processing fulfilment
+        else
+            FulfilmentPending fulfilment
+
+    let private tryShipment shipmentId allocationId (fulfilment: FulfilmentOrder) =
+        fulfilment.Shipments
+        |> List.tryFind (fun shipment ->
+            shipment.Plan.ShipmentId = shipmentId
+            && shipment.Plan.Allocation.AllocationId = allocationId)
+
+    let private updateShipment shipmentId allocationId update (fulfilment: FulfilmentOrder) =
+        { fulfilment with
+            Shipments =
+                fulfilment.Shipments
+                |> List.map (fun shipment ->
+                    if
+                        shipment.Plan.ShipmentId = shipmentId
+                        && shipment.Plan.Allocation.AllocationId = allocationId
+                    then
+                        update shipment
+                    else
+                        shipment) }
+
+    let private classifyUpdated state fulfilment =
+        match state with
+        | HeldForReview held -> HeldForReview { held with Fulfilment = fulfilment }
+        | _ -> classifyFulfilment fulfilment
+
+    let private fulfilmentRequested state event =
+        match state, event with
+        | Placed placed, FulfilmentRequested plan -> validFulfilmentPlan placed plan
+        | _ -> false
+
+    let private shipmentCreated state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, ShipmentCreated(shipmentId, allocationId) ->
+            tryShipment shipmentId allocationId fulfilment
+            |> Option.exists (fun shipment -> not shipment.Created && not shipment.CreationFailed)
+        | _ -> false
+
+    let private shipmentCreationFailed state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, ShipmentCreationFailed(shipmentId, allocationId, reason) ->
+            not (String.IsNullOrWhiteSpace reason)
+            && (tryShipment shipmentId allocationId fulfilment
+                |> Option.exists (fun shipment -> not shipment.Created && not shipment.CreationFailed))
+        | _ -> false
+
+    let private shipmentDispatched state event =
+        match state, event with
+        | (Processing fulfilment | PartiallyShipped fulfilment), ShipmentDispatched(shipmentId, allocationId) ->
+            tryShipment shipmentId allocationId fulfilment
+            |> Option.exists (fun shipment -> shipment.Created && not shipment.Dispatched)
+        | _ -> false
+
+    let private shipmentDelivered state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, ShipmentDelivered(shipmentId, allocationId) ->
+            tryShipment shipmentId allocationId fulfilment
+            |> Option.exists (fun shipment -> shipment.Dispatched && not shipment.Delivered)
+        | _ -> false
+
+    let private paymentCaptured state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, PaymentCaptured(captureId, operationId) ->
+            fulfilment.Shipments
+            |> List.exists (fun shipment ->
+                shipment.Dispatched
+                && not shipment.CaptureSucceeded
+                && shipment.Plan.CaptureId = captureId
+                && shipment.Plan.PaymentOperationId = operationId)
+        | _ -> false
+
+    let private holdRequested state event =
+        match state, event with
+        | (FulfilmentPending _ | Processing _ | PartiallyShipped _ | Shipped _), HoldRequested reason ->
+            not (String.IsNullOrWhiteSpace reason)
+        | _ -> false
+
+    let private releaseHoldRequested state event =
+        match state, event with
+        | HeldForReview _, ReleaseHoldRequested -> true
+        | _ -> false
+
+    let private addressSnapshotChanged state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, AddressSnapshotChanged _ -> fulfilment.Shipments |> List.forall (not << _.Dispatched)
+        | _ -> false
+
+    let private applyShipmentCreated state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, ShipmentCreated(shipmentId, allocationId) ->
+            let updated =
+                updateShipment shipmentId allocationId (fun shipment -> { shipment with Created = true }) fulfilment
+
+            [], classifyUpdated state updated
+        | _ -> [], state
+
+    let private applyShipmentCreationFailed state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, ShipmentCreationFailed(shipmentId, allocationId, reason) ->
+            let updated =
+                updateShipment
+                    shipmentId
+                    allocationId
+                    (fun shipment -> { shipment with CreationFailed = true })
+                    fulfilment
+
+            [],
+            HeldForReview
+                { Fulfilment = updated
+                  Reason = reason }
+        | _ -> [], state
+
+    let private applyShipmentDispatched state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, ShipmentDispatched(shipmentId, allocationId) ->
+            match tryShipment shipmentId allocationId fulfilment with
+            | Some shipment ->
+                let updated =
+                    updateShipment
+                        shipmentId
+                        allocationId
+                        (fun current -> { current with Dispatched = true })
+                        fulfilment
+
+                [ RequestCapture(
+                      shipmentId,
+                      shipment.Plan.Allocation,
+                      shipment.Plan.CaptureId,
+                      shipment.Plan.PaymentOperationId,
+                      fulfilment.PlacedOrder.ProviderReference
+                  ) ],
+                classifyFulfilment updated
+            | None -> [], state
+        | _ -> [], state
+
+    let private applyShipmentDelivered state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, ShipmentDelivered(shipmentId, allocationId) ->
+            let updated =
+                updateShipment shipmentId allocationId (fun shipment -> { shipment with Delivered = true }) fulfilment
+
+            [], classifyUpdated state updated
+        | _ -> [], state
+
+    let private applyPaymentCaptured state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, PaymentCaptured(captureId, _) ->
+            let updated =
+                { fulfilment with
+                    Shipments =
+                        fulfilment.Shipments
+                        |> List.map (fun shipment ->
+                            if shipment.Plan.CaptureId = captureId then
+                                { shipment with
+                                    CaptureSucceeded = true }
+                            else
+                                shipment) }
+
+            [], classifyUpdated state updated
+        | _ -> [], state
+
+    let private applyHoldRequested state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, HoldRequested reason ->
+            [],
+            HeldForReview
+                { Fulfilment = fulfilment
+                  Reason = reason }
+        | _ -> [], state
+
+    let private applyAddressSnapshotChanged state event =
+        match fulfilmentOfState state, event with
+        | Some fulfilment, AddressSnapshotChanged snapshotId ->
+            let updated =
+                { fulfilment with
+                    AddressSnapshotId = snapshotId }
+
+            match state with
+            | HeldForReview held -> [], HeldForReview { held with Fulfilment = updated }
+            | _ -> [], classifyFulfilment updated
+        | _ -> [], state
 
     let private beginCancellation (reserved: ReservedOrder) reason paymentInvolved =
         let actions =
@@ -317,7 +641,96 @@ module Orders =
                 internalOn absorb (fun _ _ -> [])
             }
 
-            state "placed" { internalOn absorb (fun _ _ -> []) }
+            state "placed" {
+                on fulfilmentRequested (fun state event ->
+                    match state, event with
+                    | Placed placed, FulfilmentRequested plan ->
+                        let fulfilment =
+                            { PlacedOrder = placed
+                              AddressSnapshotId = placed.Reserved.Pending.SnapshotId
+                              Shipments =
+                                plan
+                                |> List.map (fun shipment ->
+                                    { Plan = shipment
+                                      Created = false
+                                      CreationFailed = false
+                                      Dispatched = false
+                                      Delivered = false
+                                      CaptureSucceeded = false }) }
+
+                        plan
+                        |> List.map (fun shipment -> CreateShipment(shipment, fulfilment.AddressSnapshotId)),
+                        FulfilmentPending fulfilment
+                    | _ -> [], state)
+
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "held-for-review" {
+                on shipmentCreated applyShipmentCreated
+                on shipmentCreationFailed applyShipmentCreationFailed
+                on shipmentDelivered applyShipmentDelivered
+                on paymentCaptured applyPaymentCaptured
+
+                on releaseHoldRequested (fun state _ ->
+                    match state with
+                    | HeldForReview held ->
+                        let failed = held.Fulfilment.Shipments |> List.filter _.CreationFailed
+
+                        if failed.IsEmpty then
+                            [], classifyFulfilment held.Fulfilment
+                        else
+                            let retried =
+                                { held.Fulfilment with
+                                    Shipments =
+                                        held.Fulfilment.Shipments
+                                        |> List.map (fun shipment ->
+                                            if shipment.CreationFailed then
+                                                { shipment with CreationFailed = false }
+                                            else
+                                                shipment) }
+
+                            failed
+                            |> List.map (fun shipment ->
+                                CreateShipment(shipment.Plan, held.Fulfilment.AddressSnapshotId)),
+                            FulfilmentPending retried
+                    | _ -> [], state)
+
+                on addressSnapshotChanged applyAddressSnapshotChanged
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "fulfilment-pending" {
+                on shipmentCreated applyShipmentCreated
+                on shipmentCreationFailed applyShipmentCreationFailed
+                on holdRequested applyHoldRequested
+                on addressSnapshotChanged applyAddressSnapshotChanged
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "processing" {
+                on shipmentDispatched applyShipmentDispatched
+                on holdRequested applyHoldRequested
+                on addressSnapshotChanged applyAddressSnapshotChanged
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "partially-shipped" {
+                on shipmentDispatched applyShipmentDispatched
+                on shipmentDelivered applyShipmentDelivered
+                on paymentCaptured applyPaymentCaptured
+                on holdRequested applyHoldRequested
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "shipped" {
+                on shipmentDelivered applyShipmentDelivered
+                on paymentCaptured applyPaymentCaptured
+                on holdRequested applyHoldRequested
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "delivered" { internalOn absorb (fun _ _ -> []) }
 
             state "cancellation-pending" {
                 on released (fun state _ ->

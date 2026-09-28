@@ -9,6 +9,7 @@ open App.Cart
 open App.Domain
 open App.Orders
 open App.Payments
+open App.Shipments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
@@ -23,6 +24,8 @@ module OrderEffects =
         | RequestAuthorization _ -> "request-authorization"
         | RequestPaymentCancellation _ -> "request-payment-cancellation"
         | CommitStock _ -> "commit-stock"
+        | CreateShipment _ -> "create-shipment"
+        | RequestCapture _ -> "request-capture"
 
     let private key (record: ActionRecord<OrderId, OrderAction>) purpose =
         $"xmsg:v1:{MachineId.value record.MachineId}:{CommandId.value record.CommandId}:{record.Ordinal}:{purpose}"
@@ -526,6 +529,147 @@ module OrderEffects =
                                 (key record "stock-commit-result")
                                 Orders.MachineKey
                                 entity
+                                eventJson
+                                ct
+
+                        do! tx.CommitAsync ct
+                        return Ok()
+                | _ ->
+                    do! tx.RollbackAsync ct
+                    return Error OrderActionError.InvalidAction
+        }
+
+    /// <summary>Persists the shipment-allocation ledger row, hands the shipment request to the
+    /// shipments machine, and marks the order's shipment created in one transaction.</summary>
+    let applyCreateShipment
+        (dataSource: NpgsqlDataSource)
+        (record: ActionRecord<OrderId, OrderAction>)
+        (ct: CancellationToken)
+        =
+        task {
+            use connection = dataSource.CreateConnection()
+            do! connection.OpenAsync ct
+            use! tx = connection.BeginTransactionAsync ct
+
+            match! receipt connection tx record ct with
+            | Error error ->
+                do! tx.RollbackAsync ct
+                return Error error
+            | Ok _ ->
+                match record.Action with
+                | CreateShipment(shipment, addressSnapshotId) ->
+                    let orderEntity = EntityId.value record.EntityId
+
+                    use insert =
+                        new NpgsqlCommand(
+                            "INSERT INTO fsnix.shipments(shipment_id,allocation_id,order_id) VALUES(@shipment,@allocation,@order) ON CONFLICT(shipment_id) DO NOTHING",
+                            connection,
+                            tx
+                        )
+
+                    insert.Parameters.AddWithValue("shipment", ShipmentId.value shipment.ShipmentId)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue(
+                        "allocation",
+                        ShipmentAllocationId.value shipment.Allocation.AllocationId
+                    )
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("order", orderEntity) |> ignore
+                    let! _ = insert.ExecuteNonQueryAsync ct
+
+                    let shipmentRequest =
+                        { ShipmentId = shipment.ShipmentId
+                          AllocationId = shipment.Allocation.AllocationId
+                          OrderId = orderEntity
+                          Lines =
+                            shipment.Allocation.Lines
+                            |> List.map (fun line ->
+                                { LineId = line.LineId
+                                  Quantity = line.Quantity }) }
+
+                    match ShipmentCodec.event.Encode(ShipmentRequested shipmentRequest) with
+                    | Error _ ->
+                        do! tx.RollbackAsync ct
+                        return Error OrderActionError.CallbackEncodingFailed
+                    | Ok shipmentJson ->
+                        let shipmentEntity = EntityId.value (Shipments.shipmentEntityId shipment.ShipmentId)
+
+                        do!
+                            callback
+                                connection
+                                tx
+                                (key record "shipment-requested")
+                                Shipments.MachineKey
+                                shipmentEntity
+                                shipmentJson
+                                ct
+
+                        match
+                            OrderCodec.event.Encode(
+                                ShipmentCreated(shipment.ShipmentId, shipment.Allocation.AllocationId)
+                            )
+                        with
+                        | Error _ ->
+                            do! tx.RollbackAsync ct
+                            return Error OrderActionError.CallbackEncodingFailed
+                        | Ok createdJson ->
+                            do!
+                                callback
+                                    connection
+                                    tx
+                                    (key record "shipment-created")
+                                    Orders.MachineKey
+                                    orderEntity
+                                    createdJson
+                                    ct
+
+                            do! tx.CommitAsync ct
+                            return Ok()
+                | _ ->
+                    do! tx.RollbackAsync ct
+                    return Error OrderActionError.InvalidAction
+        }
+
+    /// <summary>Forwards a dispatch-triggered capture request to the payments machine.</summary>
+    let applyRequestCapture
+        (dataSource: NpgsqlDataSource)
+        (record: ActionRecord<OrderId, OrderAction>)
+        (ct: CancellationToken)
+        =
+        task {
+            use connection = dataSource.CreateConnection()
+            do! connection.OpenAsync ct
+            use! tx = connection.BeginTransactionAsync ct
+
+            match! receipt connection tx record ct with
+            | Error error ->
+                do! tx.RollbackAsync ct
+                return Error error
+            | Ok _ ->
+                match record.Action with
+                | RequestCapture(shipmentId, allocation, captureId, operationId, providerReference) ->
+                    let orderEntity = EntityId.value record.EntityId
+
+                    let captureRequest =
+                        { OrderId = orderEntity
+                          CaptureId = captureId
+                          OperationId = operationId
+                          Amount = allocation.Total }
+
+                    match PaymentCodec.event.Encode(CaptureRequested captureRequest) with
+                    | Error _ ->
+                        do! tx.RollbackAsync ct
+                        return Error OrderActionError.CallbackEncodingFailed
+                    | Ok eventJson ->
+                        do!
+                            callback
+                                connection
+                                tx
+                                (key record "capture-requested")
+                                Payments.MachineKey
+                                (paymentEntityOfOrder orderEntity)
                                 eventJson
                                 ct
 

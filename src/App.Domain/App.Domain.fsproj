@@ -14,8 +14,10 @@
     <Compile Include="Money.fs" />
     <Compile Include="CommerceIds.fs" />
     <Compile Include="PaymentIds.fs" />
+    <Compile Include="ShipmentIds.fs" />
     <Compile Include="OrderAddress.fs" />
     <Compile Include="OrderPricing.fs" />
+    <Compile Include="CaptureAllocation.fs" />
     <Compile Include="FlowKinds.fs" />
     <Compile Include="FeatureFlags.fs" />
   </ItemGroup>

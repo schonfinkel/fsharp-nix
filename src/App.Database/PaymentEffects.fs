@@ -25,11 +25,14 @@ module PaymentEffects =
         function
         | CallGatewayAuthorize _ -> "call-gateway-authorize"
         | QueryGatewayAuthorization _ -> "query-gateway-authorization"
+        | CallGatewayCapture _ -> "call-gateway-capture"
+        | QueryGatewayCapture _ -> "query-gateway-capture"
         | CallGatewayVoid _ -> "call-gateway-void"
         | NotifyOrderAuthorized _ -> "notify-order-authorized"
         | NotifyOrderDeclined _ -> "notify-order-declined"
         | NotifyOrderCancelled _ -> "notify-order-cancelled"
         | NotifyOrderVoided _ -> "notify-order-voided"
+        | NotifyOrderCaptured _ -> "notify-order-captured"
 
     let private key (record: ActionRecord<PaymentId, PaymentAction>) purpose =
         $"xmsg:v1:{MachineId.value record.MachineId}:{CommandId.value record.CommandId}:{record.Ordinal}:{purpose}"
@@ -326,6 +329,28 @@ module PaymentEffects =
         | "failed" -> AuthorizationDeclined(attempt, row.ResultCode |> Option.defaultValue "unknown")
         | _ -> AuthorizationOutcomeUnknown attempt
 
+    let private captureOutcome request (outcome: GatewayCapture) =
+        match outcome with
+        | GatewayCaptured reference when validProviderReference reference ->
+            "succeeded", Some reference, Some "captured", None, CaptureSucceeded(request, reference)
+        | GatewayCaptured _ -> "unknown", None, Some "invalid-provider-response", None, CaptureOutcomeUnknown request
+        | GatewayCaptureDeclined reason when validResultCode reason ->
+            "failed", None, Some reason, None, CaptureDeclined(request, reason)
+        | GatewayCaptureDeclined _ ->
+            "failed", None, Some "provider-declined", None, CaptureDeclined(request, "provider-declined")
+        | GatewayCaptureUnknown -> "unknown", None, Some "outcome-unknown", None, CaptureOutcomeUnknown request
+
+    let private captureRowEvent request (row: OperationRow) =
+        match row.Status with
+        | "succeeded" ->
+            CaptureSucceeded(
+                request,
+                row.ProviderReference
+                |> Option.defaultWith (fun () -> invalidOp "succeeded captures carry a reference")
+            )
+        | "failed" -> CaptureDeclined(request, row.ResultCode |> Option.defaultValue "unknown")
+        | _ -> CaptureOutcomeUnknown request
+
     let private recordAndSettle
         (dataSource: NpgsqlDataSource)
         (record: ActionRecord<PaymentId, PaymentAction>)
@@ -494,6 +519,70 @@ module PaymentEffects =
                 ct
         | _ -> Task.FromResult(Error PaymentActionError.InvalidAction)
 
+    let private applyCaptureAction
+        (dataSource: NpgsqlDataSource)
+        (gateway: IPaymentGateway)
+        (record: ActionRecord<PaymentId, PaymentAction>)
+        (authorized: AuthorizedPayment)
+        (request: CaptureRequest)
+        (queryOnly: bool)
+        (ct: CancellationToken)
+        =
+        let query () =
+            gateway.QueryCapture(request.OperationId, authorized.ProviderReference, authorized.Attempt.Method, ct)
+
+        let firstCall () =
+            if queryOnly then
+                task {
+                    match! query () with
+                    | Some outcome -> return outcome
+                    | None -> return GatewayCaptureUnknown
+                }
+            else
+                gateway.Capture(
+                    request.OperationId,
+                    authorized.ProviderReference,
+                    request.Amount,
+                    authorized.Attempt.Method,
+                    ct
+                )
+
+        recordAndSettle
+            dataSource
+            record
+            "capture"
+            (PaymentOperationId.value request.OperationId)
+            request.OrderId
+            firstCall
+            query
+            (captureOutcome request)
+            (CaptureOutcomeUnknown request)
+            (captureRowEvent request)
+            "capture-result"
+            ct
+
+    let applyCapture
+        (dataSource: NpgsqlDataSource)
+        (gateway: IPaymentGateway)
+        (record: ActionRecord<PaymentId, PaymentAction>)
+        (ct: CancellationToken)
+        =
+        match record.Action with
+        | CallGatewayCapture(authorized, request) ->
+            applyCaptureAction dataSource gateway record authorized request false ct
+        | _ -> Task.FromResult(Error PaymentActionError.InvalidAction)
+
+    let applyQueryCapture
+        (dataSource: NpgsqlDataSource)
+        (gateway: IPaymentGateway)
+        (record: ActionRecord<PaymentId, PaymentAction>)
+        (ct: CancellationToken)
+        =
+        match record.Action with
+        | QueryGatewayCapture(authorized, request) ->
+            applyCaptureAction dataSource gateway record authorized request true ct
+        | _ -> Task.FromResult(Error PaymentActionError.InvalidAction)
+
     let applyQueryAuthorization
         (dataSource: NpgsqlDataSource)
         (gateway: IPaymentGateway)
@@ -603,6 +692,12 @@ module PaymentEffects =
                 | NotifyOrderCancelled orderId -> Some(PaymentSettled, orderId, "notify-order-cancelled")
                 | NotifyOrderVoided authorized ->
                     Some(PaymentSettled, authorized.Attempt.OrderId, "notify-order-voided")
+                | NotifyOrderCaptured capture ->
+                    Some(
+                        PaymentCaptured(capture.Request.CaptureId, capture.Request.OperationId),
+                        capture.Request.OrderId,
+                        "notify-order-captured"
+                    )
                 | _ -> None
 
             match notify with

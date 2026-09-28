@@ -24,6 +24,27 @@ module OrderWire =
           PriceVersion: int64 }
 
     [<CLIMutable>]
+    type AllocationLineDto = { LineId: string; Quantity: int }
+
+    [<CLIMutable>]
+    type ShipmentDto =
+        { ShipmentId: string
+          AllocationId: string
+          CaptureId: string
+          OperationId: string
+          Lines: AllocationLineDto array
+          Merchandise: string
+          Shipping: string
+          Tax: string
+          Total: string
+          Currency: string
+          Created: bool
+          CreationFailed: bool
+          Dispatched: bool
+          Delivered: bool
+          CaptureSucceeded: bool }
+
+    [<CLIMutable>]
     type WireDto =
         { Tag: string
           SnapshotId: string
@@ -44,7 +65,19 @@ module OrderWire =
           Method: string
           ProviderReference: string
           ReservationsSettled: bool
-          PaymentSettled: bool }
+          PaymentSettled: bool
+          [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+          AddressSnapshotId: string
+          [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+          ShipmentId: string
+          [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+          AllocationId: string
+          [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+          CaptureId: string
+          [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+          OperationId: string
+          [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+          Shipments: ShipmentDto array }
 
 [<RequireQualifiedAccess>]
 module OrderCodec =
@@ -76,7 +109,13 @@ module OrderCodec =
           Method = ""
           ProviderReference = ""
           ReservationsSettled = false
-          PaymentSettled = false }
+          PaymentSettled = false
+          AddressSnapshotId = null
+          ShipmentId = null
+          AllocationId = null
+          CaptureId = null
+          OperationId = null
+          Shipments = null }
 
     let private encode name (dto: OrderWire.WireDto) =
         try
@@ -234,6 +273,156 @@ module OrderCodec =
                 { Pending = pending
                   ReservationIds = ids }))
 
+    let private shipmentDto (status: OrderShipmentStatus) : OrderWire.ShipmentDto =
+        let allocation = status.Plan.Allocation
+
+        { ShipmentId = ShipmentId.wireString status.Plan.ShipmentId
+          AllocationId = ShipmentAllocationId.wireString allocation.AllocationId
+          CaptureId = CaptureId.wireString status.Plan.CaptureId
+          OperationId = PaymentOperationId.value status.Plan.PaymentOperationId
+          Lines =
+            allocation.Lines
+            |> List.map (fun line ->
+                ({ LineId = OrderLineId.wireString line.LineId
+                   Quantity = line.Quantity }
+                : OrderWire.AllocationLineDto))
+            |> List.toArray
+          Merchandise = Money.wireAmount allocation.Merchandise
+          Shipping = Money.wireAmount allocation.Shipping
+          Tax = Money.wireAmount allocation.Tax
+          Total = Money.wireAmount allocation.Total
+          Currency = Money.currencyCode allocation.Total
+          Created = status.Created
+          CreationFailed = status.CreationFailed
+          Dispatched = status.Dispatched
+          Delivered = status.Delivered
+          CaptureSucceeded = status.CaptureSucceeded }
+
+    let private statusOfPlan plan =
+        { Plan = plan
+          Created = false
+          CreationFailed = false
+          Dispatched = false
+          Delivered = false
+          CaptureSucceeded = false }
+
+    let private shipmentOfDto (dto: OrderWire.ShipmentDto) : Result<OrderShipmentStatus, CodecError> =
+        let parseId parse field value =
+            parse value |> Result.mapError (fun message -> codecError field message)
+
+        let money field amount =
+            Money.tryOfWire amount dto.Currency
+            |> Result.mapError (fun message -> codecError field message)
+
+        parseId ShipmentId.tryParse "Shipment" dto.ShipmentId
+        |> Result.bind (fun shipmentId ->
+            parseId ShipmentAllocationId.tryParse "Shipment" dto.AllocationId
+            |> Result.bind (fun allocationId ->
+                parseId CaptureId.tryParse "Shipment" dto.CaptureId
+                |> Result.bind (fun captureId ->
+                    parseId PaymentOperationId.tryParse "Shipment" dto.OperationId
+                    |> Result.bind (fun operationId ->
+                        (if isNull dto.Lines then [] else Array.toList dto.Lines)
+                        |> List.map (fun line ->
+                            guid "ShipmentLine" line.LineId
+                            |> Result.bind (
+                                OrderLineId.create
+                                >> Result.mapError (fun message -> codecError "ShipmentLine" message)
+                            )
+                            |> Result.bind (fun lineId ->
+                                if line.Quantity > 0 then
+                                    Ok
+                                        { LineId = lineId
+                                          Quantity = line.Quantity }
+                                else
+                                    Error(codecError "ShipmentLine" "Quantity must be positive.")))
+                        |> sequenceResults
+                        |> Result.bind (fun lines ->
+                            money "Shipment" dto.Merchandise
+                            |> Result.bind (fun merchandise ->
+                                money "Shipment" dto.Shipping
+                                |> Result.bind (fun shipping ->
+                                    money "Shipment" dto.Tax
+                                    |> Result.bind (fun tax ->
+                                        money "Shipment" dto.Total
+                                        |> Result.bind (fun total ->
+                                            if
+                                                lines.IsEmpty
+                                                || total <> merchandise + shipping + tax
+                                                || dto.CreationFailed && dto.Created
+                                                || dto.Dispatched && not dto.Created
+                                                || dto.Delivered && not dto.Dispatched
+                                                || dto.CaptureSucceeded && not dto.Dispatched
+                                            then
+                                                Error(
+                                                    codecError
+                                                        "Shipment"
+                                                        "Invalid shipment allocation or status flags."
+                                                )
+                                            else
+                                                Ok
+                                                    { Plan =
+                                                        { ShipmentId = shipmentId
+                                                          CaptureId = captureId
+                                                          PaymentOperationId = operationId
+                                                          Allocation =
+                                                            { AllocationId = allocationId
+                                                              Lines = lines
+                                                              Merchandise = merchandise
+                                                              Shipping = shipping
+                                                              Tax = tax
+                                                              Total = total } }
+                                                      Created = dto.Created
+                                                      CreationFailed = dto.CreationFailed
+                                                      Dispatched = dto.Dispatched
+                                                      Delivered = dto.Delivered
+                                                      CaptureSucceeded = dto.CaptureSucceeded })))))))))
+
+    let private fulfilmentDto tag (fulfilment: FulfilmentOrder) =
+        { pendingDto tag fulfilment.PlacedOrder.Reserved.Pending with
+            ReservationIds =
+                fulfilment.PlacedOrder.Reserved.ReservationIds
+                |> List.map ReservationId.wireString
+                |> List.toArray
+            ProviderReference = fulfilment.PlacedOrder.ProviderReference
+            AddressSnapshotId = OrderSnapshotId.wireString fulfilment.AddressSnapshotId
+            Shipments = fulfilment.Shipments |> List.map shipmentDto |> List.toArray }
+
+    let private fulfilmentOfDto (dto: OrderWire.WireDto) =
+        reservedOfDto dto
+        |> Result.bind (fun reserved ->
+            NonEmptyString.create 200 dto.ProviderReference
+            |> Result.mapError (fun message -> codecError "OrderState" message)
+            |> Result.bind (fun providerReference ->
+                guid "OrderState" dto.AddressSnapshotId
+                |> Result.bind (
+                    OrderSnapshotId.create
+                    >> Result.mapError (fun message -> codecError "OrderState" message)
+                )
+                |> Result.bind (fun addressSnapshotId ->
+                    (if isNull dto.Shipments then
+                         []
+                     else
+                         Array.toList dto.Shipments)
+                    |> List.map shipmentOfDto
+                    |> sequenceResults
+                    |> Result.bind (fun shipments ->
+                        if shipments.IsEmpty then
+                            Error(codecError "OrderState" "A fulfilment plan must not be empty.")
+                        else
+                            Ok
+                                { PlacedOrder =
+                                    { Reserved = reserved
+                                      ProviderReference = NonEmptyString.value providerReference }
+                                  AddressSnapshotId = addressSnapshotId
+                                  Shipments = shipments }))))
+
+    let private shipmentIdentityOfDto name (dto: OrderWire.WireDto) =
+        idValue ShipmentId.tryParse name dto.ShipmentId
+        |> Result.bind (fun shipmentId ->
+            idValue ShipmentAllocationId.tryParse name dto.AllocationId
+            |> Result.map (fun allocationId -> shipmentId, allocationId))
+
     let state: Codec<OrderState> =
         Codec.create
             (fun state ->
@@ -265,6 +454,14 @@ module OrderCodec =
                                 |> List.map ReservationId.wireString
                                 |> List.toArray
                             ProviderReference = order.ProviderReference }
+                    | HeldForReview held ->
+                        { fulfilmentDto "held-for-review-v3" held.Fulfilment with
+                            Reason = held.Reason }
+                    | FulfilmentPending order -> fulfilmentDto "fulfilment-pending-v3" order
+                    | Processing order -> fulfilmentDto "processing-v3" order
+                    | PartiallyShipped order -> fulfilmentDto "partially-shipped-v3" order
+                    | Shipped order -> fulfilmentDto "shipped-v3" order
+                    | OrderState.Delivered order -> fulfilmentDto "delivered-v3" order
                     | CancellationPending order ->
                         { pendingDto "cancellation-pending-v2" order.Order with
                             ReservationIds = order.ReservationIds |> List.map ReservationId.wireString |> List.toArray
@@ -321,6 +518,17 @@ module OrderCodec =
                                 Placed
                                     { Reserved = reserved
                                       ProviderReference = NonEmptyString.value reference }))
+                    | "held-for-review-v3" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        fulfilmentOfDto dto
+                        |> Result.map (fun fulfilment ->
+                            HeldForReview
+                                { Fulfilment = fulfilment
+                                  Reason = dto.Reason })
+                    | "fulfilment-pending-v3" -> fulfilmentOfDto dto |> Result.map FulfilmentPending
+                    | "processing-v3" -> fulfilmentOfDto dto |> Result.map Processing
+                    | "partially-shipped-v3" -> fulfilmentOfDto dto |> Result.map PartiallyShipped
+                    | "shipped-v3" -> fulfilmentOfDto dto |> Result.map Shipped
+                    | "delivered-v3" -> fulfilmentOfDto dto |> Result.map OrderState.Delivered
                     | "cancellation-pending-v2" ->
                         pendingOfDto dto
                         |> Result.bind (fun pending ->
@@ -376,6 +584,37 @@ module OrderCodec =
                     | MarkManualReview reason ->
                         { empty "mark-manual-review-v2" with
                             Reason = reason }
+                    | FulfilmentRequested plan ->
+                        { empty "fulfilment-requested-v3" with
+                            Shipments = plan |> List.map (statusOfPlan >> shipmentDto) |> List.toArray }
+                    | ShipmentCreated(shipmentId, allocationId) ->
+                        { empty "shipment-created-v3" with
+                            ShipmentId = ShipmentId.wireString shipmentId
+                            AllocationId = ShipmentAllocationId.wireString allocationId }
+                    | ShipmentCreationFailed(shipmentId, allocationId, reason) ->
+                        { empty "shipment-creation-failed-v3" with
+                            ShipmentId = ShipmentId.wireString shipmentId
+                            AllocationId = ShipmentAllocationId.wireString allocationId
+                            Reason = reason }
+                    | ShipmentDispatched(shipmentId, allocationId) ->
+                        { empty "shipment-dispatched-v3" with
+                            ShipmentId = ShipmentId.wireString shipmentId
+                            AllocationId = ShipmentAllocationId.wireString allocationId }
+                    | ShipmentDelivered(shipmentId, allocationId) ->
+                        { empty "shipment-delivered-v3" with
+                            ShipmentId = ShipmentId.wireString shipmentId
+                            AllocationId = ShipmentAllocationId.wireString allocationId }
+                    | PaymentCaptured(captureId, operationId) ->
+                        { empty "payment-captured-v3" with
+                            CaptureId = CaptureId.wireString captureId
+                            OperationId = PaymentOperationId.value operationId }
+                    | HoldRequested reason ->
+                        { empty "hold-requested-v3" with
+                            Reason = reason }
+                    | ReleaseHoldRequested -> empty "release-hold-requested-v3"
+                    | AddressSnapshotChanged snapshotId ->
+                        { empty "address-snapshot-changed-v3" with
+                            AddressSnapshotId = OrderSnapshotId.wireString snapshotId }
 
                 encode "OrderEvent" dto)
             (fun json ->
@@ -428,6 +667,51 @@ module OrderCodec =
                             |> fun deadline -> Ok(ReservationExpired(dto.Generation, deadline))
                         with _ ->
                             Error(codecError "OrderEvent" "Invalid deadline.")
+                    | "fulfilment-requested-v3" ->
+                        (if isNull dto.Shipments then
+                             []
+                         else
+                             Array.toList dto.Shipments)
+                        |> List.map shipmentOfDto
+                        |> sequenceResults
+                        |> Result.bind (fun shipments ->
+                            if
+                                shipments.IsEmpty
+                                || shipments
+                                   |> List.exists (fun shipment ->
+                                       shipment.Created
+                                       || shipment.CreationFailed
+                                       || shipment.Dispatched
+                                       || shipment.Delivered
+                                       || shipment.CaptureSucceeded)
+                            then
+                                Error(codecError "OrderEvent" "Invalid fulfilment plan.")
+                            else
+                                Ok(FulfilmentRequested(shipments |> List.map _.Plan)))
+                    | "shipment-created-v3" -> shipmentIdentityOfDto "OrderEvent" dto |> Result.map ShipmentCreated
+                    | "shipment-creation-failed-v3" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        shipmentIdentityOfDto "OrderEvent" dto
+                        |> Result.map (fun (shipmentId, allocationId) ->
+                            ShipmentCreationFailed(shipmentId, allocationId, dto.Reason))
+                    | "shipment-dispatched-v3" ->
+                        shipmentIdentityOfDto "OrderEvent" dto |> Result.map ShipmentDispatched
+                    | "shipment-delivered-v3" ->
+                        shipmentIdentityOfDto "OrderEvent" dto |> Result.map ShipmentDelivered
+                    | "payment-captured-v3" ->
+                        idValue CaptureId.tryParse "OrderEvent" dto.CaptureId
+                        |> Result.bind (fun captureId ->
+                            idValue PaymentOperationId.tryParse "OrderEvent" dto.OperationId
+                            |> Result.map (fun operationId -> PaymentCaptured(captureId, operationId)))
+                    | "hold-requested-v3" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        Ok(HoldRequested dto.Reason)
+                    | "release-hold-requested-v3" -> Ok ReleaseHoldRequested
+                    | "address-snapshot-changed-v3" ->
+                        guid "OrderEvent" dto.AddressSnapshotId
+                        |> Result.bind (
+                            OrderSnapshotId.create
+                            >> Result.mapError (fun message -> codecError "OrderEvent" message)
+                        )
+                        |> Result.map AddressSnapshotChanged
                     | tag -> Error(codecError "OrderEvent" $"Unknown tag '{tag}'.")))
 
     let action: Codec<OrderAction> =
@@ -462,7 +746,25 @@ module OrderCodec =
                     encode
                         "OrderAction"
                         { empty "commit-stock-v2" with
-                            ReservationIds = ids |> List.map ReservationId.wireString |> List.toArray })
+                            ReservationIds = ids |> List.map ReservationId.wireString |> List.toArray }
+                | CreateShipment(shipment, addressSnapshotId) ->
+                    encode
+                        "OrderAction"
+                        { empty "create-shipment-v3" with
+                            AddressSnapshotId = OrderSnapshotId.wireString addressSnapshotId
+                            Shipments = [| shipment |> statusOfPlan |> shipmentDto |] }
+                | RequestCapture(shipmentId, allocation, captureId, operationId, providerReference) ->
+                    let shipment =
+                        { ShipmentId = shipmentId
+                          CaptureId = captureId
+                          PaymentOperationId = operationId
+                          Allocation = allocation }
+
+                    encode
+                        "OrderAction"
+                        { empty "request-capture-v3" with
+                            ProviderReference = providerReference
+                            Shipments = [| shipment |> statusOfPlan |> shipmentDto |] })
             (fun json ->
                 decode "OrderAction" json
                 |> Result.bind (fun dto ->
@@ -485,6 +787,52 @@ module OrderCodec =
                     | "commit-stock-v2" -> reservationIdsOfDto "OrderAction" dto |> Result.map CommitStock
                     | "release-reservations-v2" ->
                         reservationIdsOfDto "OrderAction" dto |> Result.map ReleaseReservations
+                    | "create-shipment-v3" ->
+                        guid "OrderAction" dto.AddressSnapshotId
+                        |> Result.bind (
+                            OrderSnapshotId.create
+                            >> Result.mapError (fun message -> codecError "OrderAction" message)
+                        )
+                        |> Result.bind (fun snapshotId ->
+                            if isNull dto.Shipments || dto.Shipments.Length <> 1 then
+                                Error(codecError "OrderAction" "CreateShipment requires exactly one shipment.")
+                            else
+                                shipmentOfDto dto.Shipments[0]
+                                |> Result.bind (fun shipment ->
+                                    if
+                                        shipment.Created
+                                        || shipment.CreationFailed
+                                        || shipment.Dispatched
+                                        || shipment.Delivered
+                                        || shipment.CaptureSucceeded
+                                    then
+                                        Error(codecError "OrderAction" "CreateShipment contains status flags.")
+                                    else
+                                        Ok(CreateShipment(shipment.Plan, snapshotId))))
+                    | "request-capture-v3" when not (String.IsNullOrWhiteSpace dto.ProviderReference) ->
+                        if isNull dto.Shipments || dto.Shipments.Length <> 1 then
+                            Error(codecError "OrderAction" "RequestCapture requires exactly one allocation.")
+                        else
+                            shipmentOfDto dto.Shipments[0]
+                            |> Result.bind (fun shipment ->
+                                if
+                                    shipment.Created
+                                    || shipment.CreationFailed
+                                    || shipment.Dispatched
+                                    || shipment.Delivered
+                                    || shipment.CaptureSucceeded
+                                then
+                                    Error(codecError "OrderAction" "RequestCapture contains status flags.")
+                                else
+                                    Ok(
+                                        RequestCapture(
+                                            shipment.Plan.ShipmentId,
+                                            shipment.Plan.Allocation,
+                                            shipment.Plan.CaptureId,
+                                            shipment.Plan.PaymentOperationId,
+                                            dto.ProviderReference
+                                        )
+                                    ))
                     | tag -> Error(codecError "OrderAction" $"Unknown tag '{tag}'.")))
 
     let error: Codec<OrderActionError> =
@@ -532,7 +880,7 @@ module OrderCodec =
     let private build (log: ILogger) storeArg =
         machine<OrderId, OrderState, OrderEvent, OrderAction, OrderActionError> (machineId Orders.MachineKey) {
             chart Orders.chartValue
-            chartVersion 2
+            chartVersion Orders.ChartVersion
             initialState Orders.initialState
             store storeArg
             logger log

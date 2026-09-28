@@ -9,6 +9,7 @@ open App.Database
 open App.Domain
 open App.Orders
 open App.Payments
+open App.Shipments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
@@ -235,6 +236,50 @@ type PaymentMachineClient(context: PostgresContext, loggerFactory: ILoggerFactor
 
                 client <- None
                 health.Stopped RuntimeComponent.PaymentMachine
+            }
+            :> Task
+
+type ShipmentMachineClient(context: PostgresContext, loggerFactory: ILoggerFactory, health: RuntimeHealth) =
+    let logger = loggerFactory.CreateLogger "ShipmentMachineClient"
+    let mutable client = None
+
+    member _.Shipments =
+        client
+        |> Option.defaultWith (fun () -> invalidOp "the shipment machine client has not started")
+
+    interface IHostedService with
+        member _.StartAsync(ct: CancellationToken) =
+            task {
+                health.Starting RuntimeComponent.ShipmentMachine
+
+                let machine =
+                    match ShipmentCodec.buildClient logger context with
+                    | Ok machine -> machine
+                    | Error _ ->
+                        health.Failed(RuntimeComponent.ShipmentMachine, RuntimeFailure.InvalidChart)
+                        invalidOp "shipment client machine is invalid"
+
+                match! Machine.startAsync machine (PostgresChartRegistry { Context = context }) ct with
+                | Ok(Startup.Started _) ->
+                    client <- Some machine
+                    health.Succeeded RuntimeComponent.ShipmentMachine
+                | Ok(Startup.Refused _) ->
+                    health.Failed(RuntimeComponent.ShipmentMachine, RuntimeFailure.StartupRefused)
+                    return raise (InvalidOperationException "shipment client refused to boot")
+                | Error _ ->
+                    health.Failed(RuntimeComponent.ShipmentMachine, RuntimeFailure.StartupFailed)
+                    return raise (InvalidOperationException "shipment client failed to start")
+            }
+            :> Task
+
+        member _.StopAsync(ct: CancellationToken) =
+            task {
+                match client with
+                | Some machine -> do! Machine.stopAsync machine ct
+                | None -> ()
+
+                client <- None
+                health.Stopped RuntimeComponent.ShipmentMachine
             }
             :> Task
 

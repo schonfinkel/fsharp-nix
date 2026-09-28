@@ -10,6 +10,7 @@ open App.Database
 open App.Domain
 open App.Orders
 open App.Payments
+open App.Shipments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.DependencyInjection
 open ByzantineSystems.Automata.Storage
@@ -319,9 +320,12 @@ module Application =
             .AddScoped<IActionHandler<CartId, CartAction, CartActionError>, CartEffectHandler>()
             .AddScoped<IActionHandler<OrderId, OrderAction, OrderActionError>, OrderEffectHandler>()
             .AddScoped<IActionHandler<PaymentId, PaymentAction, PaymentActionError>, PaymentEffectHandler>()
+            .AddScoped<IActionHandler<ShipmentEntityId, ShipmentAction, ShipmentActionError>, ShipmentEffectHandler>()
             .AddSingleton<SimulatedPaymentGateway>()
             .AddSingleton<IPaymentGateway>(fun provider ->
                 provider.GetRequiredService<SimulatedPaymentGateway>() :> IPaymentGateway)
+            .AddSingleton<SimulatedCarrier>()
+            .AddSingleton<ICarrier>(fun provider -> provider.GetRequiredService<SimulatedCarrier>() :> ICarrier)
             .AddSingleton<ProbeMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<ProbeMachineClient>())
             .AddSingleton<AccountFlowMachineClient>()
@@ -332,6 +336,8 @@ module Application =
             .AddHostedService(fun provider -> provider.GetRequiredService<OrderMachineClient>())
             .AddSingleton<PaymentMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<PaymentMachineClient>())
+            .AddSingleton<ShipmentMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<ShipmentMachineClient>())
             .AddHostedService<ReservationExpiryScanner>()
             .AddSingleton<OutboxDestination list>(fun provider ->
                 let probeClient = provider.GetRequiredService<ProbeMachineClient>()
@@ -339,6 +345,7 @@ module Application =
                 let cartsClient = provider.GetRequiredService<CartMachineClient>()
                 let ordersClient = provider.GetRequiredService<OrderMachineClient>()
                 let paymentsClient = provider.GetRequiredService<PaymentMachineClient>()
+                let shipmentsClient = provider.GetRequiredService<ShipmentMachineClient>()
 
                 [ OutboxDestination.forMachineProvider
                       Probe.MachineKey
@@ -358,7 +365,12 @@ module Application =
                       Payments.MachineKey
                       EntityId.create
                       PaymentCodec.event
-                      (fun () -> paymentsClient.Payments) ])
+                      (fun () -> paymentsClient.Payments)
+                  OutboxDestination.forMachineProvider
+                      Shipments.MachineKey
+                      EntityId.create
+                      ShipmentCodec.event
+                      (fun () -> shipmentsClient.Shipments) ])
             .AddHostedService<IntegrationOutboxRelay>()
             .AddHostedService<EmailDeliveryRelay>()
             .AddHostedService<FlowDeadlineScanner>()
@@ -424,6 +436,19 @@ module Application =
                     fun provider ->
                         PaymentCodec.buildWorker
                             (provider.GetRequiredService<ILoggerFactory>().CreateLogger "payments")
+                            (provider.GetRequiredService<PostgresContext>())
+                  ChartRegistry =
+                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+                  TimeProvider = TimeProvider.System }
+            )
+            .AddAutomata(
+                { MachineKey = Shipments.MachineKey
+                  Supervisor = AutomataSupervisorOptions.defaults Shipments.MachineKey
+                  Actions = ActionDelivery.registered<ShipmentEntityId, ShipmentAction, ShipmentActionError>
+                  MachineFactory =
+                    fun provider ->
+                        ShipmentCodec.buildWorker
+                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "shipments")
                             (provider.GetRequiredService<PostgresContext>())
                   ChartRegistry =
                     fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
@@ -533,7 +558,25 @@ module Application =
                 route
                     "/admin/features/{name}/schedule"
                     (Account.requireMfa (Admin.requireValidAntiforgery Admin.schedule))
-                route "/admin/probe/run" (Account.requireMfa (Admin.requireValidAntiforgery ProbeAdmin.run)) ] ]
+                route "/admin/probe/run" (Account.requireMfa (Admin.requireValidAntiforgery ProbeAdmin.run))
+                route
+                    "/admin/orders/{orderId}/ship"
+                    (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.ship))
+                route
+                    "/admin/orders/{orderId}/prepare"
+                    (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.prepare))
+                route
+                    "/admin/orders/{orderId}/dispatch"
+                    (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.dispatch))
+                route
+                    "/admin/orders/{orderId}/deliver"
+                    (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.deliver))
+                route
+                    "/admin/orders/{orderId}/hold"
+                    (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.hold))
+                route
+                    "/admin/orders/{orderId}/release"
+                    (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.release)) ] ]
 
     let create (args: string array) =
         let builder = createBuilder args

@@ -72,11 +72,15 @@ module PaymentOperationTests =
                         | CallGatewayAuthorize _ -> PaymentEffects.applyAuthorize started.DataSource gateway record ct
                         | QueryGatewayAuthorization _ ->
                             PaymentEffects.applyQueryAuthorization started.DataSource gateway record ct
+                        | CallGatewayCapture _ -> PaymentEffects.applyCapture started.DataSource gateway record ct
+                        | QueryGatewayCapture _ ->
+                            PaymentEffects.applyQueryCapture started.DataSource gateway record ct
                         | CallGatewayVoid _ -> PaymentEffects.applyVoid started.DataSource gateway record ct
                         | NotifyOrderAuthorized _
                         | NotifyOrderDeclined _
                         | NotifyOrderCancelled _
-                        | NotifyOrderVoided _ -> PaymentEffects.applyNotify started.DataSource record ct)
+                        | NotifyOrderVoided _
+                        | NotifyOrderCaptured _ -> PaymentEffects.applyNotify started.DataSource record ct)
 
             let run =
                 task {

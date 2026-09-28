@@ -14,9 +14,12 @@ type PaymentEffectHandler(dataSource: NpgsqlDataSource, gateway: IPaymentGateway
 
             match record.Action with
             | CallGatewayAuthorize _ -> PaymentEffects.applyAuthorize dataSource gateway record ct
+            | CallGatewayCapture _ -> PaymentEffects.applyCapture dataSource gateway record ct
             | CallGatewayVoid _ -> PaymentEffects.applyVoid dataSource gateway record ct
             | QueryGatewayAuthorization _ -> PaymentEffects.applyQueryAuthorization dataSource gateway record ct
+            | QueryGatewayCapture _ -> PaymentEffects.applyQueryCapture dataSource gateway record ct
             | NotifyOrderAuthorized _
             | NotifyOrderDeclined _
             | NotifyOrderCancelled _
-            | NotifyOrderVoided _ -> PaymentEffects.applyNotify dataSource record ct
+            | NotifyOrderVoided _
+            | NotifyOrderCaptured _ -> PaymentEffects.applyNotify dataSource record ct

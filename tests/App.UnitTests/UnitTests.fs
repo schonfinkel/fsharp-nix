@@ -11,6 +11,7 @@ open App.Database
 open App.Domain
 open App.Orders
 open App.Payments
+open App.Shipments
 open App.Views
 open ByzantineSystems.Automata.Core
 open Expecto
@@ -236,7 +237,7 @@ module UnitTests =
         // A permanent rejection after the queued callback moves the flow to delivery-failed.
         let awaiting = AwaitingCompletion(active 1 0)
         let failed = expectResolution awaiting (NotificationSendFailed 1)
-        Assert.Equal(DeliveryFailed(active 1 0), failed.Next)
+        Assert.Equal(FlowState.DeliveryFailed(active 1 0), failed.Next)
 
         // Stale callbacks from a superseded generation are absorbed everywhere.
         let resentPending = NotificationPending(active 2 1)
@@ -367,7 +368,7 @@ module UnitTests =
                     UserId = userId
                     CompletedAt = completedAt }
               Expired active
-              DeliveryFailed active
+              FlowState.DeliveryFailed active
               FlowState.ManualReview
                   { Kind = PasswordReset
                     UserId = userId
@@ -479,6 +480,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.CartMachine
         health.Succeeded RuntimeComponent.OrderMachine
         health.Succeeded RuntimeComponent.PaymentMachine
+        health.Succeeded RuntimeComponent.ShipmentMachine
         Assert.True(health.Snapshot() |> RuntimeHealth.startupReady)
 
         health.Succeeded RuntimeComponent.IntegrationOutboxRelay
@@ -985,7 +987,7 @@ module UnitTests =
 
         let request = AuthorizeRequested attempt
         let json = PaymentCodec.event.Encode request |> Result.defaultWith string
-        Assert.Contains("\"tag\":\"authorize-requested-v1\"", json)
+        Assert.Contains("\"tag\":\"authorize-requested-v2\"", json)
         Assert.Equal(Ok request, PaymentCodec.event.Decode json)
 
         let authorized =
@@ -1002,7 +1004,7 @@ module UnitTests =
         let notify = NotifyOrderCancelled attempt.OrderId
         Assert.Equal(Ok notify, PaymentCodec.action.Encode notify |> Result.bind PaymentCodec.action.Decode)
 
-        Assert.True(Result.isError (PaymentCodec.event.Decode "{\"tag\":\"authorize-requested-v2\"}"))
+        Assert.True(Result.isError (PaymentCodec.event.Decode "{\"tag\":\"authorize-requested-v1\"}"))
 
     let ``payment payloads never contain cardholder fields`` () =
         let attempt = makeAuthorizationAttempt ()
@@ -1250,6 +1252,267 @@ module UnitTests =
         | Error _ -> ()
         | Ok value -> Assert.Fail $"A malformed active cart decoded as %A{value}."
 
+    let ``capture allocation distributes charges and consumes the remainder`` () =
+        let lineId = OrderLineId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+        let price = Money.create 10m "USD" |> Result.defaultWith Assert.Fail
+        let shipping = Money.create 5m "USD" |> Result.defaultWith Assert.Fail
+        let tax = Money.create 0.80m "USD" |> Result.defaultWith Assert.Fail
+        let zero = Money.create 0m "USD" |> Result.defaultWith Assert.Fail
+        let authorized = Money.create 25.80m "USD" |> Result.defaultWith Assert.Fail
+
+        let shipmentAllocation (suffix: byte) quantity =
+            { AllocationId =
+                ShipmentAllocationId.create (Guid.Parse $"00000000-0000-0000-0000-0000000000{suffix:X2}")
+                |> Result.defaultWith Assert.Fail
+              Lines = [ { LineId = lineId; Quantity = quantity } ] }
+
+        let request =
+            { OrderLines =
+                [ { LineId = lineId
+                    UnitPrice = price
+                    Quantity = 2 } ]
+              Shipments = [ shipmentAllocation 1uy 1; shipmentAllocation 2uy 1 ]
+              Shipping = shipping
+              Tax = tax
+              AuthorizedAmount = authorized }
+
+        match CaptureAllocation.allocate request with
+        | Error error -> Assert.Fail $"Expected allocation to succeed, got %A{error}."
+        | Ok allocations ->
+            Assert.Equal(2, allocations.Length)
+
+            let total =
+                allocations
+                |> List.fold (fun acc allocation -> Money.add acc allocation.Total) zero
+
+            let allocatedShipping =
+                allocations
+                |> List.fold (fun acc allocation -> Money.add acc allocation.Shipping) zero
+
+            let allocatedTax =
+                allocations
+                |> List.fold (fun acc allocation -> Money.add acc allocation.Tax) zero
+
+            Assert.Equal(authorized, total)
+            Assert.Equal(shipping, allocatedShipping)
+            Assert.Equal(tax, allocatedTax)
+
+    let private makeShipmentRequest () =
+        { ShipmentId = ShipmentId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+          AllocationId = ShipmentAllocationId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+          OrderId = "order:ship"
+          Lines =
+            [ { LineId = OrderLineId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+                Quantity = 1 } ] }
+
+    let private expectShipmentResolution state event =
+        match Chart.resolve Shipments.chartValue state event with
+        | Ok resolution -> resolution
+        | Error error -> Assert.Fail $"Expected shipment event to resolve, got %A{error}."
+
+    let ``shipment chart confirms allocation creates label and dispatches`` () =
+        let request = makeShipmentRequest ()
+
+        let started =
+            expectShipmentResolution Shipments.initialState (ShipmentRequested request)
+
+        Assert.Equal(AllocationPending(Some request), started.Next)
+        Assert.Equal([ ConfirmAllocation request.AllocationId ], started.Actions)
+
+        let confirmed =
+            expectShipmentResolution started.Next (AllocationConfirmed request.AllocationId)
+
+        match confirmed.Next with
+        | Preparing preparing -> Assert.Equal(request, preparing.Request)
+        | other -> Assert.Fail $"Expected preparing, got %A{other}."
+
+        let prepared = expectShipmentResolution confirmed.Next PreparationCompleted
+        Assert.Equal([ CreateCarrierLabel(request.ShipmentId, 1L) ], prepared.Actions)
+
+        let carrierReference =
+            CarrierReference.create "sim-abc123" |> Result.defaultWith Assert.Fail
+
+        let labelled =
+            expectShipmentResolution prepared.Next (LabelCreated(1L, carrierReference))
+
+        match labelled.Next with
+        | ReadyToDispatch ready -> Assert.Equal(carrierReference, ready.CarrierReference)
+        | other -> Assert.Fail $"Expected ready-to-dispatch, got %A{other}."
+
+        let dispatched =
+            expectShipmentResolution labelled.Next (DispatchConfirmed DateTimeOffset.UtcNow)
+
+        match dispatched.Next with
+        | InTransit transit -> Assert.Equal(1L, transit.TrackingGeneration)
+        | other -> Assert.Fail $"Expected in-transit, got %A{other}."
+
+        match dispatched.Actions with
+        | [ NotifyOrderDispatched(orderId, shipmentId, allocationId, _) ] ->
+            Assert.Equal(request.OrderId, orderId)
+            Assert.Equal(request.ShipmentId, shipmentId)
+            Assert.Equal(request.AllocationId, allocationId)
+        | other -> Assert.Fail $"Expected notify-order-dispatched, got %A{other}."
+
+        let trackingId = TrackingEventId.create "scan-1" |> Result.defaultWith Assert.Fail
+
+        let delivered =
+            expectShipmentResolution
+                dispatched.Next
+                (CarrierTrackingReceived
+                    { EventId = trackingId
+                      Generation = 1L
+                      OccurredAt = DateTimeOffset.UtcNow.AddMinutes 1.
+                      Status = CarrierTrackingStatus.Delivered })
+
+        match delivered.Next with
+        | ShipmentState.Delivered _ -> ()
+        | other -> Assert.Fail $"Expected delivered, got %A{other}."
+
+        match delivered.Actions with
+        | [ NotifyOrderDelivered(orderId, _, _, _) ] -> Assert.Equal(request.OrderId, orderId)
+        | other -> Assert.Fail $"Expected notify-order-delivered, got %A{other}."
+
+    let ``order fulfilment requests capture on dispatch and completes on delivery`` () =
+        let reserved = reservedOrder ()
+        let line = reserved.Pending.Lines.Head
+
+        let shipmentId =
+            ShipmentId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+        let allocationId =
+            ShipmentAllocationId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+        let captureId = CaptureId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+        let operationId =
+            PaymentOperationId.create "capture:v1:op" |> Result.defaultWith Assert.Fail
+
+        let totals = reserved.Pending.Totals
+
+        let allocation =
+            { AllocationId = allocationId
+              Lines =
+                [ { LineId = line.LineId
+                    Quantity = Quantity.value line.Quantity } ]
+              Merchandise = totals.Subtotal
+              Shipping = totals.Shipping
+              Tax = totals.Tax
+              Total = totals.Total }
+
+        let plan =
+            { ShipmentId = shipmentId
+              CaptureId = captureId
+              PaymentOperationId = operationId
+              Allocation = allocation }
+
+        let placed =
+            Placed
+                { Reserved = reserved
+                  ProviderReference = "sim-abc123" }
+
+        let requested = expectOrderResolution placed (FulfilmentRequested [ plan ])
+
+        match requested.Next with
+        | FulfilmentPending fulfilment -> Assert.Equal(1, fulfilment.Shipments.Length)
+        | other -> Assert.Fail $"Expected fulfilment pending, got %A{other}."
+
+        Assert.Equal([ CreateShipment(plan, reserved.Pending.SnapshotId) ], requested.Actions)
+
+        let created =
+            expectOrderResolution requested.Next (ShipmentCreated(shipmentId, allocationId))
+
+        match created.Next with
+        | Processing fulfilment -> Assert.True(fulfilment.Shipments.Head.Created)
+        | other -> Assert.Fail $"Expected processing, got %A{other}."
+
+        let dispatched =
+            expectOrderResolution created.Next (ShipmentDispatched(shipmentId, allocationId))
+
+        Assert.Equal(
+            [ RequestCapture(shipmentId, allocation, captureId, operationId, "sim-abc123") ],
+            dispatched.Actions
+        )
+
+        match dispatched.Next with
+        | Shipped _ -> ()
+        | other -> Assert.Fail $"Expected shipped, got %A{other}."
+
+        let captured =
+            expectOrderResolution dispatched.Next (PaymentCaptured(captureId, operationId))
+
+        match captured.Next with
+        | Shipped fulfilment -> Assert.True(fulfilment.Shipments.Head.CaptureSucceeded)
+        | other -> Assert.Fail $"Expected shipped, got %A{other}."
+
+        let delivered =
+            expectOrderResolution captured.Next (ShipmentDelivered(shipmentId, allocationId))
+
+        match delivered.Next with
+        | OrderState.Delivered _ -> ()
+        | other -> Assert.Fail $"Expected delivered, got %A{other}."
+
+    let ``payment captures respect the authorized amount`` () =
+        let attempt = makeAuthorizationAttempt ()
+        let expiry = DateTimeOffset.UtcNow.AddDays 6.
+
+        let authorized =
+            { Attempt = attempt
+              ProviderReference = "sim-abc123"
+              ExpiresAt = expiry }
+
+        let captureRequest (suffix: string) amount =
+            { OrderId = attempt.OrderId
+              CaptureId = CaptureId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+              OperationId =
+                PaymentOperationId.create $"capture:v1:{suffix}"
+                |> Result.defaultWith Assert.Fail
+              Amount = Money.create amount "USD" |> Result.defaultWith Assert.Fail }
+
+        let first = captureRequest "one" 10m
+
+        let started =
+            expectPaymentResolution (Authorized authorized) (CaptureRequested first)
+
+        match started.Next with
+        | CapturePending pending -> Assert.Equal(first, pending.Request)
+        | other -> Assert.Fail $"Expected capture pending, got %A{other}."
+
+        Assert.Equal([ CallGatewayCapture(authorized, first) ], started.Actions)
+
+        let succeeded =
+            expectPaymentResolution started.Next (CaptureSucceeded(first, "sim-cap1"))
+
+        match succeeded.Next with
+        | PartiallyCaptured payment -> Assert.Equal(1, payment.Captures.Length)
+        | other -> Assert.Fail $"Expected partially captured, got %A{other}."
+
+        Assert.Equal(
+            [ NotifyOrderCaptured
+                  { Request = first
+                    ProviderReference = "sim-cap1" } ],
+            succeeded.Actions
+        )
+
+        let second = captureRequest "two" 17m
+        let secondPending = expectPaymentResolution succeeded.Next (CaptureRequested second)
+
+        match secondPending.Next with
+        | CapturePending pending -> Assert.Equal(second, pending.Request)
+        | other -> Assert.Fail $"Expected capture pending, got %A{other}."
+
+        let fully =
+            expectPaymentResolution secondPending.Next (CaptureSucceeded(second, "sim-cap2"))
+
+        match fully.Next with
+        | Captured payment -> Assert.Equal(2, payment.Captures.Length)
+        | other -> Assert.Fail $"Expected captured, got %A{other}."
+
+        let excess = captureRequest "excess" 18m
+
+        match Chart.resolve Payments.chartValue fully.Next (CaptureRequested excess) with
+        | Ok _ -> Assert.Fail "Expected an excess capture to be rejected."
+        | Error _ -> ()
+
     let tests =
         testList
             "unit"
@@ -1340,5 +1603,17 @@ module UnitTests =
               testCase
                   "capability locate digest is purpose scoped"
                   ``capability locate digest is purpose scoped and entity free``
+              testCase
+                  "capture allocation distributes charges"
+                  ``capture allocation distributes charges and consumes the remainder``
+              testCase
+                  "shipment chart confirms allocation and dispatches"
+                  ``shipment chart confirms allocation creates label and dispatches``
+              testCase
+                  "order fulfilment captures on dispatch"
+                  ``order fulfilment requests capture on dispatch and completes on delivery``
+              testCase
+                  "payment captures respect the authorized amount"
+                  ``payment captures respect the authorized amount``
               testCase "cart codecs contain no secret fields" ``cart codecs cover every case without secret fields``
               testCase "cart codecs round trip an active cart" ``cart codecs round trip an active cart`` ]

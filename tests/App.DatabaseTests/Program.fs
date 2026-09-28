@@ -107,7 +107,11 @@ let private tests =
               "payment operations"
               [ DatabaseTest.isolated false "authorization is provider-idempotent" (fun fixture ->
                     PaymentOperationTests.``authorization persists one provider operation and one order callback``
-                        fixture) ] ]
+                        fixture) ]
+          testList
+              "shipment operations"
+              [ DatabaseTest.isolated false "shipment confirms allocation and labels" (fun fixture ->
+                    ShipmentOperationTests.``shipment confirms allocation and creates a carrier label`` fixture) ] ]
     |> testSequenced
 
 [<EntryPoint>]

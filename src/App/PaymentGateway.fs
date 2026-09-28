@@ -17,6 +17,7 @@ open App.Domain
 /// </summary>
 type SimulatedPaymentGateway() =
     let authorizeCalls = ConcurrentDictionary<string, int>()
+    let captureCalls = ConcurrentDictionary<string, int>()
     let voidCalls = ConcurrentDictionary<string, int>()
 
     let seed (operationId: PaymentOperationId) =
@@ -63,11 +64,27 @@ type SimulatedPaymentGateway() =
             record voidCalls (PaymentOperationId.value operationId)
             Task.FromResult GatewayVoided
 
+        member _.Capture(operationId, _, _, method, _) =
+            record captureCalls (PaymentOperationId.value operationId)
+
+            match PaymentMethodReference.value method with
+            | "sandbox://decline" -> Task.FromResult(GatewayCaptureDeclined "do-not-honor")
+            | "sandbox://unknown" -> Task.FromResult GatewayCaptureUnknown
+            | _ -> Task.FromResult(GatewayCaptured(reference operationId))
+
+        member _.QueryCapture(operationId, _, method, _) =
+            match PaymentMethodReference.value method with
+            | "sandbox://decline" -> Task.FromResult(Some(GatewayCaptureDeclined "do-not-honor"))
+            | _ -> Task.FromResult(Some(GatewayCaptured(reference operationId)))
+
         member _.QueryAuthorization(operationId, method, _) =
             Task.FromResult(Some(resolve operationId method))
 
     /// <summary>How many times the provider was asked to authorize this operation.</summary>
     member _.AuthorizeCalls(operationId: PaymentOperationId) = lookup authorizeCalls operationId
+
+    /// <summary>How many times the provider was asked to capture this operation.</summary>
+    member _.CaptureCalls(operationId: PaymentOperationId) = lookup captureCalls operationId
 
     /// <summary>How many times the provider was asked to void this operation.</summary>
     member _.VoidCalls(operationId: PaymentOperationId) = lookup voidCalls operationId

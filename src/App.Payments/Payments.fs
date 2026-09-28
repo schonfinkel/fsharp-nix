@@ -24,11 +24,37 @@ type PendingAuthorization =
     { Attempt: AuthorizationAttempt
       CancelRequested: bool }
 
+/// <summary>One immutable request to capture part of an authorization.</summary>
+type CaptureRequest =
+    { OrderId: string
+      CaptureId: CaptureId
+      OperationId: PaymentOperationId
+      Amount: Money }
+
+/// <summary>A capture confirmed by the gateway.</summary>
+type CaptureRecord =
+    { Request: CaptureRequest
+      ProviderReference: string }
+
+/// <summary>The authorization and all captures confirmed against it.</summary>
+type CapturedPayment =
+    { Authorization: AuthorizedPayment
+      Captures: CaptureRecord list }
+
+/// <summary>A capture whose provider outcome has not yet been settled.</summary>
+type PendingCapture =
+    { Payment: CapturedPayment
+      Request: CaptureRequest }
+
 type PaymentState =
     | Initial
     | AuthorizationPending of PendingAuthorization
     | AuthorizationUnknown of PendingAuthorization
     | Authorized of AuthorizedPayment
+    | CapturePending of PendingCapture
+    | CaptureUnknown of PendingCapture
+    | PartiallyCaptured of CapturedPayment
+    | Captured of CapturedPayment
     | VoidPending of AuthorizedPayment
     | VoidUnknown of AuthorizedPayment
     | Voided of AuthorizedPayment
@@ -41,6 +67,10 @@ type PaymentEvent =
     | AuthorizationSucceeded of AuthorizationAttempt * providerReference: string * expiresAt: DateTimeOffset
     | AuthorizationDeclined of AuthorizationAttempt * reasonCode: string
     | AuthorizationOutcomeUnknown of AuthorizationAttempt
+    | CaptureRequested of CaptureRequest
+    | CaptureSucceeded of CaptureRequest * providerReference: string
+    | CaptureOutcomeUnknown of CaptureRequest
+    | CaptureDeclined of CaptureRequest * reasonCode: string
     | PaymentCancellationRequested of orderId: string * reason: string
     | VoidSucceeded of AuthorizedPayment
     | VoidOutcomeUnknown of AuthorizedPayment
@@ -49,11 +79,14 @@ type PaymentEvent =
 type PaymentAction =
     | CallGatewayAuthorize of AuthorizationAttempt
     | QueryGatewayAuthorization of AuthorizationAttempt
+    | CallGatewayCapture of AuthorizedPayment * CaptureRequest
+    | QueryGatewayCapture of AuthorizedPayment * CaptureRequest
     | CallGatewayVoid of AuthorizedPayment
     | NotifyOrderAuthorized of AuthorizedPayment
     | NotifyOrderDeclined of AuthorizationAttempt * reasonCode: string
     | NotifyOrderCancelled of orderId: string
     | NotifyOrderVoided of AuthorizedPayment
+    | NotifyOrderCaptured of CaptureRecord
 
 [<RequireQualifiedAccess>]
 type PaymentActionError =
@@ -84,6 +117,10 @@ module Payments =
         | AuthorizationPending _ -> stateId "authorization-pending"
         | AuthorizationUnknown _ -> stateId "authorization-unknown"
         | Authorized _ -> stateId "authorized"
+        | CapturePending _ -> stateId "capture-pending"
+        | CaptureUnknown _ -> stateId "capture-unknown"
+        | PartiallyCaptured _ -> stateId "partially-captured"
+        | Captured _ -> stateId "captured"
         | VoidPending _ -> stateId "void-pending"
         | VoidUnknown _ -> stateId "void-unknown"
         | Voided _ -> stateId "voided"
@@ -129,14 +166,95 @@ module Payments =
             confirmed.Attempt.OperationId = authorized.Attempt.OperationId
         | _ -> false
 
+    let private captureTotal (payment: CapturedPayment) =
+        payment.Captures
+        |> List.fold
+            (fun total capture -> Money.add total capture.Request.Amount)
+            (Money.zero (Money.currencyCode payment.Authorization.Attempt.Amount)
+             |> Result.defaultWith invalidOp)
+
+    let authorizedTotal (payment: CapturedPayment) = payment.Authorization.Attempt.Amount
+
+    let capturedTotal (payment: CapturedPayment) = captureTotal payment
+
+    let private captureAllowed payment request =
+        request.OrderId = payment.Authorization.Attempt.OrderId
+        && Money.currencyCode request.Amount = Money.currencyCode payment.Authorization.Attempt.Amount
+        && Money.amount request.Amount > 0m
+        && request.OperationId <> payment.Authorization.Attempt.OperationId
+        && payment.Captures
+           |> List.forall (fun capture ->
+               capture.Request.CaptureId <> request.CaptureId
+               && capture.Request.OperationId <> request.OperationId)
+        && Money.amount (Money.add (captureTotal payment) request.Amount)
+           <= Money.amount payment.Authorization.Attempt.Amount
+
+    let private captureStart state event =
+        match state, event with
+        | Authorized authorized, CaptureRequested request ->
+            captureAllowed
+                { Authorization = authorized
+                  Captures = [] }
+                request
+        | PartiallyCaptured payment, CaptureRequested request -> captureAllowed payment request
+        | _ -> false
+
+    let private captureSettled state event =
+        let matches pending request = pending.Request = request
+
+        match state, event with
+        | (CapturePending pending | CaptureUnknown pending), CaptureSucceeded(request, _)
+        | (CapturePending pending | CaptureUnknown pending), CaptureDeclined(request, _)
+        | (CapturePending pending | CaptureUnknown pending), CaptureOutcomeUnknown request -> matches pending request
+        | _ -> false
+
+    let private readyState payment =
+        if List.isEmpty payment.Captures then
+            Authorized payment.Authorization
+        elif captureTotal payment = payment.Authorization.Attempt.Amount then
+            Captured payment
+        else
+            PartiallyCaptured payment
+
+    let private settleCapture queryOnUnknown pending event =
+        match event with
+        | CaptureSucceeded(request, reference) ->
+            let capture =
+                { Request = request
+                  ProviderReference = reference }
+
+            let payment =
+                { pending.Payment with
+                    Captures = pending.Payment.Captures @ [ capture ] }
+
+            [ NotifyOrderCaptured capture ], readyState payment
+        | CaptureDeclined _ -> [], readyState pending.Payment
+        | CaptureOutcomeUnknown _ ->
+            (if queryOnUnknown then
+                 [ QueryGatewayCapture(pending.Payment.Authorization, pending.Request) ]
+             else
+                 []),
+            CaptureUnknown pending
+        | _ -> [], CapturePending pending
+
+    let private cancelAfterCapture state event =
+        match state, event with
+        | (CapturePending _ | CaptureUnknown _ | PartiallyCaptured _ | Captured _), PaymentCancellationRequested _ ->
+            true
+        | _ -> false
+
     let private absorb _ =
         function
         | AuthorizationSucceeded _
         | AuthorizationDeclined _
         | AuthorizationOutcomeUnknown _
+        | CaptureSucceeded _
+        | CaptureOutcomeUnknown _
+        | CaptureDeclined _
         | VoidSucceeded _
         | VoidOutcomeUnknown _ -> true
         | AuthorizeRequested _
+        | CaptureRequested _
         | PaymentCancellationRequested _
         | MarkManualReview _ -> false
 
@@ -239,11 +357,59 @@ module Payments =
             }
 
             state "authorized" {
+                on captureStart (fun state event ->
+                    match state, event with
+                    | Authorized authorized, CaptureRequested request ->
+                        [ CallGatewayCapture(authorized, request) ],
+                        CapturePending
+                            { Payment =
+                                { Authorization = authorized
+                                  Captures = [] }
+                              Request = request }
+                    | _ -> [], state)
+
                 on cancelInFlight (fun state _ ->
                     match state with
                     | Authorized authorized -> [ CallGatewayVoid authorized ], VoidPending authorized
                     | _ -> [], state)
 
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "capture-pending" {
+                on captureSettled (fun state event ->
+                    match state with
+                    | CapturePending pending -> settleCapture true pending event
+                    | _ -> [], state)
+
+                on cancelAfterCapture (fun _ _ -> [], ManualReview "cancellation-during-capture")
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "capture-unknown" {
+                on captureSettled (fun state event ->
+                    match state with
+                    | CaptureUnknown pending -> settleCapture false pending event
+                    | _ -> [], state)
+
+                on cancelAfterCapture (fun _ _ -> [], ManualReview "cancellation-during-unknown-capture")
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "partially-captured" {
+                on captureStart (fun state event ->
+                    match state, event with
+                    | PartiallyCaptured payment, CaptureRequested request ->
+                        [ CallGatewayCapture(payment.Authorization, request) ],
+                        CapturePending { Payment = payment; Request = request }
+                    | _ -> [], state)
+
+                on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "captured" {
+                on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
                 internalOn absorb (fun _ _ -> [])
             }
 

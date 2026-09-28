@@ -7,6 +7,7 @@
     <Project Path="src/App.Domain/App.Domain.fsproj" />
     <Project Path="src/App.Orders/App.Orders.fsproj" />
     <Project Path="src/App.Payments/App.Payments.fsproj" />
+    <Project Path="src/App.Shipments/App.Shipments.fsproj" />
     <Project Path="src/App.Migrations/App.Migrations.fsproj" />
     <Project Path="src/App.Views/App.Views.fsproj" />
   </Folder>

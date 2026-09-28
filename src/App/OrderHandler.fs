@@ -25,3 +25,5 @@ type OrderEffectHandler(dataSource: NpgsqlDataSource, timeProvider: TimeProvider
             | RequestAuthorization _ -> OrderEffects.applyRequestAuthorization dataSource record ct
             | RequestPaymentCancellation _ -> OrderEffects.applyRequestPaymentCancellation dataSource record ct
             | CommitStock _ -> OrderEffects.applyCommitStock dataSource record ct
+            | CreateShipment _ -> OrderEffects.applyCreateShipment dataSource record ct
+            | RequestCapture _ -> OrderEffects.applyRequestCapture dataSource record ct

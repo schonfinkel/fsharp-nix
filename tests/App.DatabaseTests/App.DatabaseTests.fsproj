@@ -18,6 +18,7 @@
     <Compile Include="CatalogAndCartTests.fs" />
     <Compile Include="OrderReservationTests.fs" />
     <Compile Include="PaymentOperationTests.fs" />
+    <Compile Include="ShipmentOperationTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
