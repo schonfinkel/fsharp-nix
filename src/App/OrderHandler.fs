@@ -27,3 +27,5 @@ type OrderEffectHandler(dataSource: NpgsqlDataSource, timeProvider: TimeProvider
             | CommitStock _ -> OrderEffects.applyCommitStock dataSource record ct
             | CreateShipment _ -> OrderEffects.applyCreateShipment dataSource record ct
             | RequestCapture _ -> OrderEffects.applyRequestCapture dataSource record ct
+            | StartReturn _ -> OrderEffects.applyStartReturn dataSource record ct
+            | StartRefund _ -> OrderEffects.applyStartRefund dataSource record ct

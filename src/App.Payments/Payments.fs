@@ -36,10 +36,15 @@ type CaptureRecord =
     { Request: CaptureRequest
       ProviderReference: string }
 
+type RefundReservation =
+    { Request: RefundRequest
+      Status: string }
+
 /// <summary>The authorization and all captures confirmed against it.</summary>
 type CapturedPayment =
     { Authorization: AuthorizedPayment
-      Captures: CaptureRecord list }
+      Captures: CaptureRecord list
+      Refunds: RefundReservation list }
 
 /// <summary>A capture whose provider outcome has not yet been settled.</summary>
 type PendingCapture =
@@ -55,6 +60,7 @@ type PaymentState =
     | CaptureUnknown of PendingCapture
     | PartiallyCaptured of CapturedPayment
     | Captured of CapturedPayment
+    | RefundAllocationPending of CapturedPayment
     | VoidPending of AuthorizedPayment
     | VoidUnknown of AuthorizedPayment
     | Voided of AuthorizedPayment
@@ -71,6 +77,9 @@ type PaymentEvent =
     | CaptureSucceeded of CaptureRequest * providerReference: string
     | CaptureOutcomeUnknown of CaptureRequest
     | CaptureDeclined of CaptureRequest * reasonCode: string
+    | RefundAllocationRequested of RefundRequest
+    | RefundAllocationSettled of RefundAllocationId
+    | RefundAllocationReleased of RefundAllocationId
     | PaymentCancellationRequested of orderId: string * reason: string
     | VoidSucceeded of AuthorizedPayment
     | VoidOutcomeUnknown of AuthorizedPayment
@@ -87,6 +96,9 @@ type PaymentAction =
     | NotifyOrderCancelled of orderId: string
     | NotifyOrderVoided of AuthorizedPayment
     | NotifyOrderCaptured of CaptureRecord
+    | NotifyRefundApproved of ApprovedRefund
+    | NotifyRefundDenied of RefundRequest * reasonCode: string
+    | NotifyRefundSettled of RefundRequest
 
 [<RequireQualifiedAccess>]
 type PaymentActionError =
@@ -121,6 +133,7 @@ module Payments =
         | CaptureUnknown _ -> stateId "capture-unknown"
         | PartiallyCaptured _ -> stateId "partially-captured"
         | Captured _ -> stateId "captured"
+        | RefundAllocationPending _ -> stateId "refund-allocation-pending"
         | VoidPending _ -> stateId "void-pending"
         | VoidUnknown _ -> stateId "void-unknown"
         | Voided _ -> stateId "voided"
@@ -177,6 +190,30 @@ module Payments =
 
     let capturedTotal (payment: CapturedPayment) = captureTotal payment
 
+    let refundedTotal (payment: CapturedPayment) =
+        let zero =
+            Money.zero (Money.currencyCode payment.Authorization.Attempt.Amount)
+            |> Result.defaultWith invalidOp
+
+        payment.Refunds
+        |> List.filter (fun refund -> refund.Status = "settled")
+        |> List.fold (fun sum refund -> sum + refund.Request.Amount) zero
+
+    let refundableTotal (payment: CapturedPayment) =
+        let zero =
+            Money.zero (Money.currencyCode payment.Authorization.Attempt.Amount)
+            |> Result.defaultWith invalidOp
+
+        let pending =
+            payment.Refunds
+            |> List.filter (fun refund -> refund.Status = "pending")
+            |> List.fold (fun sum refund -> sum + refund.Request.Amount) zero
+
+        RefundAllocation.available
+            { Captured = captureTotal payment
+              Refunded = refundedTotal payment
+              Pending = pending }
+
     let private captureAllowed payment request =
         request.OrderId = payment.Authorization.Attempt.OrderId
         && Money.currencyCode request.Amount = Money.currencyCode payment.Authorization.Attempt.Amount
@@ -194,9 +231,11 @@ module Payments =
         | Authorized authorized, CaptureRequested request ->
             captureAllowed
                 { Authorization = authorized
-                  Captures = [] }
+                  Captures = []
+                  Refunds = [] }
                 request
         | PartiallyCaptured payment, CaptureRequested request -> captureAllowed payment request
+        | RefundAllocationPending payment, CaptureRequested request -> captureAllowed payment request
         | _ -> false
 
     let private captureSettled state event =
@@ -209,7 +248,9 @@ module Payments =
         | _ -> false
 
     let private readyState payment =
-        if List.isEmpty payment.Captures then
+        if payment.Refunds |> List.exists (fun refund -> refund.Status = "pending") then
+            RefundAllocationPending payment
+        elif List.isEmpty payment.Captures then
             Authorized payment.Authorization
         elif captureTotal payment = payment.Authorization.Attempt.Amount then
             Captured payment
@@ -239,9 +280,97 @@ module Payments =
 
     let private cancelAfterCapture state event =
         match state, event with
-        | (CapturePending _ | CaptureUnknown _ | PartiallyCaptured _ | Captured _), PaymentCancellationRequested _ ->
-            true
+        | (CapturePending _ | CaptureUnknown _ | PartiallyCaptured _ | Captured _ | RefundAllocationPending _),
+          PaymentCancellationRequested _ -> true
         | _ -> false
+
+    let private refundPayment =
+        function
+        | PartiallyCaptured payment
+        | Captured payment
+        | RefundAllocationPending payment -> Some payment
+        | _ -> None
+
+    let private refundRequest state event =
+        match refundPayment state, event with
+        | Some _, RefundAllocationRequested _ -> true
+        | _ -> false
+
+    let private refundSettlement state event =
+        match refundPayment state, event with
+        | Some payment, (RefundAllocationSettled id | RefundAllocationReleased id) ->
+            payment.Refunds
+            |> List.exists (fun row -> row.Request.AllocationId = id && row.Status = "pending")
+        | _ -> false
+
+    let private applyRefundRequest state event =
+        match refundPayment state, event with
+        | Some payment, RefundAllocationRequested request ->
+            let existing =
+                payment.Refunds
+                |> List.tryFind (fun row -> row.Request.AllocationId = request.AllocationId)
+
+            let expectedOrder = payment.Authorization.Attempt.OrderId
+
+            match existing with
+            | Some row when row.Request = request && row.Status = "pending" ->
+                [ NotifyRefundApproved
+                      { Request = request
+                        PaymentReference = payment.Authorization.ProviderReference } ],
+                state
+            | Some _ -> [ NotifyRefundDenied(request, "allocation-conflict") ], state
+            | None ->
+                match refundableTotal payment with
+                | Error _ -> [ NotifyRefundDenied(request, "balance-invalid") ], state
+                | Ok remaining when
+                    RefundOrigin.orderId request.Origin <> expectedOrder
+                    || Money.currencyCode request.Amount <> Money.currencyCode remaining
+                    || Money.amount request.Amount <= 0m
+                    || request.Amount > remaining
+                    ->
+                    [ NotifyRefundDenied(request, "insufficient-captured-balance") ], state
+                | Ok _ ->
+                    let updated =
+                        { payment with
+                            Refunds =
+                                payment.Refunds
+                                @ [ { Request = request
+                                      Status = "pending" } ] }
+
+                    [ NotifyRefundApproved
+                          { Request = request
+                            PaymentReference = payment.Authorization.ProviderReference } ],
+                    RefundAllocationPending updated
+        | _ -> [], state
+
+    let private applyRefundSettlement state event =
+        match refundPayment state, event with
+        | Some payment, (RefundAllocationSettled id | RefundAllocationReleased id) ->
+            let row = payment.Refunds |> List.find (fun row -> row.Request.AllocationId = id)
+
+            let status =
+                match event with
+                | RefundAllocationSettled _ -> "settled"
+                | _ -> "released"
+
+            let updated =
+                { payment with
+                    Refunds =
+                        payment.Refunds
+                        |> List.map (fun entry ->
+                            if entry.Request.AllocationId = id then
+                                { entry with Status = status }
+                            else
+                                entry) }
+
+            let actions =
+                if status = "settled" then
+                    [ NotifyRefundSettled row.Request ]
+                else
+                    []
+
+            actions, readyState updated
+        | _ -> [], state
 
     let private absorb _ =
         function
@@ -253,8 +382,11 @@ module Payments =
         | CaptureDeclined _
         | VoidSucceeded _
         | VoidOutcomeUnknown _ -> true
+        | RefundAllocationSettled _
+        | RefundAllocationReleased _ -> true
         | AuthorizeRequested _
         | CaptureRequested _
+        | RefundAllocationRequested _
         | PaymentCancellationRequested _
         | MarkManualReview _ -> false
 
@@ -364,7 +496,8 @@ module Payments =
                         CapturePending
                             { Payment =
                                 { Authorization = authorized
-                                  Captures = [] }
+                                  Captures = []
+                                  Refunds = [] }
                               Request = request }
                     | _ -> [], state)
 
@@ -405,11 +538,29 @@ module Payments =
                     | _ -> [], state)
 
                 on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
+                on refundRequest applyRefundRequest
+                on refundSettlement applyRefundSettlement
                 internalOn absorb (fun _ _ -> [])
             }
 
             state "captured" {
                 on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
+                on refundRequest applyRefundRequest
+                on refundSettlement applyRefundSettlement
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "refund-allocation-pending" {
+                on refundRequest applyRefundRequest
+                on refundSettlement applyRefundSettlement
+
+                on captureStart (fun state event ->
+                    match state, event with
+                    | RefundAllocationPending payment, CaptureRequested request ->
+                        [ CallGatewayCapture(payment.Authorization, request) ],
+                        CapturePending { Payment = payment; Request = request }
+                    | _ -> [], state)
+
                 internalOn absorb (fun _ _ -> [])
             }
 

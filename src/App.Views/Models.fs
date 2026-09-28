@@ -160,6 +160,12 @@ type OrderPayModel =
     { Attempt: string
       Methods: (string * string) list }
 
+type ReturnLineModel =
+    { LineId: string
+      Name: string
+      Available: int
+      ReturnKey: string }
+
 type OrderStatusModel =
     { OrderId: string
       Status: string
@@ -167,4 +173,6 @@ type OrderStatusModel =
       CanCancel: bool
       TooLateToCancel: bool
       Pay: OrderPayModel option
+      ReturnLines: ReturnLineModel list
+      ReturnStatuses: (string * string) list
       Error: string option }

@@ -353,6 +353,24 @@ module ShipmentEffects =
                     do! tx.RollbackAsync ct
                     return Error error
                 | Ok _ ->
+                    match record.Action with
+                    | NotifyOrderDelivered(_, shipmentId, _, deliveredAt) ->
+                        use delivered =
+                            new NpgsqlCommand(
+                                "UPDATE fsnix.shipments SET delivered_at=COALESCE(delivered_at,@delivered) WHERE shipment_id=@shipment",
+                                connection,
+                                tx
+                            )
+
+                        delivered.Parameters.AddWithValue("delivered", deliveredAt) |> ignore
+
+                        delivered.Parameters.AddWithValue("shipment", ShipmentId.value shipmentId)
+                        |> ignore
+
+                        let! _ = delivered.ExecuteNonQueryAsync ct
+                        ()
+                    | _ -> ()
+
                     match OrderCodec.event.Encode orderEvent with
                     | Error _ ->
                         do! tx.RollbackAsync ct

@@ -15,9 +15,13 @@
     <Compile Include="CommerceIds.fs" />
     <Compile Include="PaymentIds.fs" />
     <Compile Include="ShipmentIds.fs" />
+    <Compile Include="RefundIds.fs" />
+    <Compile Include="ReturnIds.fs" />
     <Compile Include="OrderAddress.fs" />
     <Compile Include="OrderPricing.fs" />
     <Compile Include="CaptureAllocation.fs" />
+    <Compile Include="RefundAllocation.fs" />
+    <Compile Include="ReturnRequest.fs" />
     <Compile Include="FlowKinds.fs" />
     <Compile Include="FeatureFlags.fs" />
   </ItemGroup>

@@ -23,3 +23,6 @@ type PaymentEffectHandler(dataSource: NpgsqlDataSource, gateway: IPaymentGateway
             | NotifyOrderCancelled _
             | NotifyOrderVoided _
             | NotifyOrderCaptured _ -> PaymentEffects.applyNotify dataSource record ct
+            | NotifyRefundApproved _
+            | NotifyRefundDenied _
+            | NotifyRefundSettled _ -> PaymentEffects.applyNotifyRefund dataSource record ct

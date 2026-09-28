@@ -54,12 +54,19 @@ type OrderShipmentStatus =
       CreationFailed: bool
       Dispatched: bool
       Delivered: bool
-      CaptureSucceeded: bool }
+      CaptureSucceeded: bool
+      RefundRequested: bool
+      Refunded: bool }
+
+type OrderReturnReservation =
+    { Request: ReturnRequest
+      Status: string }
 
 type FulfilmentOrder =
     { PlacedOrder: PlacedOrder
       AddressSnapshotId: OrderSnapshotId
-      Shipments: OrderShipmentStatus list }
+      Shipments: OrderShipmentStatus list
+      Returns: OrderReturnReservation list }
 
 type HeldForReviewOrder =
     { Fulfilment: FulfilmentOrder
@@ -87,6 +94,8 @@ type OrderState =
     | PartiallyShipped of FulfilmentOrder
     | Shipped of FulfilmentOrder
     | Delivered of FulfilmentOrder
+    | CancellationCompensating of FulfilmentOrder
+    | CancelledAfterRefund of FulfilmentOrder
     | CancellationPending of CancellationPendingOrder
     | Cancelled
     | ReservationFailed of code: string
@@ -123,6 +132,11 @@ type OrderEvent =
     | HoldRequested of reason: string
     | ReleaseHoldRequested
     | AddressSnapshotChanged of OrderSnapshotId
+    | ReturnRequested of ReturnRequest
+    | ReturnRefunded of ReturnId
+    | ReturnRejected of ReturnId
+    | OrderRefunded of RefundId
+    | OrderRefundFailed of RefundId * reasonCode: string
 
 type OrderAction =
     | ReserveStock of ReservationPendingOrder
@@ -138,6 +152,8 @@ type OrderAction =
         captureId: CaptureId *
         operationId: PaymentOperationId *
         providerReference: string
+    | StartReturn of ReturnRequest
+    | StartRefund of RefundRequest
 
 [<RequireQualifiedAccess>]
 type OrderActionError =
@@ -179,6 +195,8 @@ module Orders =
         | PartiallyShipped _ -> stateId "partially-shipped"
         | Shipped _ -> stateId "shipped"
         | Delivered _ -> stateId "delivered"
+        | CancellationCompensating _ -> stateId "cancellation-compensating"
+        | CancelledAfterRefund _ -> stateId "cancelled-after-refund"
         | CancellationPending _ -> stateId "cancellation-pending"
         | Cancelled -> stateId "cancelled"
         | ReservationFailed _ -> stateId "reservation-failed"
@@ -253,6 +271,10 @@ module Orders =
         | ShipmentDispatched _
         | ShipmentDelivered _
         | PaymentCaptured _ -> true
+        | ReturnRefunded _
+        | ReturnRejected _
+        | OrderRefunded _
+        | OrderRefundFailed _ -> true
         | OrderSubmitted _
         | CancelRequested
         | AuthorizePaymentRequested _
@@ -261,6 +283,7 @@ module Orders =
         | HoldRequested _
         | ReleaseHoldRequested
         | AddressSnapshotChanged _ -> false
+        | ReturnRequested _ -> false
 
     let private duplicateBy selector values =
         values |> List.countBy selector |> List.exists (fun (_, count) -> count > 1)
@@ -325,6 +348,8 @@ module Orders =
         | PartiallyShipped fulfilment
         | Shipped fulfilment
         | Delivered fulfilment -> Some fulfilment
+        | CancellationCompensating fulfilment
+        | CancelledAfterRefund fulfilment -> Some fulfilment
         | HeldForReview held -> Some held.Fulfilment
         | _ -> None
 
@@ -365,7 +390,180 @@ module Orders =
     let private classifyUpdated state fulfilment =
         match state with
         | HeldForReview held -> HeldForReview { held with Fulfilment = fulfilment }
+        | CancellationCompensating _ -> CancellationCompensating fulfilment
+        | CancelledAfterRefund _ -> CancelledAfterRefund fulfilment
         | _ -> classifyFulfilment fulfilment
+
+    let private cancellationRefund (fulfilment: FulfilmentOrder) (shipment: OrderShipmentStatus) =
+        let id = CaptureId.value shipment.Plan.CaptureId
+
+        { RefundId = RefundId.create id |> Result.defaultWith invalidOp
+          AllocationId = RefundAllocationId.create id |> Result.defaultWith invalidOp
+          OperationId =
+            PaymentOperationId.create $"refund:cancel:{id:D}"
+            |> Result.defaultWith invalidOp
+          Origin =
+            OrderCancellation($"order:{OrderSnapshotId.wireString fulfilment.PlacedOrder.Reserved.Pending.SnapshotId}")
+          Amount = shipment.Plan.Allocation.Total }
+
+    let private cancelCaptured state event =
+        match state, event with
+        | (Shipped f | HeldForReview { Fulfilment = f }), CancelRequested ->
+            not (f.Shipments |> List.exists _.Delivered)
+            && (f.Shipments |> List.forall _.Dispatched)
+        | _ -> false
+
+    let private beginCapturedCancellation state _ =
+        match fulfilmentOfState state with
+        | Some fulfilment ->
+            let refunds =
+                fulfilment.Shipments
+                |> List.filter (fun shipment -> shipment.CaptureSucceeded && not shipment.RefundRequested)
+
+            let updated =
+                { fulfilment with
+                    Shipments =
+                        fulfilment.Shipments
+                        |> List.map (fun shipment ->
+                            if shipment.CaptureSucceeded then
+                                { shipment with RefundRequested = true }
+                            else
+                                shipment) }
+
+            refunds |> List.map (cancellationRefund fulfilment >> StartRefund), CancellationCompensating updated
+        | None -> [], state
+
+    let private canRequestReturn state event =
+        match state, event with
+        | Delivered fulfilment, ReturnRequested request ->
+            Result.isOk (ReturnRequest.validate request)
+            && request.OrderId = $"order:{OrderSnapshotId.wireString fulfilment.PlacedOrder.Reserved.Pending.SnapshotId}"
+            && (fulfilment.Returns
+                |> List.forall (fun entry ->
+                    entry.Request.ReturnId <> request.ReturnId
+                    && entry.Request.AuthorizationId <> request.AuthorizationId))
+            && (request.Lines
+                |> List.forall (fun line ->
+                    let delivered =
+                        fulfilment.Shipments
+                        |> List.filter _.Delivered
+                        |> List.collect (fun shipment -> shipment.Plan.Allocation.Lines)
+                        |> List.filter (fun item -> item.LineId = line.OrderLineId)
+                        |> List.sumBy _.Quantity
+
+                    let reserved =
+                        fulfilment.Returns
+                        |> List.filter (fun entry -> entry.Status <> "rejected")
+                        |> List.collect (fun entry -> entry.Request.Lines)
+                        |> List.filter (fun item -> item.OrderLineId = line.OrderLineId)
+                        |> List.sumBy _.Quantity
+
+                    let original =
+                        fulfilment.PlacedOrder.Reserved.Pending.Lines
+                        |> List.tryFind (fun item -> item.LineId = line.OrderLineId)
+
+                    let priceValid =
+                        original
+                        |> Option.exists (fun item ->
+                            Money.currencyCode item.UnitPrice = Money.currencyCode line.RefundAmount
+                            && Money.amount line.RefundAmount > 0m
+                            && line.RefundAmount
+                               <= Money.multiply item.UnitPrice (decimal line.Quantity)
+                                  + Money.multiply
+                                      fulfilment.PlacedOrder.Reserved.Pending.Totals.Tax
+                                      (decimal line.Quantity / decimal (Quantity.value item.Quantity)))
+
+                    delivered > 0 && line.Quantity + reserved <= delivered && priceValid))
+        | _ -> false
+
+    let private returnCallback state event =
+        match state, event with
+        | Delivered fulfilment, (ReturnRefunded id | ReturnRejected id) ->
+            fulfilment.Returns
+            |> List.exists (fun entry -> entry.Request.ReturnId = id && entry.Status = "pending")
+        | _ -> false
+
+    let private applyReturnCallback state event =
+        match state, event with
+        | Delivered fulfilment, (ReturnRefunded id | ReturnRejected id) ->
+            let status =
+                match event with
+                | ReturnRefunded _ -> "refunded"
+                | _ -> "rejected"
+
+            [],
+            Delivered
+                { fulfilment with
+                    Returns =
+                        fulfilment.Returns
+                        |> List.map (fun entry ->
+                            if entry.Request.ReturnId = id then
+                                { entry with Status = status }
+                            else
+                                entry) }
+        | _ -> [], state
+
+    let private cancelCaptureResult state event =
+        match state, event with
+        | CancellationCompensating fulfilment, PaymentCaptured(id, operationId) ->
+            fulfilment.Shipments
+            |> List.exists (fun shipment ->
+                shipment.Plan.CaptureId = id
+                && shipment.Plan.PaymentOperationId = operationId
+                && shipment.Dispatched
+                && not shipment.CaptureSucceeded)
+        | _ -> false
+
+    let private applyCancelCapture state event =
+        match state, event with
+        | CancellationCompensating fulfilment, PaymentCaptured(id, _) ->
+            let shipment =
+                fulfilment.Shipments |> List.find (fun shipment -> shipment.Plan.CaptureId = id)
+
+            let updated =
+                { fulfilment with
+                    Shipments =
+                        fulfilment.Shipments
+                        |> List.map (fun row ->
+                            if row.Plan.CaptureId = id then
+                                { row with
+                                    CaptureSucceeded = true
+                                    RefundRequested = true }
+                            else
+                                row) }
+
+            [ StartRefund(cancellationRefund fulfilment shipment) ], CancellationCompensating updated
+        | _ -> [], state
+
+    let private cancelRefundResult state event =
+        match state, event with
+        | CancellationCompensating fulfilment, (OrderRefunded id | OrderRefundFailed(id, _)) ->
+            fulfilment.Shipments
+            |> List.exists (fun row ->
+                row.RefundRequested
+                && not row.Refunded
+                && RefundId.value id = CaptureId.value row.Plan.CaptureId)
+        | _ -> false
+
+    let private applyCancelRefund state event =
+        match state, event with
+        | CancellationCompensating fulfilment, OrderRefunded id ->
+            let updated =
+                { fulfilment with
+                    Shipments =
+                        fulfilment.Shipments
+                        |> List.map (fun row ->
+                            if CaptureId.value row.Plan.CaptureId = RefundId.value id then
+                                { row with Refunded = true }
+                            else
+                                row) }
+
+            if updated.Shipments |> List.forall (fun row -> not row.Dispatched || row.Refunded) then
+                [], CancelledAfterRefund updated
+            else
+                [], CancellationCompensating updated
+        | CancellationCompensating _, OrderRefundFailed(_, reason) -> [], ManualReview reason
+        | _ -> [], state
 
     let private fulfilmentRequested state event =
         match state, event with
@@ -656,7 +854,10 @@ module Orders =
                                       CreationFailed = false
                                       Dispatched = false
                                       Delivered = false
-                                      CaptureSucceeded = false }) }
+                                      CaptureSucceeded = false
+                                      RefundRequested = false
+                                      Refunded = false })
+                              Returns = [] }
 
                         plan
                         |> List.map (fun shipment -> CreateShipment(shipment, fulfilment.AddressSnapshotId)),
@@ -667,6 +868,7 @@ module Orders =
             }
 
             state "held-for-review" {
+                on cancelCaptured beginCapturedCancellation
                 on shipmentCreated applyShipmentCreated
                 on shipmentCreationFailed applyShipmentCreationFailed
                 on shipmentDelivered applyShipmentDelivered
@@ -724,13 +926,37 @@ module Orders =
             }
 
             state "shipped" {
+                on cancelCaptured beginCapturedCancellation
                 on shipmentDelivered applyShipmentDelivered
                 on paymentCaptured applyPaymentCaptured
                 on holdRequested applyHoldRequested
                 internalOn absorb (fun _ _ -> [])
             }
 
-            state "delivered" { internalOn absorb (fun _ _ -> []) }
+            state "delivered" {
+                on canRequestReturn (fun state event ->
+                    match state, event with
+                    | Delivered fulfilment, ReturnRequested request ->
+                        [ StartReturn request ],
+                        Delivered
+                            { fulfilment with
+                                Returns =
+                                    fulfilment.Returns
+                                    @ [ { Request = request
+                                          Status = "pending" } ] }
+                    | _ -> [], state)
+
+                on returnCallback applyReturnCallback
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "cancellation-compensating" {
+                on cancelCaptureResult applyCancelCapture
+                on cancelRefundResult applyCancelRefund
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "cancelled-after-refund" { internalOn absorb (fun _ _ -> []) }
 
             state "cancellation-pending" {
                 on released (fun state _ ->

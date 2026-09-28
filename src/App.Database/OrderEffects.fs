@@ -9,6 +9,8 @@ open App.Cart
 open App.Domain
 open App.Orders
 open App.Payments
+open App.Refunds
+open App.Returns
 open App.Shipments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
@@ -26,6 +28,8 @@ module OrderEffects =
         | CommitStock _ -> "commit-stock"
         | CreateShipment _ -> "create-shipment"
         | RequestCapture _ -> "request-capture"
+        | StartReturn _ -> "start-return"
+        | StartRefund _ -> "start-refund"
 
     let private key (record: ActionRecord<OrderId, OrderAction>) purpose =
         $"xmsg:v1:{MachineId.value record.MachineId}:{CommandId.value record.CommandId}:{record.Ordinal}:{purpose}"
@@ -671,6 +675,119 @@ module OrderEffects =
                                 Payments.MachineKey
                                 (paymentEntityOfOrder orderEntity)
                                 eventJson
+                                ct
+
+                        do! tx.CommitAsync ct
+                        return Ok()
+                | _ ->
+                    do! tx.RollbackAsync ct
+                    return Error OrderActionError.InvalidAction
+        }
+
+    let applyStartRefund
+        (dataSource: NpgsqlDataSource)
+        (record: ActionRecord<OrderId, OrderAction>)
+        (ct: CancellationToken)
+        =
+        task {
+            use connection = dataSource.CreateConnection()
+            do! connection.OpenAsync ct
+            use! tx = connection.BeginTransactionAsync ct
+
+            match! receipt connection tx record ct with
+            | Error error ->
+                do! tx.RollbackAsync ct
+                return Error error
+            | Ok _ ->
+                match record.Action with
+                | StartRefund request when RefundOrigin.orderId request.Origin = EntityId.value record.EntityId ->
+                    match RefundCodec.event.Encode(RefundRequested request) with
+                    | Error _ ->
+                        do! tx.RollbackAsync ct
+                        return Error OrderActionError.CallbackEncodingFailed
+                    | Ok json ->
+                        do!
+                            callback
+                                connection
+                                tx
+                                (key record "refund-request")
+                                Refunds.MachineKey
+                                (EntityId.value (Refunds.refundEntityId request.RefundId))
+                                json
+                                ct
+
+                        do! tx.CommitAsync ct
+                        return Ok()
+                | _ ->
+                    do! tx.RollbackAsync ct
+                    return Error OrderActionError.InvalidAction
+        }
+
+    let applyStartReturn
+        (dataSource: NpgsqlDataSource)
+        (record: ActionRecord<OrderId, OrderAction>)
+        (ct: CancellationToken)
+        =
+        task {
+            use connection = dataSource.CreateConnection()
+            do! connection.OpenAsync ct
+            use! tx = connection.BeginTransactionAsync ct
+
+            match! receipt connection tx record ct with
+            | Error error ->
+                do! tx.RollbackAsync ct
+                return Error error
+            | Ok _ ->
+                match record.Action with
+                | StartReturn request when request.OrderId = EntityId.value record.EntityId ->
+                    use insert =
+                        new NpgsqlCommand(
+                            "INSERT INTO fsnix.return_requests(return_id,authorization_id,order_id,window_ends_at) VALUES(@id,@auth,@order,@deadline) ON CONFLICT(return_id) DO NOTHING",
+                            connection,
+                            tx
+                        )
+
+                    insert.Parameters.AddWithValue("id", ReturnId.value request.ReturnId) |> ignore
+
+                    insert.Parameters.AddWithValue("auth", ReturnAuthorizationId.value request.AuthorizationId)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("order", request.OrderId) |> ignore
+                    insert.Parameters.AddWithValue("deadline", request.WindowEndsAt) |> ignore
+                    let! _ = insert.ExecuteNonQueryAsync ct
+
+                    for line in request.Lines do
+                        use row =
+                            new NpgsqlCommand(
+                                "INSERT INTO fsnix.return_lines(return_id,order_line_id,quantity,refunded_amount,currency) VALUES(@return,@line,@quantity,@amount,@currency) ON CONFLICT(return_id,order_line_id) DO NOTHING",
+                                connection,
+                                tx
+                            )
+
+                        row.Parameters.AddWithValue("return", ReturnId.value request.ReturnId) |> ignore
+
+                        row.Parameters.AddWithValue("line", OrderLineId.value line.OrderLineId)
+                        |> ignore
+
+                        row.Parameters.AddWithValue("quantity", line.Quantity) |> ignore
+                        row.Parameters.AddWithValue("amount", Money.amount line.RefundAmount) |> ignore
+                        row.Parameters.AddWithValue("currency", request.Currency) |> ignore
+                        let! _ = row.ExecuteNonQueryAsync ct
+                        ()
+
+                    match ReturnCodec.event.Encode(ReturnRequested request) with
+                    | Error _ ->
+                        do! tx.RollbackAsync ct
+                        return Error OrderActionError.CallbackEncodingFailed
+                    | Ok json ->
+                        do!
+                            callback
+                                connection
+                                tx
+                                (key record "return-request")
+                                Returns.MachineKey
+                                (EntityId.value (Returns.returnEntityId request.ReturnId))
+                                json
                                 ct
 
                         do! tx.CommitAsync ct

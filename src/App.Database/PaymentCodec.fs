@@ -22,6 +22,19 @@ module PaymentWire =
           ProviderReference: string }
 
     [<CLIMutable>]
+    type RefundDto =
+        { RefundId: string
+          AllocationId: string
+          OperationId: string
+          Origin: string
+          ReturnId: string
+          OrderId: string
+          Amount: string
+          Currency: string
+          Status: string
+          PaymentReference: string }
+
+    [<CLIMutable>]
     type WireDto =
         { Tag: string
           OperationId: string
@@ -38,7 +51,10 @@ module PaymentWire =
           CaptureOrderId: string
           CaptureAmount: string
           CaptureCurrency: string
-          Captures: CaptureDto array }
+          Captures: CaptureDto array
+          Refund: RefundDto
+          Refunds: RefundDto array
+          RefundAllocationId: string }
 
 [<RequireQualifiedAccess>]
 module PaymentCodec =
@@ -66,7 +82,10 @@ module PaymentCodec =
           CaptureOrderId = ""
           CaptureAmount = ""
           CaptureCurrency = ""
-          Captures = [||] }
+          Captures = [||]
+          Refund = Unchecked.defaultof<PaymentWire.RefundDto>
+          Refunds = [||]
+          RefundAllocationId = "" }
 
     let private encode name (dto: PaymentWire.WireDto) =
         try
@@ -199,9 +218,69 @@ module PaymentCodec =
                                   Amount = amount }
                               ProviderReference = NonEmptyString.value reference })))))
 
+    let refundDto (request: RefundRequest) : PaymentWire.RefundDto =
+        let origin, returnId =
+            match request.Origin with
+            | OrderCancellation _ -> "cancellation", ""
+            | InspectedReturn(_, id) -> "return", id.ToString("D")
+
+        { RefundId = RefundId.wireString request.RefundId
+          AllocationId = RefundAllocationId.wireString request.AllocationId
+          OperationId = PaymentOperationId.value request.OperationId
+          Origin = origin
+          ReturnId = returnId
+          OrderId = RefundOrigin.orderId request.Origin
+          Amount = Money.wireAmount request.Amount
+          Currency = Money.currencyCode request.Amount
+          Status = ""
+          PaymentReference = "" }
+
+    let refundOfDto name (dto: PaymentWire.RefundDto) : Result<RefundRequest, CodecError> =
+        if isNull (box dto) then
+            Error(codecError name "A refund payload is required.")
+        else
+            RefundId.tryParse dto.RefundId
+            |> Result.mapError (codecError name)
+            |> Result.bind (fun id ->
+                RefundAllocationId.tryParse dto.AllocationId
+                |> Result.mapError (codecError name)
+                |> Result.bind (fun allocationId ->
+                    PaymentOperationId.tryParse dto.OperationId
+                    |> Result.mapError (codecError name)
+                    |> Result.bind (fun operationId ->
+                        let origin =
+                            match dto.Origin with
+                            | "cancellation" -> Ok(OrderCancellation dto.OrderId)
+                            | "return" ->
+                                match Guid.TryParseExact(dto.ReturnId, "D") with
+                                | true, guid when guid <> Guid.Empty -> Ok(InspectedReturn(dto.OrderId, guid))
+                                | _ -> Error(codecError name "Invalid return origin.")
+                            | _ -> Error(codecError name "Invalid refund origin.")
+
+                        origin
+                        |> Result.bind (fun origin ->
+                            Money.tryOfWire dto.Amount dto.Currency
+                            |> Result.mapError (codecError name)
+                            |> Result.bind (fun amount ->
+                                if String.IsNullOrWhiteSpace dto.OrderId || Money.amount amount <= 0m then
+                                    Error(codecError name "Invalid refund order or amount.")
+                                else
+                                    Ok
+                                        { RefundId = id
+                                          AllocationId = allocationId
+                                          OperationId = operationId
+                                          Origin = origin
+                                          Amount = amount })))))
+
     let private capturedDto tag (payment: CapturedPayment) =
         { (authorizedDto tag payment.Authorization) with
-            Captures = payment.Captures |> List.map captureDto |> List.toArray }
+            Captures = payment.Captures |> List.map captureDto |> List.toArray
+            Refunds =
+                payment.Refunds
+                |> List.map (fun row ->
+                    { refundDto row.Request with
+                        Status = row.Status })
+                |> List.toArray }
 
     let private capturedOfDto name (dto: PaymentWire.WireDto) =
         authorizedOfDto name dto
@@ -234,12 +313,51 @@ module PaymentCodec =
                     && (captures |> List.sumBy (fun capture -> Money.amount capture.Request.Amount))
                        <= Money.amount authorization.Attempt.Amount
 
-                if valid then
-                    Ok
-                        { Authorization = authorization
-                          Captures = captures }
+                let refundRows = if isNull dto.Refunds then [||] else dto.Refunds
+
+                let refunds =
+                    refundRows
+                    |> Array.toList
+                    |> List.map (fun row ->
+                        refundOfDto name row
+                        |> Result.bind (fun request ->
+                            if row.Status = "pending" || row.Status = "settled" || row.Status = "released" then
+                                Ok
+                                    { Request = request
+                                      Status = row.Status }
+                            else
+                                Error(codecError name "Invalid refund status.")))
+                    |> List.fold
+                        (fun acc row -> acc |> Result.bind (fun rows -> row |> Result.map (fun r -> r :: rows)))
+                        (Ok [])
+                    |> Result.map List.rev
+
+                if not valid then
+                    Error(codecError name "Invalid capture ledger.")
                 else
-                    Error(codecError name "Invalid capture ledger.")))
+                    refunds
+                    |> Result.bind (fun refunds ->
+                        let ids = refunds |> List.map (fun row -> row.Request.AllocationId)
+
+                        let total =
+                            refunds
+                            |> List.filter (fun row -> row.Status <> "released")
+                            |> List.sumBy (fun row -> Money.amount row.Request.Amount)
+
+                        if
+                            Set.count (Set.ofList ids) <> ids.Length
+                            || refunds
+                               |> List.exists (fun row ->
+                                   RefundOrigin.orderId row.Request.Origin <> orderId
+                                   || Money.currencyCode row.Request.Amount <> currency)
+                            || total > (captures |> List.sumBy (fun row -> Money.amount row.Request.Amount))
+                        then
+                            Error(codecError name "Invalid refund ledger.")
+                        else
+                            Ok
+                                { Authorization = authorization
+                                  Captures = captures
+                                  Refunds = refunds })))
 
     let private pendingCaptureDto tag (pending: PendingCapture) =
         { (capturedDto tag pending.Payment) with
@@ -309,6 +427,7 @@ module PaymentCodec =
                     | CaptureUnknown pending -> pendingCaptureDto "capture-unknown-v2" pending
                     | PartiallyCaptured payment -> capturedDto "partially-captured-v2" payment
                     | Captured payment -> capturedDto "captured-v2" payment
+                    | RefundAllocationPending payment -> capturedDto "refund-allocation-pending-v3" payment
                     | VoidPending authorized -> authorizedDto "void-pending-v2" authorized
                     | VoidUnknown authorized -> authorizedDto "void-unknown-v2" authorized
                     | Voided authorized -> authorizedDto "voided-v2" authorized
@@ -364,6 +483,13 @@ module PaymentCodec =
                                 Ok(Captured payment)
                             else
                                 Error(codecError "PaymentState" "Invalid captured total."))
+                    | "refund-allocation-pending-v3" ->
+                        capturedOfDto "PaymentState" dto
+                        |> Result.bind (fun payment ->
+                            if payment.Refunds |> List.exists (fun row -> row.Status = "pending") then
+                                Ok(RefundAllocationPending payment)
+                            else
+                                Error(codecError "PaymentState" "No pending refund allocations."))
                     | "void-pending-v1"
                     | "void-pending-v2" -> authorizedOfDto "PaymentState" dto |> Result.map VoidPending
                     | "void-unknown-v1"
@@ -394,6 +520,15 @@ module PaymentCodec =
                     | CaptureDeclined(request, reason) ->
                         { (captureRequestDto "capture-declined-v2" request) with
                             Reason = reason }
+                    | RefundAllocationRequested request ->
+                        { empty "refund-allocation-requested-v3" with
+                            Refund = refundDto request }
+                    | RefundAllocationSettled id ->
+                        { empty "refund-allocation-settled-v3" with
+                            RefundAllocationId = RefundAllocationId.wireString id }
+                    | RefundAllocationReleased id ->
+                        { empty "refund-allocation-released-v3" with
+                            RefundAllocationId = RefundAllocationId.wireString id }
                     | PaymentCancellationRequested(orderId, reason) ->
                         { empty "cancel-requested-v2" with
                             OrderId = orderId
@@ -453,6 +588,16 @@ module PaymentCodec =
                             NonEmptyString.create 200 dto.Reason
                             |> Result.mapError (fun m -> codecError "PaymentEvent" m)
                             |> Result.map (fun reason -> CaptureDeclined(request, NonEmptyString.value reason)))
+                    | "refund-allocation-requested-v3" ->
+                        refundOfDto "PaymentEvent" dto.Refund |> Result.map RefundAllocationRequested
+                    | "refund-allocation-settled-v3" ->
+                        RefundAllocationId.tryParse dto.RefundAllocationId
+                        |> Result.mapError (codecError "PaymentEvent")
+                        |> Result.map RefundAllocationSettled
+                    | "refund-allocation-released-v3" ->
+                        RefundAllocationId.tryParse dto.RefundAllocationId
+                        |> Result.mapError (codecError "PaymentEvent")
+                        |> Result.map RefundAllocationReleased
                     | "cancel-requested-v1"
                     | "cancel-requested-v2" ->
                         NonEmptyString.create 100 dto.OrderId
@@ -501,6 +646,18 @@ module PaymentCodec =
                     | NotifyOrderCaptured capture ->
                         { (captureRequestDto "notify-order-captured-v2" capture.Request) with
                             ProviderReference = capture.ProviderReference }
+                    | NotifyRefundApproved approved ->
+                        { empty "notify-refund-approved-v3" with
+                            Refund =
+                                { refundDto approved.Request with
+                                    PaymentReference = approved.PaymentReference } }
+                    | NotifyRefundDenied(request, reason) ->
+                        { empty "notify-refund-denied-v3" with
+                            Refund = refundDto request
+                            Reason = reason }
+                    | NotifyRefundSettled request ->
+                        { empty "notify-refund-settled-v3" with
+                            Refund = refundDto request }
 
                 encode "PaymentAction" dto)
             (fun json ->
@@ -544,9 +701,27 @@ module PaymentCodec =
                             NonEmptyString.create 200 dto.ProviderReference
                             |> Result.mapError (fun m -> codecError "PaymentAction" m)
                             |> Result.map (fun reference ->
-                                NotifyOrderCaptured
+                                NotifyOrderCaptured(
                                     { Request = request
-                                      ProviderReference = NonEmptyString.value reference }))
+                                      ProviderReference = NonEmptyString.value reference }
+                                    : CaptureRecord
+                                )))
+                    | "notify-refund-approved-v3" ->
+                        refundOfDto "PaymentAction" dto.Refund
+                        |> Result.bind (fun request ->
+                            if String.IsNullOrWhiteSpace dto.Refund.PaymentReference then
+                                Error(codecError "PaymentAction" "Missing payment reference.")
+                            else
+                                Ok(
+                                    NotifyRefundApproved
+                                        { Request = request
+                                          PaymentReference = dto.Refund.PaymentReference }
+                                ))
+                    | "notify-refund-denied-v3" ->
+                        refundOfDto "PaymentAction" dto.Refund
+                        |> Result.map (fun request -> NotifyRefundDenied(request, dto.Reason))
+                    | "notify-refund-settled-v3" ->
+                        refundOfDto "PaymentAction" dto.Refund |> Result.map NotifyRefundSettled
                     | tag -> Error(codecError "PaymentAction" $"Unknown tag '{tag}'.")))
 
     let error: Codec<PaymentActionError> =
@@ -601,7 +776,7 @@ module PaymentCodec =
             machineId Payments.MachineKey
         ) {
             chart Payments.chartValue
-            chartVersion 2
+            chartVersion 3
             initialState Payments.initialState
             store storeArg
             logger log

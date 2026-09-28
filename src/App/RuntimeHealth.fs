@@ -12,6 +12,9 @@ type RuntimeComponent =
     | OrderMachine
     | PaymentMachine
     | ShipmentMachine
+    | RefundMachine
+    | ReturnMachine
+    | ReturnWindowScanner
     | IntegrationOutboxRelay
     | EmailDeliveryRelay
     | FlowDeadlineScanner
@@ -30,6 +33,9 @@ module RuntimeComponent =
         | RuntimeComponent.OrderMachine -> "order-machine"
         | RuntimeComponent.PaymentMachine -> "payment-machine"
         | RuntimeComponent.ShipmentMachine -> "shipment-machine"
+        | RuntimeComponent.RefundMachine -> "refund-machine"
+        | RuntimeComponent.ReturnMachine -> "return-machine"
+        | RuntimeComponent.ReturnWindowScanner -> "return-window-scanner"
         | RuntimeComponent.IntegrationOutboxRelay -> "integration-outbox-relay"
         | RuntimeComponent.EmailDeliveryRelay -> "email-delivery-relay"
         | RuntimeComponent.FlowDeadlineScanner -> "flow-deadline-scanner"
@@ -79,6 +85,9 @@ type RuntimeHealth(timeProvider: TimeProvider) =
               RuntimeComponent.OrderMachine
               RuntimeComponent.PaymentMachine
               RuntimeComponent.ShipmentMachine
+              RuntimeComponent.RefundMachine
+              RuntimeComponent.ReturnMachine
+              RuntimeComponent.ReturnWindowScanner
               RuntimeComponent.IntegrationOutboxRelay
               RuntimeComponent.EmailDeliveryRelay
               RuntimeComponent.FlowDeadlineScanner
@@ -142,6 +151,7 @@ module RuntimeHealth =
           RuntimeComponent.OrderMachine
           RuntimeComponent.PaymentMachine
           RuntimeComponent.ShipmentMachine ]
+        @ [ RuntimeComponent.RefundMachine; RuntimeComponent.ReturnMachine ]
         |> List.forall (fun service -> snapshot[service].Phase = RuntimePhase.Healthy)
 
     let workersReady
@@ -154,7 +164,8 @@ module RuntimeHealth =
           RuntimeComponent.FlowDeadlineScanner
           RuntimeComponent.CartAbandonmentScanner
           RuntimeComponent.CartMergeScanner ]
-        @ [ RuntimeComponent.ReservationExpiryScanner ]
+        @ [ RuntimeComponent.ReservationExpiryScanner
+            RuntimeComponent.ReturnWindowScanner ]
         |> List.forall (fun service ->
             let observation = snapshot[service]
 

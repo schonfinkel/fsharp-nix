@@ -8,6 +8,7 @@ open System.Threading.Tasks
 open App.Domain
 open App.Orders
 open App.Payments
+open App.Refunds
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
@@ -33,6 +34,9 @@ module PaymentEffects =
         | NotifyOrderCancelled _ -> "notify-order-cancelled"
         | NotifyOrderVoided _ -> "notify-order-voided"
         | NotifyOrderCaptured _ -> "notify-order-captured"
+        | NotifyRefundApproved _ -> "notify-refund-approved"
+        | NotifyRefundDenied _ -> "notify-refund-denied"
+        | NotifyRefundSettled _ -> "notify-refund-settled"
 
     let private key (record: ActionRecord<PaymentId, PaymentAction>) purpose =
         $"xmsg:v1:{MachineId.value record.MachineId}:{CommandId.value record.CommandId}:{record.Ordinal}:{purpose}"
@@ -310,9 +314,9 @@ module PaymentEffects =
             AuthorizationSucceeded(attempt, reference, expiresAt)
         | GatewayAuthorized _ ->
             "unknown", None, Some "invalid-provider-response", None, AuthorizationOutcomeUnknown attempt
-        | GatewayDeclined reason when validResultCode reason ->
+        | GatewayAuthorization.GatewayDeclined reason when validResultCode reason ->
             "failed", None, Some reason, None, AuthorizationDeclined(attempt, reason)
-        | GatewayDeclined _ ->
+        | GatewayAuthorization.GatewayDeclined _ ->
             "failed", None, Some "provider-declined", None, AuthorizationDeclined(attempt, "provider-declined")
         | GatewayOutcomeUnknown -> "unknown", None, Some "outcome-unknown", None, AuthorizationOutcomeUnknown attempt
 
@@ -716,6 +720,103 @@ module PaymentEffects =
                         return Error PaymentActionError.CallbackEncodingFailed
                     | Ok eventJson ->
                         do! callback connection tx (key record purpose) Orders.MachineKey entity eventJson ct
+                        do! tx.CommitAsync ct
+                        return Ok()
+        }
+
+    let applyNotifyRefund
+        (dataSource: NpgsqlDataSource)
+        (record: ActionRecord<PaymentId, PaymentAction>)
+        (ct: CancellationToken)
+        =
+        task {
+            let notify =
+                match record.Action with
+                | NotifyRefundApproved approved ->
+                    Some(approved.Request, AllocationApproved approved, "refund-approved", true)
+                | NotifyRefundDenied(request, reason) ->
+                    Some(request, AllocationDenied(request, reason), "refund-denied", false)
+                | NotifyRefundSettled request ->
+                    Some(request, AllocationSettled request.AllocationId, "refund-settled", false)
+                | _ -> None
+
+            match notify with
+            | None -> return Error PaymentActionError.InvalidAction
+            | Some(request, event, purpose, reserve) ->
+                use connection = dataSource.CreateConnection()
+                do! connection.OpenAsync ct
+                use! tx = connection.BeginTransactionAsync ct
+
+                match! receipt connection tx record ct with
+                | Error error ->
+                    do! tx.RollbackAsync ct
+                    return Error error
+                | Ok _ ->
+                    if reserve then
+                        use insert =
+                            new NpgsqlCommand(
+                                "INSERT INTO fsnix.refund_allocations(allocation_id,refund_id,order_id,amount,currency,status) VALUES(@allocation,@refund,@order,@amount,@currency,'pending') ON CONFLICT(allocation_id) DO NOTHING",
+                                connection,
+                                tx
+                            )
+
+                        insert.Parameters.AddWithValue("allocation", RefundAllocationId.value request.AllocationId)
+                        |> ignore
+
+                        insert.Parameters.AddWithValue("refund", RefundId.value request.RefundId)
+                        |> ignore
+
+                        insert.Parameters.AddWithValue("order", RefundOrigin.orderId request.Origin)
+                        |> ignore
+
+                        insert.Parameters.AddWithValue("amount", Money.amount request.Amount) |> ignore
+
+                        insert.Parameters.AddWithValue("currency", Money.currencyCode request.Amount)
+                        |> ignore
+
+                        let! _ = insert.ExecuteNonQueryAsync ct
+
+                        use verify =
+                            new NpgsqlCommand(
+                                "SELECT refund_id,order_id,amount,currency,status FROM fsnix.refund_allocations WHERE allocation_id=@allocation",
+                                connection,
+                                tx
+                            )
+
+                        verify.Parameters.AddWithValue("allocation", RefundAllocationId.value request.AllocationId)
+                        |> ignore
+
+                        use! reader = verify.ExecuteReaderAsync ct
+                        let! found = reader.ReadAsync ct
+
+                        let valid =
+                            found
+                            && reader.GetGuid 0 = RefundId.value request.RefundId
+                            && reader.GetString 1 = RefundOrigin.orderId request.Origin
+                            && reader.GetDecimal 2 = Money.amount request.Amount
+                            && reader.GetString 3 = Money.currencyCode request.Amount
+                            && reader.GetString 4 = "pending"
+
+                        reader.Dispose()
+
+                        if not valid then
+                            invalidOp "Refund allocation binding mismatch."
+
+                    match RefundCodec.event.Encode event with
+                    | Error _ ->
+                        do! tx.RollbackAsync ct
+                        return Error PaymentActionError.CallbackEncodingFailed
+                    | Ok eventJson ->
+                        do!
+                            callback
+                                connection
+                                tx
+                                (key record purpose)
+                                Refunds.MachineKey
+                                (EntityId.value (Refunds.refundEntityId request.RefundId))
+                                eventJson
+                                ct
+
                         do! tx.CommitAsync ct
                         return Ok()
         }

@@ -18,6 +18,8 @@
     <ProjectReference Include="..\App.Cart\App.Cart.fsproj" />
     <ProjectReference Include="..\App.Orders\App.Orders.fsproj" />
     <ProjectReference Include="..\App.Payments\App.Payments.fsproj" />
+    <ProjectReference Include="..\App.Refunds\App.Refunds.fsproj" />
+    <ProjectReference Include="..\App.Returns\App.Returns.fsproj" />
     <ProjectReference Include="..\App.Shipments\App.Shipments.fsproj" />
   </ItemGroup>
   <ItemGroup>
@@ -45,16 +47,21 @@
     <Compile Include="CartDeadlines.fs" />
     <Compile Include="CartChangeSource.fs" />
     <Compile Include="CartEffects.fs" />
+    <Compile Include="PaymentCodec.fs" />
+    <Compile Include="RefundCodec.fs" />
     <Compile Include="OrderCodec.fs" />
+    <Compile Include="ReturnCodec.fs" />
+    <Compile Include="WorkflowEffects.fs" />
     <Compile Include="OrderSnapshots.fs" />
     <Compile Include="StockReservations.fs" />
     <Compile Include="ReservationDeadlines.fs" />
     <Compile Include="PaymentGateway.fs" />
-    <Compile Include="PaymentCodec.fs" />
     <Compile Include="Carrier.fs" />
     <Compile Include="ShipmentCodec.fs" />
     <Compile Include="OrderEffects.fs" />
     <Compile Include="PaymentEffects.fs" />
+    <Compile Include="RefundEffects.fs" />
+    <Compile Include="ReturnEffects.fs" />
     <Compile Include="ShipmentEffects.fs" />
     <Compile Include="Services.fs" />
   </ItemGroup>

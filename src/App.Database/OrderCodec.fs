@@ -42,7 +42,25 @@ module OrderWire =
           CreationFailed: bool
           Dispatched: bool
           Delivered: bool
-          CaptureSucceeded: bool }
+          CaptureSucceeded: bool
+          RefundRequested: bool
+          Refunded: bool }
+
+    [<CLIMutable>]
+    type ReturnLineDto =
+        { LineId: string
+          Quantity: int
+          RefundAmount: string }
+
+    [<CLIMutable>]
+    type ReturnDto =
+        { ReturnId: string
+          AuthorizationId: string
+          OrderId: string
+          Currency: string
+          WindowEndsAt: int64
+          Lines: ReturnLineDto array
+          Status: string }
 
     [<CLIMutable>]
     type WireDto =
@@ -77,7 +95,11 @@ module OrderWire =
           [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
           OperationId: string
           [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
-          Shipments: ShipmentDto array }
+          Shipments: ShipmentDto array
+          Refund: PaymentWire.RefundDto
+          Returns: ReturnDto array
+          ReturnId: string
+          RefundId: string }
 
 [<RequireQualifiedAccess>]
 module OrderCodec =
@@ -115,7 +137,11 @@ module OrderCodec =
           AllocationId = null
           CaptureId = null
           OperationId = null
-          Shipments = null }
+          Shipments = null
+          Refund = Unchecked.defaultof<PaymentWire.RefundDto>
+          Returns = null
+          ReturnId = ""
+          RefundId = "" }
 
     let private encode name (dto: OrderWire.WireDto) =
         try
@@ -296,7 +322,9 @@ module OrderCodec =
           CreationFailed = status.CreationFailed
           Dispatched = status.Dispatched
           Delivered = status.Delivered
-          CaptureSucceeded = status.CaptureSucceeded }
+          CaptureSucceeded = status.CaptureSucceeded
+          RefundRequested = status.RefundRequested
+          Refunded = status.Refunded }
 
     let private statusOfPlan plan =
         { Plan = plan
@@ -304,7 +332,9 @@ module OrderCodec =
           CreationFailed = false
           Dispatched = false
           Delivered = false
-          CaptureSucceeded = false }
+          CaptureSucceeded = false
+          RefundRequested = false
+          Refunded = false }
 
     let private shipmentOfDto (dto: OrderWire.ShipmentDto) : Result<OrderShipmentStatus, CodecError> =
         let parseId parse field value =
@@ -376,7 +406,75 @@ module OrderCodec =
                                                       CreationFailed = dto.CreationFailed
                                                       Dispatched = dto.Dispatched
                                                       Delivered = dto.Delivered
-                                                      CaptureSucceeded = dto.CaptureSucceeded })))))))))
+                                                      CaptureSucceeded = dto.CaptureSucceeded
+                                                      RefundRequested = dto.RefundRequested
+                                                      Refunded = dto.Refunded })))))))))
+
+    let returnDto (entry: OrderReturnReservation) : OrderWire.ReturnDto =
+        let request = entry.Request
+
+        { ReturnId = ReturnId.wireString request.ReturnId
+          AuthorizationId = ReturnAuthorizationId.wireString request.AuthorizationId
+          OrderId = request.OrderId
+          Currency = request.Currency
+          WindowEndsAt = request.WindowEndsAt.ToUnixTimeMilliseconds()
+          Lines =
+            request.Lines
+            |> List.map (fun line ->
+                ({ LineId = OrderLineId.wireString line.OrderLineId
+                   Quantity = line.Quantity
+                   RefundAmount = Money.wireAmount line.RefundAmount }
+                : OrderWire.ReturnLineDto))
+            |> List.toArray
+          Status = entry.Status }
+
+    let returnOfDto name (dto: OrderWire.ReturnDto) : Result<OrderReturnReservation, CodecError> =
+        if isNull (box dto) then
+            Error(codecError name "Missing return.")
+        else
+            ReturnId.tryParse dto.ReturnId
+            |> Result.mapError (codecError name)
+            |> Result.bind (fun id ->
+                ReturnAuthorizationId.tryParse dto.AuthorizationId
+                |> Result.mapError (codecError name)
+                |> Result.bind (fun authId ->
+                    let lines =
+                        (if isNull dto.Lines then [||] else dto.Lines)
+                        |> Array.toList
+                        |> List.map (fun line ->
+                            guid name line.LineId
+                            |> Result.bind (OrderLineId.create >> Result.mapError (codecError name))
+                            |> Result.bind (fun lineId ->
+                                Money.tryOfWire line.RefundAmount dto.Currency
+                                |> Result.mapError (codecError name)
+                                |> Result.map (fun amount ->
+                                    { OrderLineId = lineId
+                                      Quantity = line.Quantity
+                                      RefundAmount = amount })))
+                        |> sequenceResults
+
+                    lines
+                    |> Result.bind (fun lines ->
+                        try
+                            let request =
+                                { ReturnId = id
+                                  AuthorizationId = authId
+                                  OrderId = dto.OrderId
+                                  Lines = lines
+                                  Currency = dto.Currency
+                                  WindowEndsAt = DateTimeOffset.FromUnixTimeMilliseconds dto.WindowEndsAt }
+
+                            ReturnRequest.validate request
+                            |> Result.mapError (codecError name)
+                            |> Result.bind (fun request ->
+                                if dto.Status = "pending" || dto.Status = "refunded" || dto.Status = "rejected" then
+                                    Ok
+                                        { Request = request
+                                          Status = dto.Status }
+                                else
+                                    Error(codecError name "Invalid return status."))
+                        with _ ->
+                            Error(codecError name "Invalid return deadline."))))
 
     let private fulfilmentDto tag (fulfilment: FulfilmentOrder) =
         { pendingDto tag fulfilment.PlacedOrder.Reserved.Pending with
@@ -386,7 +484,8 @@ module OrderCodec =
                 |> List.toArray
             ProviderReference = fulfilment.PlacedOrder.ProviderReference
             AddressSnapshotId = OrderSnapshotId.wireString fulfilment.AddressSnapshotId
-            Shipments = fulfilment.Shipments |> List.map shipmentDto |> List.toArray }
+            Shipments = fulfilment.Shipments |> List.map shipmentDto |> List.toArray
+            Returns = fulfilment.Returns |> List.map returnDto |> List.toArray }
 
     let private fulfilmentOfDto (dto: OrderWire.WireDto) =
         reservedOfDto dto
@@ -407,15 +506,23 @@ module OrderCodec =
                     |> List.map shipmentOfDto
                     |> sequenceResults
                     |> Result.bind (fun shipments ->
-                        if shipments.IsEmpty then
-                            Error(codecError "OrderState" "A fulfilment plan must not be empty.")
-                        else
-                            Ok
-                                { PlacedOrder =
-                                    { Reserved = reserved
-                                      ProviderReference = NonEmptyString.value providerReference }
-                                  AddressSnapshotId = addressSnapshotId
-                                  Shipments = shipments }))))
+                        let returns =
+                            (if isNull dto.Returns then [] else Array.toList dto.Returns)
+                            |> List.map (returnOfDto "OrderState")
+                            |> sequenceResults
+
+                        returns
+                        |> Result.bind (fun returns ->
+                            if shipments.IsEmpty then
+                                Error(codecError "OrderState" "A fulfilment plan must not be empty.")
+                            else
+                                Ok
+                                    { PlacedOrder =
+                                        { Reserved = reserved
+                                          ProviderReference = NonEmptyString.value providerReference }
+                                      AddressSnapshotId = addressSnapshotId
+                                      Shipments = shipments
+                                      Returns = returns })))))
 
     let private shipmentIdentityOfDto name (dto: OrderWire.WireDto) =
         idValue ShipmentId.tryParse name dto.ShipmentId
@@ -462,6 +569,8 @@ module OrderCodec =
                     | PartiallyShipped order -> fulfilmentDto "partially-shipped-v3" order
                     | Shipped order -> fulfilmentDto "shipped-v3" order
                     | OrderState.Delivered order -> fulfilmentDto "delivered-v3" order
+                    | CancellationCompensating order -> fulfilmentDto "cancellation-compensating-v4" order
+                    | CancelledAfterRefund order -> fulfilmentDto "cancelled-after-refund-v4" order
                     | CancellationPending order ->
                         { pendingDto "cancellation-pending-v2" order.Order with
                             ReservationIds = order.ReservationIds |> List.map ReservationId.wireString |> List.toArray
@@ -529,6 +638,8 @@ module OrderCodec =
                     | "partially-shipped-v3" -> fulfilmentOfDto dto |> Result.map PartiallyShipped
                     | "shipped-v3" -> fulfilmentOfDto dto |> Result.map Shipped
                     | "delivered-v3" -> fulfilmentOfDto dto |> Result.map OrderState.Delivered
+                    | "cancellation-compensating-v4" -> fulfilmentOfDto dto |> Result.map CancellationCompensating
+                    | "cancelled-after-refund-v4" -> fulfilmentOfDto dto |> Result.map CancelledAfterRefund
                     | "cancellation-pending-v2" ->
                         pendingOfDto dto
                         |> Result.bind (fun pending ->
@@ -615,6 +726,25 @@ module OrderCodec =
                     | AddressSnapshotChanged snapshotId ->
                         { empty "address-snapshot-changed-v3" with
                             AddressSnapshotId = OrderSnapshotId.wireString snapshotId }
+                    | ReturnRequested request ->
+                        { empty "return-requested-v4" with
+                            Returns =
+                                [| returnDto
+                                       { Request = request
+                                         Status = "pending" } |] }
+                    | ReturnRefunded id ->
+                        { empty "return-refunded-v4" with
+                            ReturnId = ReturnId.wireString id }
+                    | ReturnRejected id ->
+                        { empty "return-rejected-v4" with
+                            ReturnId = ReturnId.wireString id }
+                    | OrderRefunded id ->
+                        { empty "order-refunded-v4" with
+                            RefundId = RefundId.wireString id }
+                    | OrderRefundFailed(id, reason) ->
+                        { empty "order-refund-failed-v4" with
+                            RefundId = RefundId.wireString id
+                            Reason = reason }
 
                 encode "OrderEvent" dto)
             (fun json ->
@@ -712,6 +842,25 @@ module OrderCodec =
                             >> Result.mapError (fun message -> codecError "OrderEvent" message)
                         )
                         |> Result.map AddressSnapshotChanged
+                    | "return-requested-v4" when not (isNull dto.Returns) && dto.Returns.Length = 1 ->
+                        returnOfDto "OrderEvent" dto.Returns[0]
+                        |> Result.map (fun entry -> ReturnRequested entry.Request)
+                    | "return-refunded-v4" ->
+                        ReturnId.tryParse dto.ReturnId
+                        |> Result.mapError (codecError "OrderEvent")
+                        |> Result.map ReturnRefunded
+                    | "return-rejected-v4" ->
+                        ReturnId.tryParse dto.ReturnId
+                        |> Result.mapError (codecError "OrderEvent")
+                        |> Result.map ReturnRejected
+                    | "order-refunded-v4" ->
+                        RefundId.tryParse dto.RefundId
+                        |> Result.mapError (codecError "OrderEvent")
+                        |> Result.map OrderRefunded
+                    | "order-refund-failed-v4" ->
+                        RefundId.tryParse dto.RefundId
+                        |> Result.mapError (codecError "OrderEvent")
+                        |> Result.map (fun id -> OrderRefundFailed(id, dto.Reason))
                     | tag -> Error(codecError "OrderEvent" $"Unknown tag '{tag}'.")))
 
     let action: Codec<OrderAction> =
@@ -764,7 +913,20 @@ module OrderCodec =
                         "OrderAction"
                         { empty "request-capture-v3" with
                             ProviderReference = providerReference
-                            Shipments = [| shipment |> statusOfPlan |> shipmentDto |] })
+                            Shipments = [| shipment |> statusOfPlan |> shipmentDto |] }
+                | StartReturn request ->
+                    encode
+                        "OrderAction"
+                        { empty "start-return-v4" with
+                            Returns =
+                                [| returnDto
+                                       { Request = request
+                                         Status = "pending" } |] }
+                | StartRefund request ->
+                    encode
+                        "OrderAction"
+                        { empty "start-refund-v4" with
+                            Refund = PaymentCodec.refundDto request })
             (fun json ->
                 decode "OrderAction" json
                 |> Result.bind (fun dto ->
@@ -833,6 +995,10 @@ module OrderCodec =
                                             dto.ProviderReference
                                         )
                                     ))
+                    | "start-return-v4" when not (isNull dto.Returns) && dto.Returns.Length = 1 ->
+                        returnOfDto "OrderAction" dto.Returns[0]
+                        |> Result.map (fun entry -> StartReturn entry.Request)
+                    | "start-refund-v4" -> PaymentCodec.refundOfDto "OrderAction" dto.Refund |> Result.map StartRefund
                     | tag -> Error(codecError "OrderAction" $"Unknown tag '{tag}'.")))
 
     let error: Codec<OrderActionError> =
@@ -880,7 +1046,7 @@ module OrderCodec =
     let private build (log: ILogger) storeArg =
         machine<OrderId, OrderState, OrderEvent, OrderAction, OrderActionError> (machineId Orders.MachineKey) {
             chart Orders.chartValue
-            chartVersion Orders.ChartVersion
+            chartVersion 4
             initialState Orders.initialState
             store storeArg
             logger log

@@ -22,6 +22,11 @@ type GatewayCapture =
     | GatewayCaptureDeclined of reasonCode: string
     | GatewayCaptureUnknown
 
+type GatewayRefund =
+    | GatewayRefunded of providerReference: string
+    | GatewayRefundDeclined of reasonCode: string
+    | GatewayRefundUnknown
+
 /// <summary>
 /// The payment provider boundary. Implementations must honor the operation id as the
 /// idempotency key: one operation id names at most one real provider effect, and
@@ -54,3 +59,10 @@ type IPaymentGateway =
     abstract member QueryAuthorization:
         operationId: PaymentOperationId * method: PaymentMethodReference * ct: CancellationToken ->
             Task<GatewayAuthorization option>
+
+    abstract member Refund:
+        operationId: PaymentOperationId * paymentReference: string * amount: Money * ct: CancellationToken ->
+            Task<GatewayRefund>
+
+    abstract member QueryRefund:
+        operationId: PaymentOperationId * paymentReference: string * ct: CancellationToken -> Task<GatewayRefund option>

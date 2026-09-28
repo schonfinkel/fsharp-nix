@@ -79,6 +79,8 @@ module OrderEndpoints =
         | PartiallyShipped _ -> "Partially shipped"
         | Shipped _ -> "Shipped"
         | OrderState.Delivered _ -> "Delivered"
+        | CancellationCompensating _ -> "Refunding cancelled order"
+        | CancelledAfterRefund _ -> "Cancelled and refunded"
         | CancellationPending _ -> "Cancelling order"
         | Cancelled -> "Cancelled"
         | ReservationFailed _ -> "Stock could not be reserved"
@@ -98,6 +100,8 @@ module OrderEndpoints =
         | PartiallyShipped order
         | Shipped order
         | OrderState.Delivered order -> Money.format order.PlacedOrder.Reserved.Pending.Totals.Total
+        | CancellationCompensating order
+        | CancelledAfterRefund order -> Money.format order.PlacedOrder.Reserved.Pending.Totals.Total
         | CancellationPending order -> Money.format order.Order.Totals.Total
         | Initial
         | Cancelled
@@ -110,6 +114,7 @@ module OrderEndpoints =
         | ReservationPending _
         | AwaitingAuthorization _
         | PaymentPending _ -> true
+        | Shipped order when order.Shipments |> List.forall (fun shipment -> not shipment.Delivered) -> true
         | Initial
         | StockCommitPending _
         | Placed _
@@ -119,6 +124,8 @@ module OrderEndpoints =
         | PartiallyShipped _
         | Shipped _
         | OrderState.Delivered _
+        | CancellationCompensating _
+        | CancelledAfterRefund _
         | CancellationPending _
         | Cancelled
         | ReservationFailed _
@@ -127,6 +134,7 @@ module OrderEndpoints =
 
     let private tooLateToCancel state =
         match state with
+        | Shipped order when order.Shipments |> List.forall (fun shipment -> not shipment.Delivered) -> false
         | StockCommitPending _
         | Placed _
         | HeldForReview _
@@ -135,6 +143,8 @@ module OrderEndpoints =
         | PartiallyShipped _
         | Shipped _
         | OrderState.Delivered _ -> true
+        | CancellationCompensating _
+        | CancelledAfterRefund _ -> true
         | _ -> false
 
     let sandboxMethods =
@@ -451,12 +461,46 @@ module OrderEndpoints =
                                 | _ -> None
 
                             let model =
+                                let returnLines, returnStatuses =
+                                    match order.State with
+                                    | OrderState.Delivered fulfilment ->
+                                        let reserved lineId =
+                                            fulfilment.Returns
+                                            |> List.filter (fun entry -> entry.Status <> "rejected")
+                                            |> List.collect (fun entry -> entry.Request.Lines)
+                                            |> List.filter (fun line -> line.OrderLineId = lineId)
+                                            |> List.sumBy _.Quantity
+
+                                        let availableLines =
+                                            fulfilment.PlacedOrder.Reserved.Pending.Lines
+                                            |> List.choose (fun line ->
+                                                let available = Quantity.value line.Quantity - reserved line.LineId
+
+                                                if available <= 0 then
+                                                    None
+                                                else
+                                                    Some
+                                                        { LineId = OrderLineId.wireString line.LineId
+                                                          Name = NonEmptyString.value line.Name
+                                                          Available = available
+                                                          ReturnKey = Guid.NewGuid().ToString("D") })
+
+                                        let statuses =
+                                            fulfilment.Returns
+                                            |> List.map (fun entry ->
+                                                ReturnId.wireString entry.Request.ReturnId, entry.Status)
+
+                                        availableLines, statuses
+                                    | _ -> [], []
+
                                 { OrderId = guid.ToString("D")
                                   Status = status order.State
                                   Total = orderTotal order.State
                                   CanCancel = canCancel order.State
                                   TooLateToCancel = tooLateToCancel order.State
                                   Pay = pay
+                                  ReturnLines = returnLines
+                                  ReturnStatuses = returnStatuses
                                   Error = None }
 
                             return! context.WriteHtmlView(CheckoutViews.orderPage context model)
@@ -571,4 +615,132 @@ module OrderEndpoints =
                                 context.RequestAborted
 
                         return! Web.redirect $"/orders/{guid:D}" context
+            }
+
+    let requestReturn: EndpointHandler =
+        fun context ->
+            task {
+                let idText = context.TryGetRouteValue("orderId") |> Option.defaultValue ""
+
+                match Guid.TryParseExact(idText, "D") with
+                | false, _ ->
+                    context.Response.StatusCode <- StatusCodes.Status404NotFound
+                    return! context.WriteHtmlView(p () { "Order not found." })
+                | true, guid ->
+                    let users = context.GetService<UserManager<ApplicationUser>>()
+                    let! user = users.GetUserAsync context.User
+                    let orderId = Orders.orderId guid
+                    let dataSource = context.GetService<NpgsqlDataSource>()
+
+                    let! owned =
+                        if isNull user then
+                            Task.FromResult false
+                        else
+                            OrderSnapshots.isOwnedBy dataSource (EntityId.value orderId) user.Id context.RequestAborted
+
+                    if not owned then
+                        context.Response.StatusCode <- StatusCodes.Status404NotFound
+                        return! context.WriteHtmlView(p () { "Order not found." })
+                    else
+                        let! form = context.Request.ReadFormAsync context.RequestAborted
+                        let lineId = formValue form "lineId"
+                        let quantity = formValue form "quantity"
+                        let key = formValue form "returnKey"
+                        let orders = context.GetService<OrderMachineClient>()
+                        let! snapshot = Machine.state orders.Orders orderId context.RequestAborted
+
+                        match
+                            snapshot, ReturnId.tryParse key, Int32.TryParse quantity, Guid.TryParseExact(lineId, "D")
+                        with
+                        | Ok(Some order), Ok returnId, (true, amount), (true, parsedLineId) when amount > 0 ->
+                            match order.State with
+                            | OrderState.Delivered fulfilment ->
+                                match
+                                    fulfilment.PlacedOrder.Reserved.Pending.Lines
+                                    |> List.tryFind (fun line -> OrderLineId.value line.LineId = parsedLineId)
+                                with
+                                | None ->
+                                    context.Response.StatusCode <- StatusCodes.Status422UnprocessableEntity
+                                    return! context.WriteHtmlView(p (class' = "error") { "Choose an order line." })
+                                | Some line ->
+                                    use connection = dataSource.CreateConnection()
+                                    do! connection.OpenAsync context.RequestAborted
+
+                                    use cmd =
+                                        new NpgsqlCommand(
+                                            "SELECT max(delivered_at) FROM fsnix.shipments WHERE order_id=@order",
+                                            connection
+                                        )
+
+                                    cmd.Parameters.AddWithValue("order", EntityId.value orderId) |> ignore
+                                    let! delivered = cmd.ExecuteScalarAsync context.RequestAborted
+
+                                    if isNull delivered || delivered = DBNull.Value then
+                                        context.Response.StatusCode <- StatusCodes.Status409Conflict
+
+                                        return!
+                                            context.WriteHtmlView(p (class' = "error") { "Delivery has not settled." })
+                                    else
+                                        let deadline = (delivered :?> DateTimeOffset).AddDays 30.
+
+                                        if context.GetService<TimeProvider>().GetUtcNow() > deadline then
+                                            context.Response.StatusCode <- StatusCodes.Status409Conflict
+
+                                            return!
+                                                context.WriteHtmlView(
+                                                    p (class' = "error") { "The return window has ended." }
+                                                )
+                                        else
+                                            let totals = fulfilment.PlacedOrder.Reserved.Pending.Totals
+                                            let merchandise = Money.multiply line.UnitPrice (decimal amount)
+
+                                            let tax =
+                                                if Money.amount totals.Subtotal = 0m then
+                                                    Money.zero (Money.currencyCode merchandise)
+                                                    |> Result.defaultWith invalidOp
+                                                else
+                                                    Money.multiply
+                                                        totals.Tax
+                                                        (Money.amount merchandise / Money.amount totals.Subtotal)
+
+                                            let request =
+                                                { ReturnId = returnId
+                                                  AuthorizationId =
+                                                    ReturnAuthorizationId.create (ReturnId.value returnId)
+                                                    |> Result.defaultWith invalidOp
+                                                  OrderId = EntityId.value orderId
+                                                  Currency = Money.currencyCode merchandise
+                                                  WindowEndsAt = deadline
+                                                  Lines =
+                                                    [ { OrderLineId = line.LineId
+                                                        Quantity = amount
+                                                        RefundAmount = merchandise + tax } ] }
+
+                                            let! outcome =
+                                                Machine.send
+                                                    orders.Orders
+                                                    orderId
+                                                    (EventEnvelope.create
+                                                        $"return:{guid:D}:{ReturnId.wireString returnId}"
+                                                        (ReturnRequested request))
+                                                    context.RequestAborted
+
+                                            match outcome with
+                                            | Ok(CommandResult.Committed _) ->
+                                                return! Web.redirect $"/orders/{guid:D}" context
+                                            | _ ->
+                                                context.Response.StatusCode <- StatusCodes.Status409Conflict
+
+                                                return!
+                                                    context.WriteHtmlView(
+                                                        p (class' = "error") {
+                                                            "This quantity is not available for return."
+                                                        }
+                                                    )
+                            | _ ->
+                                context.Response.StatusCode <- StatusCodes.Status409Conflict
+                                return! context.WriteHtmlView(p (class' = "error") { "The order is not delivered." })
+                        | _ ->
+                            context.Response.StatusCode <- StatusCodes.Status422UnprocessableEntity
+                            return! context.WriteHtmlView(p (class' = "error") { "Enter a valid return quantity." })
             }

@@ -108,6 +108,30 @@ module CheckoutViews =
                         button (type' = "submit") { "Cancel order" }
                     }
 
+                for line in model.ReturnLines do
+                    form (action = $"/orders/{model.OrderId}/returns", method = "post") {
+                        context.GetAntiforgeryInput()
+                        input (type' = "hidden", name = "lineId", value = line.LineId)
+                        input (type' = "hidden", name = "returnKey", value = line.ReturnKey)
+
+                        label () {
+                            $"Return {line.Name} (up to {line.Available})"
+
+                            input (
+                                type' = "number",
+                                name = "quantity",
+                                min = "1",
+                                max = string line.Available,
+                                required = true
+                            )
+                        }
+
+                        button (type' = "submit") { "Request return" }
+                    }
+
+                for (returnId, returnStatus) in model.ReturnStatuses do
+                    p () { a (href = $"/returns/{returnId}") { $"Return {returnId}: {returnStatus}" } }
+
                 a (href = "/cart") { "Return to cart" }
             }
 

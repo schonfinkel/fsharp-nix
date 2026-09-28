@@ -80,7 +80,10 @@ module PaymentOperationTests =
                         | NotifyOrderDeclined _
                         | NotifyOrderCancelled _
                         | NotifyOrderVoided _
-                        | NotifyOrderCaptured _ -> PaymentEffects.applyNotify started.DataSource record ct)
+                        | NotifyOrderCaptured _ -> PaymentEffects.applyNotify started.DataSource record ct
+                        | NotifyRefundApproved _
+                        | NotifyRefundDenied _
+                        | NotifyRefundSettled _ -> PaymentEffects.applyNotifyRefund started.DataSource record ct)
 
             let run =
                 task {

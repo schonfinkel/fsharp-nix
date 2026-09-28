@@ -10,6 +10,8 @@ open App.Database
 open App.Domain
 open App.Orders
 open App.Payments
+open App.Refunds
+open App.Returns
 open App.Shipments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.DependencyInjection
@@ -321,6 +323,8 @@ module Application =
             .AddScoped<IActionHandler<OrderId, OrderAction, OrderActionError>, OrderEffectHandler>()
             .AddScoped<IActionHandler<PaymentId, PaymentAction, PaymentActionError>, PaymentEffectHandler>()
             .AddScoped<IActionHandler<ShipmentEntityId, ShipmentAction, ShipmentActionError>, ShipmentEffectHandler>()
+            .AddScoped<IActionHandler<RefundEntityId, RefundAction, RefundActionError>, RefundEffectHandler>()
+            .AddScoped<IActionHandler<ReturnEntityId, ReturnAction, ReturnActionError>, ReturnEffectHandler>()
             .AddSingleton<SimulatedPaymentGateway>()
             .AddSingleton<IPaymentGateway>(fun provider ->
                 provider.GetRequiredService<SimulatedPaymentGateway>() :> IPaymentGateway)
@@ -338,6 +342,10 @@ module Application =
             .AddHostedService(fun provider -> provider.GetRequiredService<PaymentMachineClient>())
             .AddSingleton<ShipmentMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<ShipmentMachineClient>())
+            .AddSingleton<RefundMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<RefundMachineClient>())
+            .AddSingleton<ReturnMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<ReturnMachineClient>())
             .AddHostedService<ReservationExpiryScanner>()
             .AddSingleton<OutboxDestination list>(fun provider ->
                 let probeClient = provider.GetRequiredService<ProbeMachineClient>()
@@ -346,6 +354,8 @@ module Application =
                 let ordersClient = provider.GetRequiredService<OrderMachineClient>()
                 let paymentsClient = provider.GetRequiredService<PaymentMachineClient>()
                 let shipmentsClient = provider.GetRequiredService<ShipmentMachineClient>()
+                let refundsClient = provider.GetRequiredService<RefundMachineClient>()
+                let returnsClient = provider.GetRequiredService<ReturnMachineClient>()
 
                 [ OutboxDestination.forMachineProvider
                       Probe.MachineKey
@@ -370,12 +380,17 @@ module Application =
                       Shipments.MachineKey
                       EntityId.create
                       ShipmentCodec.event
-                      (fun () -> shipmentsClient.Shipments) ])
+                      (fun () -> shipmentsClient.Shipments)
+                  OutboxDestination.forMachineProvider Refunds.MachineKey EntityId.create RefundCodec.event (fun () ->
+                      refundsClient.Refunds)
+                  OutboxDestination.forMachineProvider Returns.MachineKey EntityId.create ReturnCodec.event (fun () ->
+                      returnsClient.Returns) ])
             .AddHostedService<IntegrationOutboxRelay>()
             .AddHostedService<EmailDeliveryRelay>()
             .AddHostedService<FlowDeadlineScanner>()
             .AddHostedService<CartAbandonmentScanner>()
             .AddHostedService<CartMergeScanner>()
+            .AddHostedService<ReturnWindowScanner>()
             .AddAutomata(
                 { MachineKey = Probe.MachineKey
                   Supervisor = AutomataSupervisorOptions.defaults Probe.MachineKey
@@ -454,6 +469,32 @@ module Application =
                     fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
                   TimeProvider = TimeProvider.System }
             )
+            .AddAutomata(
+                { MachineKey = Refunds.MachineKey
+                  Supervisor = AutomataSupervisorOptions.defaults Refunds.MachineKey
+                  Actions = ActionDelivery.registered<RefundEntityId, RefundAction, RefundActionError>
+                  MachineFactory =
+                    fun provider ->
+                        RefundCodec.buildWorker
+                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "refunds")
+                            (provider.GetRequiredService<PostgresContext>())
+                  ChartRegistry =
+                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+                  TimeProvider = TimeProvider.System }
+            )
+            .AddAutomata(
+                { MachineKey = Returns.MachineKey
+                  Supervisor = AutomataSupervisorOptions.defaults Returns.MachineKey
+                  Actions = ActionDelivery.registered<ReturnEntityId, ReturnAction, ReturnActionError>
+                  MachineFactory =
+                    fun provider ->
+                        ReturnCodec.buildWorker
+                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "returns")
+                            (provider.GetRequiredService<PostgresContext>())
+                  ChartRegistry =
+                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+                  TimeProvider = TimeProvider.System }
+            )
             .AddAutomataMaintenance(
                 { MaintenanceOptions.defaults (fun provider ->
                       PostgresMaintenance(provider.GetRequiredService<PostgresContext>())) with
@@ -489,6 +530,7 @@ module Application =
                 route "/cart" CartEndpoints.page
                 route "/checkout" (Account.requireAuthenticated OrderEndpoints.page)
                 route "/orders/{orderId}" (Account.requireAuthenticated OrderEndpoints.show)
+                route "/returns/{returnId}" (Account.requireAuthenticated ReturnEndpoints.show)
                 route "/cart/events" CartEvents.stream
                 route "/account/login" Account.loginPage
                 route "/account/login/2fa" Account.twoFactorPage
@@ -505,6 +547,7 @@ module Application =
                 route "/admin/features/{name}" (Account.requireMfa Admin.featureCard)
                 route "/admin/operations" (Account.requireMfa OperationalHealthEndpoints.index)
                 route "/admin/catalog" (Account.requireMfa CatalogAdminEndpoints.index)
+                route "/admin/returns/{returnId}" (Account.requireMfa ReturnEndpoints.adminPage)
                 route "/admin/probe" (Account.requireMfa ProbeAdmin.index) ]
           POST
               [ route "/account/login" (Admin.requireValidAntiforgery Account.login)
@@ -545,6 +588,12 @@ module Application =
                 route
                     "/orders/{orderId}/cancel"
                     (Account.requireAuthenticated (Admin.requireValidAntiforgery OrderEndpoints.cancel))
+                route
+                    "/orders/{orderId}/returns"
+                    (Account.requireAuthenticated (Admin.requireValidAntiforgery OrderEndpoints.requestReturn))
+                route
+                    "/admin/returns/{returnId}/{action}"
+                    (Account.requireMfa (Admin.requireValidAntiforgery ReturnEndpoints.adminAction))
                 route "/cart/merge" (Account.requireAuthenticated (Admin.requireValidAntiforgery CartEndpoints.merge))
                 route
                     "/admin/catalog/products"

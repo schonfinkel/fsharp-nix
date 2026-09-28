@@ -18,6 +18,7 @@ open App.Domain
 type SimulatedPaymentGateway() =
     let authorizeCalls = ConcurrentDictionary<string, int>()
     let captureCalls = ConcurrentDictionary<string, int>()
+    let refundCalls = ConcurrentDictionary<string, int>()
     let voidCalls = ConcurrentDictionary<string, int>()
 
     let seed (operationId: PaymentOperationId) =
@@ -80,11 +81,24 @@ type SimulatedPaymentGateway() =
         member _.QueryAuthorization(operationId, method, _) =
             Task.FromResult(Some(resolve operationId method))
 
+        member _.Refund(operationId, _, _, _) =
+            record refundCalls (PaymentOperationId.value operationId)
+
+            if PaymentOperationId.value operationId |> _.Contains(":unknown:") then
+                Task.FromResult GatewayRefundUnknown
+            else
+                Task.FromResult(GatewayRefunded(reference operationId))
+
+        member _.QueryRefund(operationId, _, _) =
+            Task.FromResult(Some(GatewayRefunded(reference operationId)))
+
     /// <summary>How many times the provider was asked to authorize this operation.</summary>
     member _.AuthorizeCalls(operationId: PaymentOperationId) = lookup authorizeCalls operationId
 
     /// <summary>How many times the provider was asked to capture this operation.</summary>
     member _.CaptureCalls(operationId: PaymentOperationId) = lookup captureCalls operationId
+
+    member _.RefundCalls(operationId: PaymentOperationId) = lookup refundCalls operationId
 
     /// <summary>How many times the provider was asked to void this operation.</summary>
     member _.VoidCalls(operationId: PaymentOperationId) = lookup voidCalls operationId

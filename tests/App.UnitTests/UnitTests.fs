@@ -481,6 +481,8 @@ module UnitTests =
         health.Succeeded RuntimeComponent.OrderMachine
         health.Succeeded RuntimeComponent.PaymentMachine
         health.Succeeded RuntimeComponent.ShipmentMachine
+        health.Succeeded RuntimeComponent.RefundMachine
+        health.Succeeded RuntimeComponent.ReturnMachine
         Assert.True(health.Snapshot() |> RuntimeHealth.startupReady)
 
         health.Succeeded RuntimeComponent.IntegrationOutboxRelay
@@ -489,6 +491,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.CartAbandonmentScanner
         health.Succeeded RuntimeComponent.CartMergeScanner
         health.Succeeded RuntimeComponent.ReservationExpiryScanner
+        health.Succeeded RuntimeComponent.ReturnWindowScanner
         let snapshot = health.Snapshot()
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) snapshot)
 
@@ -1513,6 +1516,200 @@ module UnitTests =
         | Ok _ -> Assert.Fail "Expected an excess capture to be rejected."
         | Error _ -> ()
 
+    let private makeRefundRequest amount =
+        let id = Guid.NewGuid()
+
+        { RefundId = RefundId.create id |> Result.defaultWith Assert.Fail
+          AllocationId = RefundAllocationId.create id |> Result.defaultWith Assert.Fail
+          OperationId = PaymentOperationId.create $"refund:v1:{id:N}" |> Result.defaultWith Assert.Fail
+          Origin = OrderCancellation $"order:{Guid.NewGuid():D}"
+          Amount = Money.create amount "USD" |> Result.defaultWith Assert.Fail }
+
+    let ``refund balance reserves pending allocations`` () =
+        let captured = Money.create 27m "USD" |> Result.defaultWith Assert.Fail
+
+        let balance =
+            { Captured = captured
+              Refunded = Money.create 0m "USD" |> Result.defaultWith Assert.Fail
+              Pending = Money.create 0m "USD" |> Result.defaultWith Assert.Fail }
+
+        let reserved =
+            RefundAllocation.reserve balance (Money.create 10m "USD" |> Result.defaultWith Assert.Fail)
+            |> Result.defaultWith Assert.Fail
+
+        Assert.Equal(10m, Money.amount reserved.Pending)
+
+        match RefundAllocation.reserve reserved (Money.create 18m "USD" |> Result.defaultWith Assert.Fail) with
+        | Ok _ -> Assert.Fail "Expected an over-balance reservation to fail."
+        | Error _ -> ()
+
+    let private expectRefundResolution state event =
+        match Chart.resolve App.Refunds.Refunds.chartValue state event with
+        | Ok resolution -> resolution
+        | Error error -> Assert.Fail $"Expected refund event to resolve, got %A{error}."
+
+    let ``refund chart requests allocation and settles`` () =
+        let request = makeRefundRequest 10m
+
+        let started =
+            expectRefundResolution App.Refunds.Refunds.initialState (App.Refunds.RefundEvent.RefundRequested request)
+
+        Assert.Equal(App.Refunds.RefundState.AllocationPending request, started.Next)
+        Assert.Equal([ App.Refunds.RefundAction.RequestAllocation request ], started.Actions)
+
+        let approved =
+            { Request = request
+              PaymentReference = "sim-abc123" }
+
+        let gatewaying =
+            expectRefundResolution started.Next (App.Refunds.RefundEvent.AllocationApproved approved)
+
+        Assert.Equal(App.Refunds.RefundState.PendingGateway approved, gatewaying.Next)
+        Assert.Equal([ App.Refunds.RefundAction.CallGatewayRefund approved ], gatewaying.Actions)
+
+        let settling =
+            expectRefundResolution gatewaying.Next (App.Refunds.RefundEvent.GatewayRefunded(approved, "sim-ref1"))
+
+        match settling.Next with
+        | App.Refunds.RefundState.SettlementPending(_, reference) -> Assert.Equal("sim-ref1", reference)
+        | other -> Assert.Fail $"Expected settlement pending, got %A{other}."
+
+        let doneState =
+            expectRefundResolution settling.Next (App.Refunds.RefundEvent.AllocationSettled request.AllocationId)
+
+        Assert.Equal(App.Refunds.RefundState.Succeeded request, doneState.Next)
+        Assert.Equal([ App.Refunds.RefundAction.NotifyOriginSucceeded request ], doneState.Actions)
+
+    let private makeReturnRequest () =
+        let id = Guid.NewGuid()
+        let lineId = OrderLineId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+        { ReturnId = ReturnId.create id |> Result.defaultWith Assert.Fail
+          AuthorizationId = ReturnAuthorizationId.create id |> Result.defaultWith Assert.Fail
+          OrderId = $"order:{Guid.NewGuid():D}"
+          Currency = "USD"
+          WindowEndsAt = DateTimeOffset.UtcNow.AddDays 10.
+          Lines =
+            [ { OrderLineId = lineId
+                Quantity = 1
+                RefundAmount = Money.create 10m "USD" |> Result.defaultWith Assert.Fail } ] }
+
+    let private expectReturnResolution state event =
+        match Chart.resolve App.Returns.Returns.chartValue state event with
+        | Ok resolution -> resolution
+        | Error error -> Assert.Fail $"Expected return event to resolve, got %A{error}."
+
+    let ``return chart authorizes receives and refunds`` () =
+        let request = makeReturnRequest ()
+        let lineId = request.Lines.Head.OrderLineId
+
+        let started =
+            expectReturnResolution App.Returns.Returns.initialState (App.Returns.ReturnEvent.ReturnRequested request)
+
+        match started.Next with
+        | App.Returns.ReturnState.AuthorizationPending p -> Assert.Equal(request, p.Request)
+        | other -> Assert.Fail $"Expected authorization pending, got %A{other}."
+
+        Assert.Equal([ App.Returns.ReturnAction.VerifyAuthorization request ], started.Actions)
+
+        let approved =
+            expectReturnResolution started.Next (App.Returns.ReturnEvent.AuthorizationApproved request.AuthorizationId)
+
+        Assert.Equal([ App.Returns.ReturnAction.IssueLabel request ], approved.Actions)
+
+        let reference =
+            CarrierReference.create "sim-abc123" |> Result.defaultWith Assert.Fail
+
+        let labelled =
+            expectReturnResolution approved.Next (App.Returns.ReturnEvent.LabelCreated reference)
+
+        let scanId = ReturnTrackingEventId.create "scan-1" |> Result.defaultWith Assert.Fail
+
+        let inTransit =
+            expectReturnResolution labelled.Next (App.Returns.ReturnEvent.CarrierScanReceived scanId)
+
+        match inTransit.Next with
+        | App.Returns.ReturnState.InTransit _ -> ()
+        | other -> Assert.Fail $"Expected in transit, got %A{other}."
+
+        let received =
+            expectReturnResolution inTransit.Next (App.Returns.ReturnEvent.ItemsReceived [ lineId, 1 ])
+
+        match received.Next with
+        | App.Returns.ReturnState.Received _ -> ()
+        | other -> Assert.Fail $"Expected received, got %A{other}."
+
+        let inspected =
+            expectReturnResolution received.Next (App.Returns.ReturnEvent.InspectionApproved [ lineId, 1 ])
+
+        match inspected.Next with
+        | App.Returns.ReturnState.Inspected _ -> ()
+        | other -> Assert.Fail $"Expected inspected, got %A{other}."
+
+        let restocked =
+            expectReturnResolution inspected.Next (App.Returns.ReturnEvent.RestockCompleted request.ReturnId)
+
+        let refunding =
+            expectReturnResolution restocked.Next App.Returns.ReturnEvent.CloseRequested
+
+        let refundId =
+            match refunding.Next with
+            | App.Returns.ReturnState.RefundPending(_, refund) -> refund.RefundId
+            | other -> Assert.Fail $"Expected refund pending, got %A{other}."
+
+        let refunded =
+            expectReturnResolution refunding.Next (App.Returns.ReturnEvent.RefundSucceeded refundId)
+
+        match refunded.Next with
+        | App.Returns.ReturnState.Refunded _ -> ()
+        | other -> Assert.Fail $"Expected refunded, got %A{other}."
+
+    let ``payment reserves and settles a refund allocation`` () =
+        let attempt = makeAuthorizationAttempt ()
+        let expiry = DateTimeOffset.UtcNow.AddDays 6.
+
+        let authorized =
+            { Attempt = attempt
+              ProviderReference = "sim-abc123"
+              ExpiresAt = expiry }
+
+        let captureRequest amount suffix =
+            { OrderId = attempt.OrderId
+              CaptureId = CaptureId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+              OperationId =
+                PaymentOperationId.create $"capture:v1:{suffix}"
+                |> Result.defaultWith Assert.Fail
+              Amount = Money.create amount "USD" |> Result.defaultWith Assert.Fail }
+
+        let started =
+            expectPaymentResolution (Authorized authorized) (CaptureRequested(captureRequest 27m "one"))
+
+        let pendingRequest =
+            match started.Next with
+            | CapturePending p -> p.Request
+            | other -> Assert.Fail $"Expected capture pending, got %A{other}."
+
+        let captured =
+            expectPaymentResolution started.Next (CaptureSucceeded(pendingRequest, "sim-cap1"))
+
+        let refund =
+            { makeRefundRequest 10m with
+                Origin = OrderCancellation attempt.OrderId }
+
+        let reserved =
+            expectPaymentResolution captured.Next (RefundAllocationRequested refund)
+
+        match reserved.Next with
+        | RefundAllocationPending payment -> Assert.Equal(1, payment.Refunds.Length)
+        | other -> Assert.Fail $"Expected refund allocation pending, got %A{other}."
+
+        let settled =
+            expectPaymentResolution reserved.Next (RefundAllocationSettled refund.AllocationId)
+
+        match settled.Next with
+        | Captured payment -> Assert.True(payment.Refunds.Head.Status = "settled")
+        | other -> Assert.Fail $"Expected captured, got %A{other}."
+
     let tests =
         testList
             "unit"
@@ -1615,5 +1812,11 @@ module UnitTests =
               testCase
                   "payment captures respect the authorized amount"
                   ``payment captures respect the authorized amount``
+              testCase "refund balance reserves allocations" ``refund balance reserves pending allocations``
+              testCase "refund chart allocates and settles" ``refund chart requests allocation and settles``
+              testCase "return chart authorizes and refunds" ``return chart authorizes receives and refunds``
+              testCase
+                  "payment reserves and settles refund allocations"
+                  ``payment reserves and settles a refund allocation``
               testCase "cart codecs contain no secret fields" ``cart codecs cover every case without secret fields``
               testCase "cart codecs round trip an active cart" ``cart codecs round trip an active cart`` ]

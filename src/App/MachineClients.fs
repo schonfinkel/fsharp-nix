@@ -10,6 +10,8 @@ open App.Domain
 open App.Orders
 open App.Payments
 open App.Shipments
+open App.Refunds
+open App.Returns
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
@@ -282,6 +284,178 @@ type ShipmentMachineClient(context: PostgresContext, loggerFactory: ILoggerFacto
                 health.Stopped RuntimeComponent.ShipmentMachine
             }
             :> Task
+
+type RefundMachineClient(context: PostgresContext, loggerFactory: ILoggerFactory, health: RuntimeHealth) =
+    let logger = loggerFactory.CreateLogger "RefundMachineClient"
+    let mutable client = None
+
+    member _.Refunds =
+        client
+        |> Option.defaultWith (fun () -> invalidOp "refund machine client has not started")
+
+    interface IHostedService with
+        member _.StartAsync(ct: CancellationToken) =
+            task {
+                health.Starting RuntimeComponent.RefundMachine
+
+                let machine =
+                    match RefundCodec.buildClient logger context with
+                    | Ok machine -> machine
+                    | Error _ ->
+                        health.Failed(RuntimeComponent.RefundMachine, RuntimeFailure.InvalidChart)
+                        invalidOp "refund chart is invalid"
+
+                match! Machine.startAsync machine (PostgresChartRegistry { Context = context }) ct with
+                | Ok(Startup.Started _) ->
+                    client <- Some machine
+                    health.Succeeded RuntimeComponent.RefundMachine
+                | Ok(Startup.Refused _) ->
+                    health.Failed(RuntimeComponent.RefundMachine, RuntimeFailure.StartupRefused)
+                    return raise (InvalidOperationException "refund client refused to boot")
+                | Error _ ->
+                    health.Failed(RuntimeComponent.RefundMachine, RuntimeFailure.StartupFailed)
+                    return raise (InvalidOperationException "refund client failed to start")
+            }
+            :> Task
+
+        member _.StopAsync(ct: CancellationToken) =
+            task {
+                match client with
+                | Some machine -> do! Machine.stopAsync machine ct
+                | None -> ()
+
+                client <- None
+                health.Stopped RuntimeComponent.RefundMachine
+            }
+            :> Task
+
+type ReturnMachineClient(context: PostgresContext, loggerFactory: ILoggerFactory, health: RuntimeHealth) =
+    let logger = loggerFactory.CreateLogger "ReturnMachineClient"
+    let mutable client = None
+
+    member _.Returns =
+        client
+        |> Option.defaultWith (fun () -> invalidOp "return machine client has not started")
+
+    interface IHostedService with
+        member _.StartAsync(ct: CancellationToken) =
+            task {
+                health.Starting RuntimeComponent.ReturnMachine
+
+                let machine =
+                    match ReturnCodec.buildClient logger context with
+                    | Ok machine -> machine
+                    | Error _ ->
+                        health.Failed(RuntimeComponent.ReturnMachine, RuntimeFailure.InvalidChart)
+                        invalidOp "return chart is invalid"
+
+                match! Machine.startAsync machine (PostgresChartRegistry { Context = context }) ct with
+                | Ok(Startup.Started _) ->
+                    client <- Some machine
+                    health.Succeeded RuntimeComponent.ReturnMachine
+                | Ok(Startup.Refused _) ->
+                    health.Failed(RuntimeComponent.ReturnMachine, RuntimeFailure.StartupRefused)
+                    return raise (InvalidOperationException "return client refused to boot")
+                | Error _ ->
+                    health.Failed(RuntimeComponent.ReturnMachine, RuntimeFailure.StartupFailed)
+                    return raise (InvalidOperationException "return client failed to start")
+            }
+            :> Task
+
+        member _.StopAsync(ct: CancellationToken) =
+            task {
+                match client with
+                | Some machine -> do! Machine.stopAsync machine ct
+                | None -> ()
+
+                client <- None
+                health.Stopped RuntimeComponent.ReturnMachine
+            }
+            :> Task
+
+type ReturnWindowScanner
+    (
+        dataSource: NpgsqlDataSource,
+        returns: ReturnMachineClient,
+        logger: ILogger<ReturnWindowScanner>,
+        health: RuntimeHealth
+    ) =
+    inherit BackgroundService()
+    let owner = $"return-window-{Environment.MachineName}-{Guid.NewGuid():N}"
+
+    override _.ExecuteAsync(ct: CancellationToken) =
+        task {
+            try
+                while not ct.IsCancellationRequested do
+                    try
+                        use connection = dataSource.CreateConnection()
+                        do! connection.OpenAsync ct
+
+                        use claim =
+                            new NpgsqlCommand(
+                                "WITH due AS (SELECT return_id FROM fsnix.return_requests WHERE status='pending' AND window_ends_at <= statement_timestamp() AND (lease_until IS NULL OR lease_until < statement_timestamp()) ORDER BY window_ends_at, return_id LIMIT 20 FOR UPDATE SKIP LOCKED) UPDATE fsnix.return_requests r SET lease_owner=@owner,lease_until=statement_timestamp()+interval '30 seconds' FROM due WHERE r.return_id=due.return_id RETURNING r.return_id,r.authorization_id,r.window_ends_at",
+                                connection
+                            )
+
+                        claim.Parameters.AddWithValue("owner", owner) |> ignore
+                        use! reader = claim.ExecuteReaderAsync ct
+                        let claimed = ResizeArray<ReturnId * ReturnAuthorizationId * DateTimeOffset>()
+
+                        while! reader.ReadAsync ct do
+                            let id = ReturnId.create (reader.GetGuid 0) |> Result.defaultWith invalidOp
+
+                            let auth =
+                                ReturnAuthorizationId.create (reader.GetGuid 1) |> Result.defaultWith invalidOp
+
+                            claimed.Add((id, auth, reader.GetFieldValue<DateTimeOffset> 2))
+
+                        reader.Dispose()
+
+                        for (id, auth, deadline) in claimed do
+                            let key =
+                                $"return-window:{ReturnId.wireString id}:{deadline.ToUnixTimeMilliseconds()}"
+
+                            let! outcome =
+                                Machine.enqueue
+                                    returns.Returns
+                                    (Returns.returnEntityId id)
+                                    (EventEnvelope.create key (ReturnWindowExpired(auth, deadline)))
+                                    ct
+
+                            use settle =
+                                new NpgsqlCommand(
+                                    "UPDATE fsnix.return_requests SET status=@status,lease_owner=NULL,lease_until=NULL WHERE return_id=@id AND lease_owner=@owner",
+                                    connection
+                                )
+
+                            settle.Parameters.AddWithValue("id", ReturnId.value id) |> ignore
+                            settle.Parameters.AddWithValue("owner", owner) |> ignore
+
+                            settle.Parameters.AddWithValue(
+                                "status",
+                                if Result.isOk outcome then "expired" else "pending"
+                            )
+                            |> ignore
+
+                            let! _ = settle.ExecuteNonQueryAsync ct
+                            ()
+
+                        health.Succeeded RuntimeComponent.ReturnWindowScanner
+                    with
+                    | :? OperationCanceledException when ct.IsCancellationRequested -> ()
+                    | error ->
+                        health.Failed(RuntimeComponent.ReturnWindowScanner, RuntimeFailure.PassFailed)
+
+                        logger.LogError(
+                            "return-window scanner pass failed ({ExceptionType})",
+                            SafeDiagnostics.exceptionType error
+                        )
+
+                    do! Task.Delay(TimeSpan.FromSeconds 5., ct)
+            with :? OperationCanceledException ->
+                health.Stopped RuntimeComponent.ReturnWindowScanner
+        }
+        :> Task
 
 type ReservationExpiryScanner
     (
