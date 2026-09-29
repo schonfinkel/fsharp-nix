@@ -136,7 +136,7 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
                 match! Machine.state invoices.Invoices entity CancellationToken.None with
                 | Ok(Some snapshot) ->
                     match snapshot.State with
-                    | Issued issued -> found <- Some issued
+                    | Rendered(issued, _) -> found <- Some issued
                     | _ -> do! Task.Delay 100
                 | _ -> do! Task.Delay 100
 
@@ -236,6 +236,60 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
                     $"SELECT i.total_amount = s.total_amount AND i.number = 1 FROM fsnix.invoices i JOIN fsnix.order_snapshots s USING (snapshot_id) WHERE i.order_id='order:{orderId:D}'"
 
             Assert.Equal("True", invoicedTotal)
+
+            let number = InvoiceNumber.display invoice.Number
+            let invoiceId = InvoiceId.wireString invoice.Request.InvoiceId
+
+            Assert.True(
+                Text.RegularExpressions.Regex.IsMatch(number, "^INV-[0-9]{4}-(0[1-9]|1[0-2])-00000001$"),
+                number
+            )
+
+            let! invoices = client.GetStringAsync "/invoices"
+            Assert.Contains(number, invoices)
+            Assert.Contains($"/invoices/{invoiceId}/pdf", invoices)
+
+            let! orderPage = client.GetStringAsync $"/orders/{orderId:D}"
+            Assert.Contains($"Invoice {number} (PDF)", orderPage)
+
+            use! pdf = client.GetAsync $"/invoices/{invoiceId}/pdf"
+            Assert.Equal(HttpStatusCode.OK, pdf.StatusCode)
+            Assert.Equal("application/pdf", pdf.Content.Headers.ContentType.MediaType)
+            Assert.Equal($"{number}.pdf", pdf.Content.Headers.ContentDisposition.FileName.Trim('"'))
+            Assert.Contains("no-store", pdf.Headers.CacheControl.ToString())
+            let! bytes = pdf.Content.ReadAsByteArrayAsync()
+            Assert.True(Pdf.isPdf bytes, "Expected a PDF body.")
+
+            let! stored =
+                scalar
+                    string
+                    $"SELECT encode(sha256, 'hex') FROM fsnix.invoice_documents WHERE invoice_id='{invoiceId}'"
+
+            Assert.Equal(Convert.ToHexStringLower(Security.Cryptography.SHA256.HashData(bytes: byte array)), stored)
+
+            let! admin = client.GetStringAsync "/admin/invoices"
+            Assert.Contains(number, admin)
+            Assert.Contains($"/admin/invoices/{invoiceId}/pdf", admin)
+
+            use strangerFactory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, userId = Guid.NewGuid())
+
+            use stranger =
+                strangerFactory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            let! foreign = stranger.GetAsync $"/invoices/{invoiceId}/pdf"
+            Assert.Equal(HttpStatusCode.NotFound, foreign.StatusCode)
+
+            use anonymousFactory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, false)
+
+            use anonymous =
+                anonymousFactory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            let! adminAnonymous = anonymous.GetAsync "/admin/invoices"
+            Assert.Equal(HttpStatusCode.Redirect, adminAnonymous.StatusCode)
+            let! pdfAnonymous = anonymous.GetAsync $"/invoices/{invoiceId}/pdf"
+            Assert.Equal(HttpStatusCode.Redirect, pdfAnonymous.StatusCode)
 
             let! onHand =
                 scalar Convert.ToInt32 $"SELECT on_hand FROM fsnix.product_stock WHERE product_id='{productId:D}'"

@@ -13,7 +13,10 @@ type IssuedInvoice =
 type InvoiceState =
     | Initial
     | SnapshotPending of InvoiceRequest
-    | Issued of IssuedInvoice
+    | RenderPending of IssuedInvoice
+    /// <summary>The PDF is stored in <c>fsnix.invoice_documents</c> under this digest.</summary>
+    | Rendered of IssuedInvoice * DocumentDigest
+    | RenderFailed of IssuedInvoice * reasonCode: ReasonCode
     | ManualReview of InvoiceRequest * reasonCode: ReasonCode
     | Closed of IssuedInvoice
 
@@ -24,9 +27,16 @@ type InvoiceEvent =
     /// <summary>Operator recovery from manual review: re-runs issuance, which resolves by the
     /// invoice business key, so a snapshot that did commit is reported rather than renumbered.</summary>
     | IssuanceRetryRequested
+    | DocumentRendered of InvoiceId * DocumentDigest
+    | DocumentRenderFailed of InvoiceId * reasonCode: ReasonCode
+    /// <summary>Operator recovery from a failed render. Rendering is deterministic, so a retry
+    /// that succeeds stores the same content address as any earlier success would have.</summary>
+    | RenderRetryRequested
     | CloseRequested
 
-type InvoiceAction = IssueSnapshot of InvoiceRequest
+type InvoiceAction =
+    | IssueSnapshot of InvoiceRequest
+    | RenderDocument of IssuedInvoice
 
 [<RequireQualifiedAccess>]
 type InvoiceActionError =
@@ -59,7 +69,9 @@ module Invoices =
         function
         | Initial -> stateId "initial"
         | SnapshotPending _ -> stateId "snapshot-pending"
-        | Issued _ -> stateId "issued"
+        | RenderPending _ -> stateId "render-pending"
+        | Rendered _ -> stateId "rendered"
+        | RenderFailed _ -> stateId "render-failed"
         | ManualReview _ -> stateId "manual-review"
         | Closed _ -> stateId "closed"
 
@@ -74,23 +86,37 @@ module Invoices =
         | SnapshotPending request, IssuanceFailed(id, _) -> id = request.InvoiceId
         | _ -> false
 
-    let private retry state event =
+    let private renderResult state event =
+        match state, event with
+        | RenderPending issued, DocumentRendered(id, _)
+        | RenderPending issued, DocumentRenderFailed(id, _) -> id = issued.Request.InvoiceId
+        | _ -> false
+
+    let private issuanceRetry state event =
         match state, event with
         | ManualReview _, IssuanceRetryRequested -> true
         | _ -> false
 
-    let private close state event =
+    let private renderRetry state event =
         match state, event with
-        | Issued _, CloseRequested -> true
+        | RenderFailed _, RenderRetryRequested -> true
         | _ -> false
 
-    /// <summary>Duplicate requests and late or stale issuance callbacks are no-ops.</summary>
+    let private close state event =
+        match state, event with
+        | Rendered _, CloseRequested -> true
+        | _ -> false
+
+    /// <summary>Duplicate requests and late or stale issuance/render callbacks are no-ops.</summary>
     let private absorb _ =
         function
         | InvoiceRequested _
         | SnapshotIssued _
-        | IssuanceFailed _ -> true
+        | IssuanceFailed _
+        | DocumentRendered _
+        | DocumentRenderFailed _ -> true
         | IssuanceRetryRequested
+        | RenderRetryRequested
         | CloseRequested -> false
 
     let chartResult =
@@ -109,24 +135,45 @@ module Invoices =
                 on issuanceResult (fun state event ->
                     match state, event with
                     | SnapshotPending request, SnapshotIssued(_, number) ->
-                        [], Issued { Request = request; Number = number }
+                        let issued = { Request = request; Number = number }
+
+                        [ RenderDocument issued ], RenderPending issued
                     | SnapshotPending request, IssuanceFailed(_, reason) -> [], ManualReview(request, reason)
                     | _ -> [], state)
 
                 internalOn absorb (fun _ _ -> [])
             }
 
-            state "issued" {
+            state "render-pending" {
+                on renderResult (fun state event ->
+                    match state, event with
+                    | RenderPending issued, DocumentRendered(_, digest) -> [], Rendered(issued, digest)
+                    | RenderPending issued, DocumentRenderFailed(_, reason) -> [], RenderFailed(issued, reason)
+                    | _ -> [], state)
+
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "rendered" {
                 on close (fun state _ ->
                     match state with
-                    | Issued issued -> [], Closed issued
+                    | Rendered(issued, _) -> [], Closed issued
+                    | _ -> [], state)
+
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "render-failed" {
+                on renderRetry (fun state _ ->
+                    match state with
+                    | RenderFailed(issued, _) -> [ RenderDocument issued ], RenderPending issued
                     | _ -> [], state)
 
                 internalOn absorb (fun _ _ -> [])
             }
 
             state "manual-review" {
-                on retry (fun state _ ->
+                on issuanceRetry (fun state _ ->
                     match state with
                     | ManualReview(request, _) -> [ IssueSnapshot request ], SnapshotPending request
                     | _ -> [], state)

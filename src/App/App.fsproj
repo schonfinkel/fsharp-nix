@@ -60,9 +60,11 @@
     <Compile Include="RefundHandler.fs" />
     <Compile Include="ReturnHandler.fs" />
     <Compile Include="Pdf.fs" />
+    <Compile Include="InvoicePdf.fs" />
     <Compile Include="InvoiceHandler.fs" />
     <Compile Include="OrderEndpoints.fs" />
     <Compile Include="ReturnEndpoints.fs" />
+    <Compile Include="InvoiceEndpoints.fs" />
     <Compile Include="CatalogEndpoints.fs" />
     <Compile Include="CatalogAdminEndpoints.fs" />
     <Compile Include="AdminFulfilment.fs" />

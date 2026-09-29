@@ -34,7 +34,7 @@ module InvoiceIssuanceTests =
            priceVersion = 1L |}
 
     /// <summary>Inserts an order snapshot whose header is consistent with its lines.</summary>
-    let private insertSnapshot (dataSource: NpgsqlDataSource) lines subtotal =
+    let private insertSnapshotFor (customerId: Guid) (dataSource: NpgsqlDataSource) lines subtotal =
         task {
             let snapshotId = Guid.NewGuid()
             let shipping = 5m
@@ -43,7 +43,7 @@ module InvoiceIssuanceTests =
             let row =
                 { SnapshotId = snapshotId
                   OrderId = $"order:{snapshotId:D}"
-                  CustomerId = Guid.NewGuid()
+                  CustomerId = customerId
                   CustomerEmail = "buyer@example.test"
                   AddressJson =
                     """{"recipient":"Buyer","line1":"2 Road","city":"Town","postalCode":"12345","countryCode":"US"}"""
@@ -67,13 +67,19 @@ module InvoiceIssuanceTests =
                 |> InvoiceRequest.forOrder
         }
 
-    let private record commandId (request: InvoiceRequest) =
+    let private insertSnapshot dataSource lines subtotal =
+        insertSnapshotFor (Guid.NewGuid()) dataSource lines subtotal
+
+    let private actionRecord commandId (request: InvoiceRequest) action =
         { MachineId = machineId Invoices.MachineKey
           EntityId = Invoices.invoiceEntityId request.InvoiceId
           CommandId = CommandId.ofInt64 commandId
           Epoch = Epoch.ofUInt64 1UL
           Ordinal = 0
-          Action = IssueSnapshot request }
+          Action = action }
+
+    let private record commandId (request: InvoiceRequest) =
+        actionRecord commandId request (IssueSnapshot request)
 
     let private issue dataSource commandId request =
         InvoiceEffects.applyIssue dataSource issuer issuedAt (record commandId request) CancellationToken.None
@@ -104,7 +110,7 @@ module InvoiceIssuanceTests =
             let! value =
                 scalar
                     dataSource
-                    "SELECT coalesce((SELECT last_number FROM fsnix.invoice_counters WHERE legal_entity='FSNIX' AND series='INV' AND fiscal_period='2026'), 0)"
+                    "SELECT coalesce((SELECT last_number FROM fsnix.invoice_counters WHERE legal_entity='FSNIX' AND series='INV' AND fiscal_period='2026-09'), 0)"
                     None
 
             return value :?> int64
@@ -167,7 +173,8 @@ module InvoiceIssuanceTests =
             let! events = callbacks dataSource first
 
             let expected =
-                InvoiceNumber.create "FSNIX" "INV" "2026" 1L |> Result.defaultWith Assert.Fail
+                InvoiceNumber.create "FSNIX" "INV" "2026-09" 1L
+                |> Result.defaultWith Assert.Fail
 
             Assert.Equal<InvoiceEvent list>(
                 [ SnapshotIssued(first.InvoiceId, expected)
@@ -288,12 +295,191 @@ module InvoiceIssuanceTests =
             let! forged =
                 expectRejected (
                     $"""INSERT INTO fsnix.invoices
-                           (invoice_id, order_id, snapshot_id, legal_entity, series, fiscal_period, number, issued_at,
+                           (invoice_id, order_id, snapshot_id, customer_id, legal_entity, series, fiscal_period, number, issued_at,
                             seller, buyer, billing_address, subtotal_amount, shipping_amount, tax_amount, total_amount,
                             currency, source_machine_id, source_command_id, source_ordinal)
-                       VALUES ('{InvoiceId.wireString other.InvoiceId}', '{other.OrderId}', '{InvoiceId.wireString other.InvoiceId}',
-                               'FSNIX', 'INV', '2026', 5, now(), '{{}}', '{{}}', '{{}}', 3, 5, 2, 10, 'USD', 'manual', 1, 0)"""
+                       VALUES ('{InvoiceId.wireString other.InvoiceId}', '{other.OrderId}', '{InvoiceId.wireString other.InvoiceId}', gen_random_uuid(),
+                               'FSNIX', 'INV', '2026-09', 5, now(), '{{}}', '{{}}', '{{}}', 3, 5, 2, 10, 'USD', 'manual', 1, 0)"""
                 )
 
             Assert.Equal("invoice number 5 was not allocated by its scope counter", forged)
+        }
+
+    let private fakeRenderer: InvoiceRenderer =
+        { Name = "test-v1"
+          Render =
+            fun document ->
+                Text.Encoding.UTF8.GetBytes(
+                    $"%%PDF-test {InvoiceNumber.display document.Number} {document.Lines.Length} {document.Total}"
+                ) }
+
+    let private issueAndNumber dataSource commandId request =
+        task {
+            let! issued = issue dataSource commandId request
+            Assert.Equal(Ok(), issued)
+            let! sequence = numberOf dataSource request
+
+            return
+                { Request = request
+                  Number =
+                    InvoiceNumber.create "FSNIX" "INV" "2026-09" sequence
+                    |> Result.defaultWith Assert.Fail }
+        }
+
+    let private render dataSource renderer commandId (issued: IssuedInvoice) =
+        InvoiceEffects.applyRender
+            dataSource
+            renderer
+            (actionRecord commandId issued.Request (RenderDocument issued))
+            CancellationToken.None
+
+    let ``rendering stores one content-addressed document per snapshot`` (fixture: PostgreSqlFixture) =
+        task {
+            use dataSource = AutomataStore.createDataSource fixture.ConnectionString
+            let! request = insertSnapshot dataSource [ line "10.00" 2; line "2.5" 1 ] 22.5m
+            let! issued = issueAndNumber dataSource 1L request
+
+            let! loaded = InvoiceDocuments.load dataSource request.InvoiceId CancellationToken.None
+
+            let document =
+                loaded
+                |> Option.defaultWith (fun () -> Assert.Fail "Expected the issued snapshot.")
+
+            Assert.Equal("INV-2026-09-00000001", InvoiceNumber.display document.Number)
+            Assert.Equal<string list>([ "Buyer"; "2 Road"; "Town 12345"; "US" ], document.BillingAddress)
+            Assert.Equal(2, document.Lines.Length)
+            Assert.Equal(29.5m, document.Total)
+
+            let! first = render dataSource fakeRenderer 2L issued
+            let! redelivered = render dataSource fakeRenderer 2L issued
+            let! rerun = render dataSource fakeRenderer 3L issued
+            Assert.Equal(Ok(), first)
+            Assert.Equal(Ok(), redelivered)
+            Assert.Equal(Ok(), rerun)
+
+            let! documents =
+                scalar
+                    dataSource
+                    "SELECT count(*) FROM fsnix.invoice_documents WHERE invoice_id=@invoice"
+                    (Some request)
+
+            Assert.Equal(1L, documents :?> int64)
+
+            let! stored = InvoiceQueries.tryDocument dataSource request.InvoiceId None CancellationToken.None
+
+            let stored =
+                stored
+                |> Option.defaultWith (fun () -> Assert.Fail "Expected a stored document.")
+
+            Assert.Equal<byte array>(fakeRenderer.Render document, stored.Content)
+
+            Assert.Equal(
+                Convert.ToHexStringLower(Security.Cryptography.SHA256.HashData(stored.Content: byte array)),
+                DocumentDigest.value stored.Digest
+            )
+
+            let! events = callbacks dataSource request
+
+            let rendered =
+                events
+                |> List.filter (function
+                    | DocumentRendered _ -> true
+                    | _ -> false)
+
+            Assert.Equal<InvoiceEvent list>(
+                [ DocumentRendered(request.InvoiceId, stored.Digest)
+                  DocumentRendered(request.InvoiceId, stored.Digest) ],
+                rendered
+            )
+
+            use connection = dataSource.CreateConnection()
+            do! connection.OpenAsync()
+
+            use update =
+                new NpgsqlCommand(
+                    "UPDATE fsnix.invoice_documents SET renderer='other' WHERE invoice_id=@invoice",
+                    connection
+                )
+
+            update.Parameters.AddWithValue("invoice", InvoiceId.value request.InvoiceId)
+            |> ignore
+
+            let! rejected = Assert.ThrowsAsync<PostgresException>(fun () -> update.ExecuteNonQueryAsync() :> Task)
+            Assert.Equal("invoice_documents is insert-only", rejected.MessageText)
+        }
+
+    let ``a failing renderer reports a bounded reason and stores nothing`` (fixture: PostgreSqlFixture) =
+        task {
+            use dataSource = AutomataStore.createDataSource fixture.ConnectionString
+            let! request = insertSnapshot dataSource [ line "3" 1 ] 3m
+            let! issued = issueAndNumber dataSource 1L request
+
+            let throwing =
+                { fakeRenderer with
+                    Render = fun _ -> raise (InvalidOperationException "secret provider detail") }
+
+            let! result = render dataSource throwing 2L issued
+            Assert.Equal(Ok(), result)
+
+            let! documents =
+                scalar
+                    dataSource
+                    "SELECT count(*) FROM fsnix.invoice_documents WHERE invoice_id=@invoice"
+                    (Some request)
+
+            Assert.Equal(0L, documents :?> int64)
+            let! events = callbacks dataSource request
+            Assert.Contains(events, (=) (DocumentRenderFailed(request.InvoiceId, ReasonCode.ofLiteral "render-failed")))
+
+            let! outbox = scalar dataSource "SELECT string_agg(event::text, ' ') FROM fsnix.integration_outbox" None
+            Assert.DoesNotContain("secret provider detail", outbox :?> string)
+
+            let! pending = InvoiceQueries.tryDocument dataSource request.InvoiceId None CancellationToken.None
+            Assert.True(pending.IsNone)
+            let! exists = InvoiceQueries.exists dataSource request.InvoiceId None CancellationToken.None
+            Assert.True(exists)
+        }
+
+    let ``invoice lists page by keyset and stay customer scoped`` (fixture: PostgreSqlFixture) =
+        task {
+            use dataSource = AutomataStore.createDataSource fixture.ConnectionString
+            let customer = Guid.NewGuid()
+            let otherCustomer = Guid.NewGuid()
+
+            let! mine =
+                [ 1..5 ]
+                |> List.map (fun _ -> insertSnapshotFor customer dataSource [ line "1" 1 ] 1m)
+                |> Task.WhenAll
+
+            let! theirs = insertSnapshotFor otherCustomer dataSource [ line "1" 1 ] 1m
+
+            for index, request in Array.indexed (Array.append mine [| theirs |]) do
+                let! issued = issue dataSource (int64 (index + 1)) request
+                Assert.Equal(Ok(), issued)
+
+            let rec pages before acc =
+                task {
+                    let! page = InvoiceQueries.list dataSource (Some customer) before 2 CancellationToken.None
+
+                    match page.Next with
+                    | Some next -> return! pages (Some next) (acc @ [ page.Rows ])
+                    | None -> return acc @ [ page.Rows ]
+                }
+
+            let! paged = pages None []
+            Assert.Equal<int list>([ 2; 2; 1 ], paged |> List.map List.length)
+
+            let ids = paged |> List.concat |> List.map _.InvoiceId
+            Assert.Equal(5, ids |> List.distinct |> List.length)
+
+            Assert.Equal<Set<InvoiceId>>(mine |> Array.map _.InvoiceId |> Set.ofArray, Set.ofList ids)
+
+            let! everyone = InvoiceQueries.list dataSource None None 50 CancellationToken.None
+            Assert.Equal(6, everyone.Rows.Length)
+            Assert.True(everyone.Next.IsNone)
+
+            let! foreign = InvoiceQueries.exists dataSource theirs.InvoiceId (Some customer) CancellationToken.None
+            Assert.False(foreign)
+            let! forOrder = InvoiceQueries.tryForOrder dataSource theirs.OrderId customer CancellationToken.None
+            Assert.True(forOrder.IsNone)
         }

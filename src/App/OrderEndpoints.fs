@@ -446,6 +446,13 @@ module OrderEndpoints =
                         let orders = context.GetService<OrderMachineClient>()
                         let! snapshot = Machine.state orders.Orders orderId context.RequestAborted
 
+                        let! invoice =
+                            InvoiceQueries.tryForOrder
+                                dataSource
+                                (EntityId.value orderId)
+                                user.Id
+                                context.RequestAborted
+
                         match snapshot with
                         | Ok(Some order) ->
                             let pay =
@@ -501,6 +508,11 @@ module OrderEndpoints =
                                   Pay = pay
                                   ReturnLines = returnLines
                                   ReturnStatuses = returnStatuses
+                                  Invoice =
+                                    invoice
+                                    |> Option.filter (fun (_, _, hasDocument) -> hasDocument)
+                                    |> Option.map (fun (id, number, _) ->
+                                        $"/invoices/{InvoiceId.wireString id}/pdf", InvoiceNumber.display number)
                                   Error = None }
 
                             return! context.WriteHtmlView(CheckoutViews.orderPage context model)

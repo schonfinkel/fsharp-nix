@@ -30,3 +30,4 @@ type InvoiceEffectHandler(dataSource: NpgsqlDataSource, issuer: InvoiceIssuer, t
         member _.HandleAsync(action: LeasedAction<InvoiceEntityId, InvoiceAction>, ct: CancellationToken) =
             match action.Work.Action with
             | IssueSnapshot _ -> InvoiceEffects.applyIssue dataSource issuer (timeProvider.GetUtcNow()) action.Work ct
+            | RenderDocument _ -> InvoiceEffects.applyRender dataSource InvoicePdf.renderer action.Work ct

@@ -22,7 +22,8 @@ module InvoiceWire =
           Series: string
           FiscalPeriod: string
           Sequence: int64
-          Reason: string }
+          Reason: string
+          Digest: string }
 
 [<RequireQualifiedAccess>]
 module InvoiceCodec =
@@ -40,7 +41,8 @@ module InvoiceCodec =
           Series = ""
           FiscalPeriod = ""
           Sequence = 0L
-          Reason = "" }
+          Reason = ""
+          Digest = "" }
 
     let private withRequest tag (request: InvoiceRequest) =
         { empty tag with
@@ -105,6 +107,13 @@ module InvoiceCodec =
             number name dto
             |> Result.map (fun number -> { Request = request; Number = number }))
 
+    let private digest name (dto: InvoiceWire.WireDto) =
+        DocumentDigest.create dto.Digest |> Result.mapError (error name)
+
+    let private reasoned name (dto: InvoiceWire.WireDto) make value =
+        CodecSupport.reason dto.Reason
+        |> Result.map (fun reason -> make (value, reason))
+
     let state: Codec<InvoiceState> =
         Codec.create
             (fun (state: InvoiceState) ->
@@ -112,7 +121,13 @@ module InvoiceCodec =
                     match state with
                     | Initial -> empty "initial-v1"
                     | SnapshotPending request -> withRequest "snapshot-pending-v1" request
-                    | Issued issued -> withIssued "issued-v1" issued
+                    | RenderPending issued -> withIssued "render-pending-v1" issued
+                    | Rendered(issued, value) ->
+                        { withIssued "rendered-v1" issued with
+                            Digest = DocumentDigest.value value }
+                    | RenderFailed(issued, reason) ->
+                        { withIssued "render-failed-v1" issued with
+                            Reason = ReasonCode.value reason }
                     | ManualReview(request, reason) ->
                         { withRequest "manual-review-v1" request with
                             Reason = ReasonCode.value reason }
@@ -125,7 +140,14 @@ module InvoiceCodec =
                     match dto.Tag with
                     | "initial-v1" -> Ok Initial
                     | "snapshot-pending-v1" -> request "InvoiceState" dto |> Result.map SnapshotPending
-                    | "issued-v1" -> issued "InvoiceState" dto |> Result.map Issued
+                    | "render-pending-v1" -> issued "InvoiceState" dto |> Result.map RenderPending
+                    | "rendered-v1" ->
+                        issued "InvoiceState" dto
+                        |> Result.bind (fun issued ->
+                            digest "InvoiceState" dto |> Result.map (fun value -> Rendered(issued, value)))
+                    | "render-failed-v1" ->
+                        issued "InvoiceState" dto
+                        |> Result.bind (reasoned "InvoiceState" dto RenderFailed)
                     | "manual-review-v1" ->
                         request "InvoiceState" dto
                         |> Result.bind (fun request ->
@@ -149,6 +171,15 @@ module InvoiceCodec =
                             InvoiceId = InvoiceId.wireString id
                             Reason = ReasonCode.value reason }
                     | IssuanceRetryRequested -> empty "issuance-retry-requested-v1"
+                    | DocumentRendered(id, value) ->
+                        { empty "document-rendered-v1" with
+                            InvoiceId = InvoiceId.wireString id
+                            Digest = DocumentDigest.value value }
+                    | DocumentRenderFailed(id, reason) ->
+                        { empty "document-render-failed-v1" with
+                            InvoiceId = InvoiceId.wireString id
+                            Reason = ReasonCode.value reason }
+                    | RenderRetryRequested -> empty "render-retry-requested-v1"
                     | CloseRequested -> empty "close-requested-v1"
 
                 encode "InvoiceEvent" dto)
@@ -168,17 +199,30 @@ module InvoiceCodec =
                             CodecSupport.reason dto.Reason
                             |> Result.map (fun reason -> IssuanceFailed(id, reason)))
                     | "issuance-retry-requested-v1" -> Ok IssuanceRetryRequested
+                    | "document-rendered-v1" ->
+                        invoiceId "InvoiceEvent" dto
+                        |> Result.bind (fun id ->
+                            digest "InvoiceEvent" dto
+                            |> Result.map (fun value -> DocumentRendered(id, value)))
+                    | "document-render-failed-v1" ->
+                        invoiceId "InvoiceEvent" dto
+                        |> Result.bind (reasoned "InvoiceEvent" dto DocumentRenderFailed)
+                    | "render-retry-requested-v1" -> Ok RenderRetryRequested
                     | "close-requested-v1" -> Ok CloseRequested
                     | _ -> Error(error "InvoiceEvent" "Unknown invoice event.")))
 
     let action: Codec<InvoiceAction> =
         Codec.create
-            (fun (IssueSnapshot request) -> encode "InvoiceAction" (withRequest "issue-snapshot-v1" request))
+            (fun (value: InvoiceAction) ->
+                match value with
+                | IssueSnapshot request -> encode "InvoiceAction" (withRequest "issue-snapshot-v1" request)
+                | RenderDocument issued -> encode "InvoiceAction" (withIssued "render-document-v1" issued))
             (fun json ->
                 decode "InvoiceAction" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
                     | "issue-snapshot-v1" -> request "InvoiceAction" dto |> Result.map IssueSnapshot
+                    | "render-document-v1" -> issued "InvoiceAction" dto |> Result.map RenderDocument
                     | _ -> Error(error "InvoiceAction" "Unknown invoice action.")))
 
     let actionError: Codec<InvoiceActionError> =

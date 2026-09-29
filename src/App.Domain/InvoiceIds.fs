@@ -28,8 +28,9 @@ module InvoiceId =
         | _ -> Error "An invoice id must be a GUID in D format."
 
 /// <summary>A legally gapless invoice number: a sequence scoped to legal entity, series and
-/// fiscal period. Allocated only inside the issuance transaction, never derived from
-/// <c>MAX(number)+1</c> or a database sequence.</summary>
+/// monthly fiscal period (<c>yyyy-MM</c>), displayed as <c>INV-2026-09-00000042</c>. Allocated only
+/// inside the issuance transaction, never derived from <c>MAX(number)+1</c> or a database
+/// sequence.</summary>
 type InvoiceNumber =
     private
         { legalEntity: string
@@ -47,6 +48,10 @@ module InvoiceNumber =
     [<Literal>]
     let MaxScopeLength = 16
 
+    /// <summary>Eight display digits per period.</summary>
+    [<Literal>]
+    let MaxSequence = 99999999L
+
     /// <summary>Scope components are upper-case ASCII letters, digits and inner hyphens, so a
     /// formatted number is unambiguous.</summary>
     let validScope (value: string) =
@@ -58,15 +63,25 @@ module InvoiceNumber =
         && value
            |> Seq.forall (fun c -> (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '-')
 
+    /// <summary>A calendar month, <c>yyyy-MM</c> with month 01-12.</summary>
+    let validFiscalPeriod (value: string) =
+        not (isNull value)
+        && value.Length = 7
+        && value[4] = '-'
+        && value
+           |> Seq.indexed
+           |> Seq.forall (fun (index, c) -> index = 4 || Char.IsAsciiDigit c)
+        && (let month = int value[5..6] in month >= 1 && month <= 12)
+
     let create legalEntity series fiscalPeriod sequence =
         if not (validScope legalEntity) then
             Error "An invoice legal entity must be a short upper-case code."
         elif not (validScope series) then
             Error "An invoice series must be a short upper-case code."
-        elif not (validScope fiscalPeriod) then
-            Error "An invoice fiscal period must be a short upper-case code."
-        elif sequence < 1L then
-            Error "An invoice sequence must be positive."
+        elif not (validFiscalPeriod fiscalPeriod) then
+            Error "An invoice fiscal period must be a month, yyyy-MM."
+        elif sequence < 1L || sequence > MaxSequence then
+            Error "An invoice sequence must be between 1 and 99999999."
         else
             Ok
                 { legalEntity = legalEntity
@@ -74,9 +89,9 @@ module InvoiceNumber =
                   fiscalPeriod = fiscalPeriod
                   sequence = sequence }
 
-    /// <summary>The customer-facing number, e.g. <c>INV-2026-000042</c>.</summary>
+    /// <summary>The customer-facing number, e.g. <c>INV-2026-09-00000042</c>.</summary>
     let display (number: InvoiceNumber) =
-        $"{number.Series}-{number.FiscalPeriod}-{number.Sequence:D6}"
+        $"{number.Series}-{number.FiscalPeriod}-{number.Sequence:D8}"
 
 /// <summary>An order's request for its invoice. The order id and snapshot id are both carried
 /// so issuance can verify the snapshot belongs to the requesting order.</summary>
@@ -99,3 +114,29 @@ module InvoiceRequest =
             Error "An invoice order id must match its order snapshot."
         else
             Ok request
+
+/// <summary>The SHA-256 of a stored invoice document, as 64 lowercase hex characters. It is the
+/// document's content address.</summary>
+[<Struct>]
+type DocumentDigest = private DocumentDigest of string
+
+[<RequireQualifiedAccess>]
+module DocumentDigest =
+    let create (text: string) =
+        if
+            not (isNull text)
+            && text.Length = 64
+            && text |> Seq.forall (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))
+        then
+            Ok(DocumentDigest text)
+        else
+            Error "A document digest must be a lowercase hex SHA-256."
+
+    let ofBytes (sha256: byte array) =
+        if isNull sha256 || sha256.Length <> 32 then
+            Error "A document digest must be 32 bytes."
+        else
+            Ok(DocumentDigest(Convert.ToHexStringLower sha256))
+
+    let value (DocumentDigest text) = text
+    let bytes (DocumentDigest text) = Convert.FromHexString text

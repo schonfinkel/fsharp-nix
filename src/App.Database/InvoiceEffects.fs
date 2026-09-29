@@ -32,9 +32,119 @@ module InvoiceIssuer =
         else
             Ok issuer
 
-    /// <summary>Fiscal periods are calendar years in UTC.</summary>
+    /// <summary>Fiscal periods are calendar months in UTC (<c>yyyy-MM</c>); each month's
+    /// numbering restarts at 1.</summary>
     let fiscalPeriod (issuedAt: DateTimeOffset) =
-        issuedAt.UtcDateTime.Year.ToString("D4", Globalization.CultureInfo.InvariantCulture)
+        issuedAt.UtcDateTime.ToString("yyyy-MM", Globalization.CultureInfo.InvariantCulture)
+
+/// <summary>One rendered invoice line, read back from the immutable snapshot.</summary>
+type InvoiceDocumentLine =
+    { Sku: string
+      Description: string
+      Quantity: int
+      UnitPrice: decimal
+      Amount: decimal }
+
+/// <summary>Everything a renderer needs, read from <c>fsnix.invoices</c>/<c>invoice_lines</c> only
+/// (never from mutable order or catalog state), so re-rendering reproduces the issued content.</summary>
+type InvoiceDocument =
+    { InvoiceId: InvoiceId
+      Number: InvoiceNumber
+      IssuedAt: DateTimeOffset
+      SellerName: string
+      SellerAddress: string
+      SellerTaxId: string
+      BuyerEmail: string
+      BillingAddress: string list
+      Lines: InvoiceDocumentLine list
+      Subtotal: decimal
+      Shipping: decimal
+      Tax: decimal
+      Total: decimal
+      Currency: string }
+
+/// <summary>A named PDF template. Bump <c>Name</c> whenever the output changes; stored documents
+/// keep the renderer that produced them.</summary>
+type InvoiceRenderer =
+    { Name: string
+      Render: InvoiceDocument -> byte array }
+
+[<RequireQualifiedAccess>]
+module InvoiceDocuments =
+    let private addressLines (json: string) =
+        use document = Text.Json.JsonDocument.Parse json
+        let root = document.RootElement
+
+        let field (name: string) =
+            match root.TryGetProperty name with
+            | true, value when value.ValueKind = Text.Json.JsonValueKind.String -> value.GetString()
+            | _ -> ""
+
+        [ field "recipient"
+          field "line1"
+          field "line2"
+          String.Join(" ", [ field "city"; field "region"; field "postalCode" ] |> List.filter ((<>) ""))
+          field "countryCode" ]
+        |> List.filter (not << String.IsNullOrWhiteSpace)
+
+    /// <summary>Loads the issued snapshot, or <c>None</c> when the invoice does not exist.</summary>
+    let load (dataSource: NpgsqlDataSource) (invoiceId: InvoiceId) (ct: CancellationToken) =
+        Execution.executeRead dataSource ct (fun connection token ->
+            task {
+                use header = new NpgsqlCommand(InvoiceSql.documentHeader, connection)
+
+                header.Parameters.AddWithValue("invoice", InvoiceId.value invoiceId) |> ignore
+                use! reader = header.ExecuteReaderAsync(token: CancellationToken)
+                let! found = reader.ReadAsync token
+
+                if not found then
+                    return None
+                else
+                    let number =
+                        InvoiceNumber.create
+                            (reader.GetString 0)
+                            (reader.GetString 1)
+                            (reader.GetString 2)
+                            (reader.GetInt64 3)
+                        |> Result.defaultWith invalidOp
+
+                    let document =
+                        { InvoiceId = invoiceId
+                          Number = number
+                          IssuedAt = reader.GetFieldValue<DateTimeOffset> 4
+                          SellerName = reader.GetString 5
+                          SellerAddress = reader.GetString 6
+                          SellerTaxId = reader.GetString 7
+                          BuyerEmail = reader.GetString 8
+                          BillingAddress = addressLines (reader.GetString 9)
+                          Lines = []
+                          Subtotal = reader.GetDecimal 10
+                          Shipping = reader.GetDecimal 11
+                          Tax = reader.GetDecimal 12
+                          Total = reader.GetDecimal 13
+                          Currency = reader.GetString 14 }
+
+                    do! reader.CloseAsync()
+
+                    use lines = new NpgsqlCommand(InvoiceSql.documentLines, connection)
+
+                    lines.Parameters.AddWithValue("invoice", InvoiceId.value invoiceId) |> ignore
+                    use! lineReader = lines.ExecuteReaderAsync(token: CancellationToken)
+                    let rows = Collections.Generic.List<InvoiceDocumentLine>()
+
+                    while! lineReader.ReadAsync token do
+                        rows.Add
+                            { Sku = lineReader.GetString 0
+                              Description = lineReader.GetString 1
+                              Quantity = lineReader.GetInt32 2
+                              UnitPrice = lineReader.GetDecimal 3
+                              Amount = lineReader.GetDecimal 4 }
+
+                    return
+                        Some
+                            { document with
+                                Lines = List.ofSeq rows }
+            })
 
 /// <summary>
 /// The invoice issuance transaction (PLAN "Issuance transaction"). One
@@ -48,6 +158,7 @@ module InvoiceEffects =
     let actionKind =
         function
         | IssueSnapshot _ -> "issue-invoice-snapshot"
+        | RenderDocument _ -> "render-invoice-document"
 
     let private invoiceError (result: Task<Result<'T, ReceiptFailure>>) =
         task {
@@ -62,12 +173,7 @@ module InvoiceEffects =
 
     let private tryExistingNumber (connection: NpgsqlConnection) tx (request: InvoiceRequest) ct =
         task {
-            use command =
-                new NpgsqlCommand(
-                    "SELECT order_id,legal_entity,series,fiscal_period,number FROM fsnix.invoices WHERE invoice_id=@invoice",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(InvoiceSql.existingNumber, connection, tx)
 
             command.Parameters.AddWithValue("invoice", InvoiceId.value request.InvoiceId)
             |> ignore
@@ -95,19 +201,7 @@ module InvoiceEffects =
     /// the subtotal. Returns the failure reason, if any.</summary>
     let private snapshotProblem (connection: NpgsqlConnection) tx (request: InvoiceRequest) ct =
         task {
-            use command =
-                new NpgsqlCommand(
-                    """SELECT s.order_id,
-                              s.total_amount = s.subtotal_amount + s.shipping_amount + s.tax_amount,
-                              (SELECT count(*) FROM jsonb_array_elements(s.lines)),
-                              (SELECT bool_and(l->>'currency' = s.currency AND (l->>'quantity')::int > 0)
-                                 FROM jsonb_array_elements(s.lines) l),
-                              (SELECT coalesce(sum((l->>'amount')::numeric * (l->>'quantity')::int), 0)
-                                 FROM jsonb_array_elements(s.lines) l) = s.subtotal_amount
-                       FROM fsnix.order_snapshots s WHERE s.snapshot_id=@snapshot""",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(InvoiceSql.snapshotCheck, connection, tx)
 
             command.Parameters.AddWithValue("snapshot", OrderSnapshotId.value request.SnapshotId)
             |> ignore
@@ -131,17 +225,7 @@ module InvoiceEffects =
     /// number. The row lock serializes concurrent issuers in the same scope until commit.</summary>
     let private allocate (connection: NpgsqlConnection) tx (issuer: InvoiceIssuer) fiscalPeriod ct =
         task {
-            use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.invoice_counters(legal_entity,series,fiscal_period)
-                       VALUES(@entity,@series,@period) ON CONFLICT DO NOTHING;
-                       UPDATE fsnix.invoice_counters
-                          SET last_number = last_number + 1, updated_at = STATEMENT_TIMESTAMP()
-                        WHERE legal_entity=@entity AND series=@series AND fiscal_period=@period
-                       RETURNING last_number""",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(InvoiceSql.allocateNumber, connection, tx)
 
             command.Parameters.AddWithValue("entity", issuer.LegalEntity) |> ignore
             command.Parameters.AddWithValue("series", issuer.Series) |> ignore
@@ -161,36 +245,7 @@ module InvoiceEffects =
         ct
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.invoices
-                           (invoice_id, order_id, snapshot_id, legal_entity, series, fiscal_period, number,
-                            issued_at, seller, buyer, billing_address,
-                            subtotal_amount, shipping_amount, tax_amount, total_amount, currency,
-                            source_machine_id, source_command_id, source_ordinal)
-                       SELECT @invoice, s.order_id, s.snapshot_id, @entity, @series, @period, @number,
-                              @issued_at,
-                              jsonb_build_object('legalEntity', @entity, 'name', @seller_name,
-                                                 'address', @seller_address, 'taxId', @seller_tax_id),
-                              jsonb_build_object('customerId', s.customer_id, 'email', s.customer_email),
-                              s.address,
-                              s.subtotal_amount, s.shipping_amount, s.tax_amount, s.total_amount, s.currency,
-                              @machine, @command, @ordinal
-                         FROM fsnix.order_snapshots s WHERE s.snapshot_id=@snapshot;
-                       INSERT INTO fsnix.invoice_lines
-                           (invoice_id, line_number, order_line_id, product_id, sku, description,
-                            unit_price, quantity, line_amount, currency)
-                       SELECT @invoice, l.n::int, (l.line->>'lineId')::uuid, (l.line->>'productId')::uuid,
-                              l.line->>'sku', l.line->>'name',
-                              (l.line->>'amount')::numeric, (l.line->>'quantity')::int,
-                              (l.line->>'amount')::numeric * (l.line->>'quantity')::int,
-                              l.line->>'currency'
-                         FROM fsnix.order_snapshots s,
-                              jsonb_array_elements(s.lines) WITH ORDINALITY AS l(line, n)
-                        WHERE s.snapshot_id=@snapshot""",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(InvoiceSql.insertSnapshot, connection, tx)
 
             command.Parameters.AddWithValue("invoice", InvoiceId.value request.InvoiceId)
             |> ignore
@@ -218,18 +273,23 @@ module InvoiceEffects =
             return ()
         }
 
-    let private report connection tx record (request: InvoiceRequest) event ct =
+    let private report connection tx record purpose (invoiceId: InvoiceId) event ct =
         WorkflowEffects.deliver
             connection
             tx
             record
-            "invoice-issuance"
+            purpose
             Invoices.MachineKey
-            (EntityId.value (Invoices.invoiceEntityId request.InvoiceId))
+            (EntityId.value (Invoices.invoiceEntityId invoiceId))
             InvoiceCodec.event
             event
             ct
         |> invoiceError
+
+    let private receipt record =
+        fun connection tx token ->
+            WorkflowEffects.receiptFor InvoiceCodec.action actionKind connection tx record token
+            |> invoiceError
 
     let applyIssue
         (dataSource: NpgsqlDataSource)
@@ -238,26 +298,23 @@ module InvoiceEffects =
         (record: ActionRecord<InvoiceEntityId, InvoiceAction>)
         (ct: CancellationToken)
         : Task<Result<unit, InvoiceActionError>> =
-        let (IssueSnapshot request) = record.Action
-
-        if
-            Result.isError (InvoiceRequest.validate request)
-            || Invoices.invoiceEntityId request.InvoiceId <> record.EntityId
-        then
-            Task.FromResult(Error InvoiceActionError.InvalidAction)
-        else
+        match record.Action with
+        | IssueSnapshot request when
+            Result.isOk (InvoiceRequest.validate request)
+            && Invoices.invoiceEntityId request.InvoiceId = record.EntityId
+            ->
             WorkflowEffects.runLocalEffect
                 dataSource
-                (fun connection tx token ->
-                    WorkflowEffects.receiptFor InvoiceCodec.action actionKind connection tx record token
-                    |> invoiceError)
+                (receipt record)
                 (fun connection tx token ->
                     task {
+                        let report = report connection tx record "invoice-issuance" request.InvoiceId
+
                         let failed reason =
-                            report connection tx record request (IssuanceFailed(request.InvoiceId, reason)) token
+                            report (IssuanceFailed(request.InvoiceId, reason)) token
 
                         let issued number =
-                            report connection tx record request (SnapshotIssued(request.InvoiceId, number)) token
+                            report (SnapshotIssued(request.InvoiceId, number)) token
 
                         match! tryExistingNumber connection tx request token with
                         | Some(Ok number) -> return! issued number
@@ -270,9 +327,73 @@ module InvoiceEffects =
                                 let! sequence = allocate connection tx issuer period token
 
                                 match InvoiceNumber.create issuer.LegalEntity issuer.Series period sequence with
+                                | Error _ when sequence > InvoiceNumber.MaxSequence ->
+                                    return! failed (ReasonCode.ofLiteral "invoice-sequence-exhausted")
                                 | Error _ -> return! failed (ReasonCode.ofLiteral "invoice-number-invalid")
                                 | Ok number ->
                                     do! insertSnapshot connection tx issuer record request number issuedAt token
                                     return! issued number
                     })
                 ct
+        | _ -> Task.FromResult(Error InvoiceActionError.InvalidAction)
+
+    /// <summary>
+    /// Renders the stored snapshot outside any transaction, then records the receipt, inserts the
+    /// content-addressed document and queues the result callback in one transaction. Rendering is
+    /// deterministic, so a redelivered action lands on the same <c>(invoice_id, sha256)</c> row.
+    /// A renderer exception is reported as a bounded <c>render-failed</c> reason, never its text.
+    /// </summary>
+    let applyRender
+        (dataSource: NpgsqlDataSource)
+        (renderer: InvoiceRenderer)
+        (record: ActionRecord<InvoiceEntityId, InvoiceAction>)
+        (ct: CancellationToken)
+        : Task<Result<unit, InvoiceActionError>> =
+        match record.Action with
+        | RenderDocument issued when Invoices.invoiceEntityId issued.Request.InvoiceId = record.EntityId ->
+            let invoiceId = issued.Request.InvoiceId
+
+            task {
+                let! document = InvoiceDocuments.load dataSource invoiceId ct
+
+                let outcome =
+                    match document with
+                    | None -> Error(ReasonCode.ofLiteral "invoice-missing")
+                    | Some document when document.Number <> issued.Number ->
+                        Error(ReasonCode.ofLiteral "invoice-number-mismatch")
+                    | Some document ->
+                        try
+                            match renderer.Render document with
+                            | bytes when isNull bytes || bytes.Length = 0 -> Error(ReasonCode.ofLiteral "render-empty")
+                            | bytes -> Ok bytes
+                        with _ ->
+                            Error(ReasonCode.ofLiteral "render-failed")
+
+                return!
+                    WorkflowEffects.runLocalEffect
+                        dataSource
+                        (receipt record)
+                        (fun connection tx token ->
+                            task {
+                                let report = report connection tx record "invoice-render" invoiceId
+
+                                match outcome with
+                                | Error reason -> return! report (DocumentRenderFailed(invoiceId, reason)) token
+                                | Ok bytes ->
+                                    let sha256 = Security.Cryptography.SHA256.HashData(bytes: byte array)
+
+                                    use insert = new NpgsqlCommand(InvoiceSql.insertDocument, connection, tx)
+
+                                    insert.Parameters.AddWithValue("invoice", InvoiceId.value invoiceId) |> ignore
+                                    insert.Parameters.AddWithValue("sha256", sha256) |> ignore
+                                    insert.Parameters.AddWithValue("renderer", renderer.Name) |> ignore
+                                    insert.Parameters.AddWithValue("content", bytes) |> ignore
+                                    insert.Parameters.AddWithValue("size", bytes.Length) |> ignore
+                                    let! _ = insert.ExecuteNonQueryAsync token
+
+                                    let digest = DocumentDigest.ofBytes sha256 |> Result.defaultWith invalidOp
+                                    return! report (DocumentRendered(invoiceId, digest)) token
+                            })
+                        ct
+            }
+        | _ -> Task.FromResult(Error InvoiceActionError.InvalidAction)

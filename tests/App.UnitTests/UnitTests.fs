@@ -1743,7 +1743,7 @@ module UnitTests =
         |> InvoiceRequest.forOrder
 
     let private invoiceNumber sequence =
-        InvoiceNumber.create "FSNIX" "INV" "2026" sequence
+        InvoiceNumber.create "FSNIX" "INV" "2026-09" sequence
         |> Result.defaultWith Assert.Fail
 
     let private expectInvoiceResolution state event =
@@ -1752,11 +1752,16 @@ module UnitTests =
         | Error error -> Assert.Fail $"Expected the invoice event to resolve, got %A{error}."
 
     let ``invoice numbers validate scope and format for display`` () =
-        Assert.Equal("INV-2026-000042", InvoiceNumber.display (invoiceNumber 42L))
-        Assert.True(Result.isError (InvoiceNumber.create "fsnix" "INV" "2026" 1L))
-        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "-INV" "2026" 1L))
-        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" "2026" 0L))
-        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" (String('A', 17)) "2026" 1L))
+        Assert.Equal("INV-2026-09-00000042", InvoiceNumber.display (invoiceNumber 42L))
+        Assert.Equal("INV-2026-09-99999999", InvoiceNumber.display (invoiceNumber 99999999L))
+        Assert.True(Result.isError (InvoiceNumber.create "fsnix" "INV" "2026-09" 1L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "-INV" "2026-09" 1L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" "2026-09" 0L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" "2026-09" 100000000L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" (String('A', 17)) "2026-09" 1L))
+
+        for period in [ "2026"; "2026-00"; "2026-13"; "2026-9"; "2026/09"; "26-09-01" ] do
+            Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" period 1L), period)
 
         let request = invoiceRequest ()
         Assert.True(Result.isOk (InvoiceRequest.validate request))
@@ -1795,14 +1800,55 @@ module UnitTests =
         let issued =
             expectInvoiceResolution requested.Next (App.Invoices.SnapshotIssued(request.InvoiceId, number))
 
-        Assert.Equal(App.Invoices.Issued { Request = request; Number = number }, issued.Next)
+        let issuedInvoice: App.Invoices.IssuedInvoice =
+            { Request = request; Number = number }
 
-        Assert.Empty(issued.Actions)
+        Assert.Equal(App.Invoices.RenderPending issuedInvoice, issued.Next)
+        Assert.Equal([ App.Invoices.RenderDocument issuedInvoice ], issued.Actions)
 
         let late =
             expectInvoiceResolution issued.Next (App.Invoices.SnapshotIssued(request.InvoiceId, invoiceNumber 8L))
 
         Assert.Equal(issued.Next, late.Next)
+
+        let digest =
+            DocumentDigest.create (String('a', 64)) |> Result.defaultWith Assert.Fail
+
+        let renderFailure = ReasonCode.ofLiteral "render-failed"
+
+        let staleRender =
+            expectInvoiceResolution issued.Next (App.Invoices.DocumentRendered(other.InvoiceId, digest))
+
+        Assert.Equal(issued.Next, staleRender.Next)
+
+        let renderFailed =
+            expectInvoiceResolution issued.Next (App.Invoices.DocumentRenderFailed(request.InvoiceId, renderFailure))
+
+        Assert.Equal(App.Invoices.RenderFailed(issuedInvoice, renderFailure), renderFailed.Next)
+
+        let rerender =
+            expectInvoiceResolution renderFailed.Next App.Invoices.RenderRetryRequested
+
+        Assert.Equal(App.Invoices.RenderPending issuedInvoice, rerender.Next)
+        Assert.Equal([ App.Invoices.RenderDocument issuedInvoice ], rerender.Actions)
+
+        let rendered =
+            expectInvoiceResolution rerender.Next (App.Invoices.DocumentRendered(request.InvoiceId, digest))
+
+        Assert.Equal(App.Invoices.Rendered(issuedInvoice, digest), rendered.Next)
+        Assert.Empty(rendered.Actions)
+
+        let duplicateRender =
+            expectInvoiceResolution rendered.Next (App.Invoices.DocumentRendered(request.InvoiceId, digest))
+
+        Assert.Equal(rendered.Next, duplicateRender.Next)
+
+        match Chart.resolve App.Invoices.Invoices.chartValue rendered.Next App.Invoices.RenderRetryRequested with
+        | Ok _ -> Assert.Fail "Retrying a rendered invoice must be rejected."
+        | Error _ -> ()
+
+        let closed = expectInvoiceResolution rendered.Next App.Invoices.CloseRequested
+        Assert.Equal(App.Invoices.Closed issuedInvoice, closed.Next)
 
         let reason = ReasonCode.ofLiteral "snapshot-missing"
 
@@ -1838,9 +1884,14 @@ module UnitTests =
             Assert.DoesNotContain("@", json)
             Assert.Equal(value, codec.Decode json |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}"))
 
+        let digest =
+            DocumentDigest.ofBytes (Array.init 32 byte) |> Result.defaultWith Assert.Fail
+
         [ App.Invoices.Initial
           App.Invoices.SnapshotPending request
-          App.Invoices.Issued issued
+          App.Invoices.RenderPending issued
+          App.Invoices.Rendered(issued, digest)
+          App.Invoices.RenderFailed(issued, reason)
           App.Invoices.ManualReview(request, reason)
           App.Invoices.Closed issued ]
         |> List.iter (roundTrip InvoiceCodec.state)
@@ -1849,10 +1900,22 @@ module UnitTests =
           App.Invoices.SnapshotIssued(request.InvoiceId, number)
           App.Invoices.IssuanceFailed(request.InvoiceId, reason)
           App.Invoices.IssuanceRetryRequested
+          App.Invoices.DocumentRendered(request.InvoiceId, digest)
+          App.Invoices.DocumentRenderFailed(request.InvoiceId, reason)
+          App.Invoices.RenderRetryRequested
           App.Invoices.CloseRequested ]
         |> List.iter (roundTrip InvoiceCodec.event)
 
         roundTrip InvoiceCodec.action (App.Invoices.IssueSnapshot request)
+        roundTrip InvoiceCodec.action (App.Invoices.RenderDocument issued)
+
+        let rendered =
+            InvoiceCodec.event.Encode(App.Invoices.DocumentRendered(request.InvoiceId, digest))
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+        Assert.True(
+            Result.isError (InvoiceCodec.event.Decode(rendered.Replace(DocumentDigest.value digest, String('Z', 64))))
+        )
 
         [ App.Invoices.InvoiceActionError.CallbackEncodingFailed
           App.Invoices.InvoiceActionError.ActionReceiptMismatch
@@ -1890,6 +1953,50 @@ module UnitTests =
 
         let text = Text.Encoding.Latin1.GetString first
         Assert.Contains("Lato", text)
+
+    let ``document digests are lowercase hex sha256`` () =
+        let digest =
+            DocumentDigest.ofBytes (Array.init 32 (fun index -> byte (index * 7)))
+            |> Result.defaultWith Assert.Fail
+
+        Assert.Equal(64, (DocumentDigest.value digest).Length)
+        Assert.Equal<byte array>(Array.init 32 (fun index -> byte (index * 7)), DocumentDigest.bytes digest)
+        Assert.True(Result.isError (DocumentDigest.create (String('A', 64))))
+        Assert.True(Result.isError (DocumentDigest.create (String('a', 63))))
+        Assert.True(Result.isError (DocumentDigest.ofBytes (Array.zeroCreate 31)))
+
+    let private sampleInvoiceDocument sequence : InvoiceDocument =
+        { InvoiceId =
+            InvoiceId.create (Guid.Parse "00000000-0000-0000-0000-00000000000a")
+            |> Result.defaultWith Assert.Fail
+          Number = invoiceNumber sequence
+          IssuedAt = DateTimeOffset(2026, 9, 29, 12, 0, 0, TimeSpan.Zero)
+          SellerName = "fsnix Store"
+          SellerAddress = "1 Example Street"
+          SellerTaxId = "TAX-1"
+          BuyerEmail = "buyer@example.test"
+          BillingAddress = [ "Buyer"; "2 Road"; "Town OR 97201"; "US" ]
+          Lines =
+            [ { Sku = "COFFEE-ESPRESSO"
+                Description = "Espresso Beans — Café Ação"
+                Quantity = 2
+                UnitPrice = 24.90m
+                Amount = 49.80m } ]
+          Subtotal = 49.80m
+          Shipping = 5m
+          Tax = 4.38m
+          Total = 59.18m
+          Currency = "USD" }
+
+    let ``invoice pdf is deterministic per snapshot`` () =
+        let first = InvoicePdf.render (sampleInvoiceDocument 42L)
+        let again = InvoicePdf.render (sampleInvoiceDocument 42L)
+        let other = InvoicePdf.render (sampleInvoiceDocument 43L)
+
+        Assert.True(Pdf.isPdf first, "Expected a PDF header.")
+        Assert.Equal<byte array>(first, again)
+        Assert.NotEqual<byte array>(first, other)
+        Assert.Equal("invoice-v1", InvoicePdf.renderer.Name)
 
     let tests =
         testList
@@ -2011,4 +2118,6 @@ module UnitTests =
                   ``invoice codecs round trip every case and reject unknown tags``
               testCase
                   "pdf renders deterministically with the shipped font"
-                  ``pdf renders deterministically with the shipped font only`` ]
+                  ``pdf renders deterministically with the shipped font only``
+              testCase "document digests are lowercase hex sha256" ``document digests are lowercase hex sha256``
+              testCase "invoice pdf is deterministic per snapshot" ``invoice pdf is deterministic per snapshot`` ]

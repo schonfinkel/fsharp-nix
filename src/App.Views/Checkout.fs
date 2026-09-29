@@ -129,6 +129,10 @@ module CheckoutViews =
                         button (type' = "submit") { "Request return" }
                     }
 
+                match model.Invoice with
+                | Some(url, number) -> p () { a (href = url) { $"Invoice {number} (PDF)" } }
+                | None -> ()
+
                 for (returnId, returnStatus) in model.ReturnStatuses do
                     p () { a (href = $"/returns/{returnId}") { $"Return {returnId}: {returnStatus}" } }
 

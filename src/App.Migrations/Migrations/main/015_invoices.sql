@@ -7,7 +7,7 @@ CREATE TABLE fsnix.invoice_counters (
     updated_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
     PRIMARY KEY (legal_entity, series, fiscal_period),
     CONSTRAINT ck_invoice_counters_last_number CHECK (last_number >= 0),
-    CONSTRAINT ck_invoice_counters_scope CHECK (legal_entity ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$' AND series ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$' AND fiscal_period ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$')
+    CONSTRAINT ck_invoice_counters_scope CHECK (legal_entity ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$' AND series ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$' AND fiscal_period ~ '^[0-9]{4}-(0[1-9]|1[0-2])$')
 );
 
 COMMENT ON TABLE fsnix.invoice_counters IS 'One row per numbering scope. A number is allocated only by incrementing this row inside the issuance transaction, so a rolled-back issuance never consumes a number. Never use MAX(number)+1 or a sequence.';
@@ -16,6 +16,7 @@ CREATE TABLE fsnix.invoices (
     invoice_id uuid PRIMARY KEY,
     order_id text NOT NULL,
     snapshot_id uuid NOT NULL REFERENCES fsnix.order_snapshots (snapshot_id),
+    customer_id uuid NOT NULL,
     legal_entity text NOT NULL,
     series text NOT NULL,
     fiscal_period text NOT NULL,
@@ -36,10 +37,14 @@ CREATE TABLE fsnix.invoices (
     CONSTRAINT uq_invoices_order UNIQUE (order_id),
     CONSTRAINT uq_invoices_number UNIQUE (legal_entity, series, fiscal_period, number),
     CONSTRAINT fk_invoices_counter FOREIGN KEY (legal_entity, series, fiscal_period) REFERENCES fsnix.invoice_counters (legal_entity, series, fiscal_period),
-    CONSTRAINT ck_invoices_number CHECK (number > 0),
+    CONSTRAINT ck_invoices_number CHECK (number BETWEEN 1 AND 99999999),
     CONSTRAINT ck_invoices_amounts CHECK (subtotal_amount >= 0 AND shipping_amount >= 0 AND tax_amount >= 0 AND total_amount = subtotal_amount + shipping_amount + tax_amount),
     CONSTRAINT ck_invoices_currency CHECK (currency ~ '^[A-Z]{3}$')
 );
+
+CREATE INDEX ix_invoices_customer ON fsnix.invoices (customer_id, issued_at DESC, invoice_id DESC);
+
+CREATE INDEX ix_invoices_issued ON fsnix.invoices (issued_at DESC, invoice_id DESC);
 
 COMMENT ON TABLE fsnix.invoices IS 'Insert-only legal invoice header. Seller, buyer and billing address are snapshotted at issuance; corrections are separate adjustment documents, never edits.';
 
@@ -60,6 +65,23 @@ CREATE TABLE fsnix.invoice_lines (
     CONSTRAINT ck_invoice_lines_amounts CHECK (unit_price >= 0 AND quantity > 0 AND line_amount = unit_price * quantity),
     CONSTRAINT ck_invoice_lines_currency CHECK (currency ~ '^[A-Z]{3}$')
 );
+
+-- Rendered PDFs, content-addressed and insert-only: a template change adds a new document under
+-- a new digest and renderer, it never rewrites an issued invoice's stored PDF.
+CREATE TABLE fsnix.invoice_documents (
+    invoice_id uuid NOT NULL REFERENCES fsnix.invoices (invoice_id),
+    sha256 bytea NOT NULL,
+    renderer text NOT NULL,
+    content bytea NOT NULL,
+    size integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    PRIMARY KEY (invoice_id, sha256),
+    CONSTRAINT ck_invoice_documents_sha256 CHECK (OCTET_LENGTH(sha256) = 32),
+    CONSTRAINT ck_invoice_documents_size CHECK (size > 0 AND size = OCTET_LENGTH(content)),
+    CONSTRAINT ck_invoice_documents_renderer CHECK (renderer ~ '^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$')
+);
+
+CREATE INDEX ix_invoice_documents_latest ON fsnix.invoice_documents (invoice_id, created_at DESC);
 
 -- An invoice may only take the number its scope counter currently holds. Issuance increments
 -- the counter and inserts in one transaction, so this rejects any number not allocated there
@@ -116,6 +138,16 @@ CREATE TRIGGER tr_invoice_lines_immutable
 
 CREATE TRIGGER tr_invoice_lines_no_truncate
     BEFORE TRUNCATE ON fsnix.invoice_lines
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION fsnix.reject_invoice_mutation ();
+
+CREATE TRIGGER tr_invoice_documents_immutable
+    BEFORE UPDATE OR DELETE ON fsnix.invoice_documents
+    FOR EACH ROW
+    EXECUTE FUNCTION fsnix.reject_invoice_mutation ();
+
+CREATE TRIGGER tr_invoice_documents_no_truncate
+    BEFORE TRUNCATE ON fsnix.invoice_documents
     FOR EACH STATEMENT
     EXECUTE FUNCTION fsnix.reject_invoice_mutation ();
 

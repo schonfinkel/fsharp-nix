@@ -13,6 +13,10 @@
     <PackageReference Include="SqlHydra.Query" Version="5.0.0" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Forward slashes on every OS so Sql.load names are stable. -->
+    <EmbeddedResource Include="Sql/**/*.sql" LogicalName="Sql/$([System.String]::Copy('%(RecursiveDir)').Replace('\','/'))%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
     <ProjectReference Include="..\App.Auth\App.Auth.fsproj" />
     <ProjectReference Include="..\App.Cart\App.Cart.fsproj" />
@@ -32,6 +36,7 @@
     <Compile Include="FeatureChangeSource.fs" />
     <Compile Include="AutomataStore.fs" />
     <Compile Include="Execution.fs" />
+    <Compile Include="Sql.fs" />
     <Compile Include="LeasedLedger.fs" />
     <Compile Include="CodecSupport.fs" />
     <Compile Include="AccountFlowCodec.fs" />
@@ -66,6 +71,7 @@
     <Compile Include="ReturnEffects.fs" />
     <Compile Include="ShipmentEffects.fs" />
     <Compile Include="InvoiceEffects.fs" />
+    <Compile Include="InvoiceQueries.fs" />
     <Compile Include="Services.fs" />
   </ItemGroup>
 </Project>

@@ -492,6 +492,10 @@ module Application =
                 route "/admin/operations" (Account.requireMfa OperationalHealthEndpoints.index)
                 route "/admin/catalog" (Account.requireMfa CatalogAdminEndpoints.index)
                 route "/admin/returns/{returnId}" (Account.requireMfa ReturnEndpoints.adminPage)
+                route "/invoices" (Account.requireAuthenticated InvoiceEndpoints.list)
+                route "/invoices/{invoiceId}/pdf" (Account.requireAuthenticated InvoiceEndpoints.customerPdf)
+                route "/admin/invoices" (Account.requireMfa InvoiceEndpoints.adminList)
+                route "/admin/invoices/{invoiceId}/pdf" (Account.requireMfa InvoiceEndpoints.adminPdf)
                 route "/admin/probe" (Account.requireMfa ProbeAdmin.index) ]
           POST
               [ route "/account/login" (Admin.requireValidAntiforgery Account.login)
@@ -552,6 +556,9 @@ module Application =
                     "/admin/features/{name}/schedule"
                     (Account.requireMfa (Admin.requireValidAntiforgery Admin.schedule))
                 route "/admin/probe/run" (Account.requireMfa (Admin.requireValidAntiforgery ProbeAdmin.run))
+                route
+                    "/admin/invoices/{invoiceId}/retry-render"
+                    (Account.requireMfa (Admin.requireValidAntiforgery InvoiceEndpoints.retryRender))
                 route
                     "/admin/orders/{orderId}/ship"
                     (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.ship))

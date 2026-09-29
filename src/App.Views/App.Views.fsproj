@@ -23,5 +23,6 @@
     <Compile Include="Catalog.fs" />
     <Compile Include="Cart.fs" />
     <Compile Include="Checkout.fs" />
+    <Compile Include="Invoices.fs" />
   </ItemGroup>
 </Project>

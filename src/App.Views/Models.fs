@@ -167,12 +167,33 @@ type ReturnLineModel =
       ReturnKey: string }
 
 type OrderStatusModel =
-    { OrderId: string
-      Status: string
-      Total: string
-      CanCancel: bool
-      TooLateToCancel: bool
-      Pay: OrderPayModel option
-      ReturnLines: ReturnLineModel list
-      ReturnStatuses: (string * string) list
-      Error: string option }
+    {
+        OrderId: string
+        Status: string
+        Total: string
+        CanCancel: bool
+        TooLateToCancel: bool
+        Pay: OrderPayModel option
+        ReturnLines: ReturnLineModel list
+        ReturnStatuses: (string * string) list
+        /// <summary>Download URL and display number, once the invoice PDF is stored.</summary>
+        Invoice: (string * string) option
+        Error: string option
+    }
+
+type InvoiceRowModel =
+    {
+        Number: string
+        IssuedOn: string
+        Total: string
+        OrderId: string
+        Status: string
+        DownloadUrl: string option
+        /// <summary>Operator retry form: post URL and a fresh idempotency key.</summary>
+        Retry: (string * string) option
+    }
+
+type InvoiceListModel =
+    { Title: string
+      Rows: InvoiceRowModel list
+      OlderUrl: string option }

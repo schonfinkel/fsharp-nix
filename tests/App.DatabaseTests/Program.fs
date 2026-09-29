@@ -122,7 +122,13 @@ let private tests =
                 DatabaseTest.isolated false "concurrent issuers share one sequence" (fun fixture ->
                     InvoiceIssuanceTests.``concurrent issuers share one gapless sequence`` fixture)
                 DatabaseTest.isolated false "invoice rows are insert-only" (fun fixture ->
-                    InvoiceIssuanceTests.``invoice rows are insert-only and numbers must be allocated`` fixture) ] ]
+                    InvoiceIssuanceTests.``invoice rows are insert-only and numbers must be allocated`` fixture)
+                DatabaseTest.isolated false "rendering stores one document" (fun fixture ->
+                    InvoiceIssuanceTests.``rendering stores one content-addressed document per snapshot`` fixture)
+                DatabaseTest.isolated false "failing renderer stores nothing" (fun fixture ->
+                    InvoiceIssuanceTests.``a failing renderer reports a bounded reason and stores nothing`` fixture)
+                DatabaseTest.isolated false "invoice lists page and scope" (fun fixture ->
+                    InvoiceIssuanceTests.``invoice lists page by keyset and stay customer scoped`` fixture) ] ]
     |> testSequenced
 
 [<EntryPoint>]
