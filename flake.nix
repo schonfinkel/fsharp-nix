@@ -45,6 +45,16 @@
           app_name = "fsnix";
           net10 = pkgs.dotnet-sdk_10;
           version = "1.0.0";
+
+          # Shared libraries the QuestPDF native binaries (libQuestPdfSkia.so, libqpdf.so) need
+          # beyond glibc, from `patchelf --print-needed` on the linux-x64/arm64 runtimes of
+          # QuestPDF 2026.9.1. Re-check on every QuestPDF bump. No fontconfig/freetype: fonts are
+          # the Lato family QuestPDF ships beside the app, never system fonts.
+          questpdfLibs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.stdenv.cc.cc.lib
+            pkgs.zlib
+          ];
+
           app = pkgs.buildDotnetModule {
             pname = app_name;
             inherit version;
@@ -69,6 +79,11 @@
             dotnet-runtime = pkgs.dotnet-aspnetcore_10;
             executables = [ "App" ];
             doCheck = false;
+
+            # Gives the prebuilt QuestPDF .so files a Nix rpath; fails the build if a needed
+            # library is unresolved instead of failing at runtime with DllNotFoundException.
+            nativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ];
+            buildInputs = questpdfLibs;
           };
         in
         {
@@ -85,6 +100,12 @@
               name = app_name;
               tag = version;
               contents = [ pkgs.cacert ];
+              # A writable, sticky /tmp: .NET and QuestPDF (TemporaryStoragePath) need one, and the
+              # image otherwise has none. The Nix sandbox always provides a TMPDIR, so only
+              # `docker run ... --render-check` against this image exercises it.
+              extraCommands = ''
+                mkdir -m 1777 tmp
+              '';
               config = {
                 Entrypoint = [ "${app}/bin/App" ];
                 User = "65532:65532";
@@ -97,7 +118,17 @@
             };
           };
 
-          checks.application = app;
+          checks = {
+            application = app;
+
+            # OCI font check: the build sandbox, like the image, has no /etc/fonts and no
+            # fontconfig, so this proves the patched native library and the shipped fonts load.
+            pdf-render = pkgs.runCommand "${app_name}-pdf-render" { } ''
+              export HOME=$TMPDIR
+              ${app}/bin/App --render-check
+              touch $out
+            '';
+          };
 
           # nix fmt + nix flake check (auto-wired by flakeModule)
           treefmt = {
@@ -126,7 +157,11 @@
                 pkgs.gnumake
               ];
 
+              # `dotnet run`/tests load the unpatched QuestPDF .so files from the NuGet cache.
+              LD_LIBRARY_PATH = lib.makeLibraryPath questpdfLibs;
+
               shellHook = ''
+                export TMPDIR="$(mktemp -d /tmp/nix-shell-XXXXXX)"
                 echo "Entering CI shell..."
                 dotnet --info
               '';
@@ -248,7 +283,12 @@
               run-app.exec = "dotnet run --project src/App/App.fsproj";
             };
 
+            # `dotnet run`/tests load the unpatched QuestPDF .so files from the NuGet cache.
+            # Prepended here rather than via `env`, which devenv's dotnet module already sets
+            # (ICU) and would conflict.
             enterShell = ''
+              export LD_LIBRARY_PATH="${lib.makeLibraryPath questpdfLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export TMPDIR="$(mktemp -d /tmp/nix-shell-XXXXXX)"
               echo "Starting Development Environment..."
             '';
 

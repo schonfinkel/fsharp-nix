@@ -572,6 +572,7 @@ module Application =
                     (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.release)) ] ]
 
     let create (args: string array) =
+        Pdf.configure ()
         let builder = createBuilder args
         configureServices builder
         let app = builder.Build()
@@ -630,8 +631,26 @@ module Program =
         task {
             let migrateOnly = args |> Array.contains "--migrate"
             let bootstrapOnly = args |> Array.contains "--bootstrap-user"
+            let renderCheckOnly = args |> Array.contains "--render-check"
 
-            if migrateOnly then
+            if renderCheckOnly then
+                // Needs no database or configuration: proves the QuestPDF native library and the
+                // shipped fonts load in this environment (the flake's pdf-render check and the OCI
+                // image run exactly this).
+                try
+                    let pdf = Pdf.renderSample ()
+
+                    if Pdf.isPdf pdf then
+                        printfn "PDF render check succeeded (%d bytes)." pdf.Length
+                        return 0
+                    else
+                        eprintfn "PDF render check produced invalid output."
+                        return 1
+                with error ->
+                    eprintfn "PDF render check failed: %s" (error.GetType().FullName)
+                    eprintfn "%O" error
+                    return 1
+            elif migrateOnly then
                 let builder = Application.createBuilder args
                 use app = builder.Build()
                 let connection = Application.connectionString app.Configuration

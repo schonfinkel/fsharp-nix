@@ -20,7 +20,7 @@ PROJECT_FILES := $(wildcard src/*/*.fsproj tests/*/*.fsproj)
 RESTORE_INPUTS := Makefile $(SOLUTION) global.json $(PROJECT_FILES) \
 	$(wildcard Directory.Build.* Directory.Packages.* NuGet.Config)
 
-.PHONY: build test test-unit test-integration test-database test-http migrate run totp db schema-generate schema-check nix-lock
+.PHONY: build test test-unit test-integration test-database test-http migrate run totp db schema-generate schema-check nix-lock oci-check
 
 build:
 	$(DOTNET) build $(SOLUTION) -m:1
@@ -67,3 +67,10 @@ deps.json: $(RESTORE_INPUTS)
 	$(DOTNET) restore --packages $(NUGET_PACKAGES_DIR) -m:1
 	$(NIX) run '$(NUGET_TO_JSON)' -- $(NUGET_PACKAGES_DIR) > $@.tmp
 	mv $@.tmp $@
+
+# Renders a PDF inside the OCI image itself: the flake's pdf-render check runs in the Nix
+# sandbox, which always has a TMPDIR, so only this exercises the image's own filesystem.
+oci-check:
+	$(NIX) build .\#oci -o out/oci-image
+	docker load < out/oci-image
+	docker run --rm $(PROJECT_NAME):1.0.0 --render-check

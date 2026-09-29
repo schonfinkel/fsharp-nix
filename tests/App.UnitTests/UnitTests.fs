@@ -1880,6 +1880,17 @@ module UnitTests =
 
         Assert.True(Result.isError (InvoiceCodec.action.Decode mismatched))
 
+    let ``pdf renders deterministically with the shipped font only`` () =
+        let first = Pdf.renderSample ()
+        let second = Pdf.renderSample ()
+
+        Assert.True(Pdf.isPdf first, "Expected a PDF header.")
+        Assert.Equal<byte array>(first, second)
+        Assert.False(QuestPDF.Settings.UseSystemFonts)
+
+        let text = Text.Encoding.Latin1.GetString first
+        Assert.Contains("Lato", text)
+
     let tests =
         testList
             "unit"
@@ -1997,4 +2008,7 @@ module UnitTests =
                   ``invoice chart issues once and parks failures for operator retry``
               testCase
                   "invoice codecs round trip and reject unknown tags"
-                  ``invoice codecs round trip every case and reject unknown tags`` ]
+                  ``invoice codecs round trip every case and reject unknown tags``
+              testCase
+                  "pdf renders deterministically with the shipped font"
+                  ``pdf renders deterministically with the shipped font only`` ]
