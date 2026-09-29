@@ -32,6 +32,7 @@
     <Compile Include="FeatureFlags.fs" />
     <Compile Include="FeatureEvents.fs" />
     <Compile Include="Web.fs" />
+    <Compile Include="HttpErrors.fs" />
     <Compile Include="Demo.fs" />
     <Compile Include="Account.fs" />
     <Compile Include="Bootstrap.fs" />
@@ -43,6 +44,7 @@
     <Compile Include="Admin.fs" />
     <Compile Include="Migrations.fs" />
     <Compile Include="MachineClients.fs" />
+    <Compile Include="Scanners.fs" />
     <Compile Include="Health.fs" />
     <Compile Include="OperationalHealth.fs" />
     <Compile Include="AccountFlowEndpoints.fs" />

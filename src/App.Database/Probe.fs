@@ -49,6 +49,11 @@ module Probe =
     [<Literal>]
     let ActionQueue = "probe_actions"
 
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
+
     let initialProbeState = { Phase = Idle; Runs = 0 }
 
     let private codecOptions =
@@ -141,7 +146,7 @@ module Probe =
     let private build (log: ILogger) storeArg =
         machine<ProbeId, ProbeState, ProbeEvent, ProbeAction, ProbeActionError> (machineId MachineKey) {
             chart chartValue
-            chartVersion 2
+            chartVersion ChartVersion
             initialState initialProbeState
             store storeArg
             logger log

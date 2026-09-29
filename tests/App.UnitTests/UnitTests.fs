@@ -185,7 +185,7 @@ module UnitTests =
 
         match
             AccountFlowCodec.event.Decode
-                "{\"tag\":\"notification-queued-v2\",\"generation\":1,\"token\":\"must-not-persist\"}"
+                "{\"tag\":\"notification-queued-v1\",\"generation\":1,\"token\":\"must-not-persist\"}"
         with
         | Error _ -> ()
         | Ok value -> Assert.Fail $"An unknown secret-bearing property decoded as %A{value}."
@@ -248,47 +248,47 @@ module UnitTests =
             Assert.Equal(resentAwaiting, (expectResolution resentAwaiting stale).Next)
 
     let ``flow codecs version notification callbacks with their generation`` () =
-        let golden = "{\"tag\":\"notification-sent-v2\",\"generation\":2}"
+        let golden = "{\"tag\":\"notification-sent-v1\",\"generation\":2}"
 
         Assert.Equal(Ok golden, AccountFlowCodec.event.Encode(NotificationSent 2))
         Assert.Equal(Ok(NotificationSent 2), AccountFlowCodec.event.Decode golden)
 
         Assert.Equal(
-            Ok "{\"tag\":\"notification-queued-v2\",\"generation\":1}",
+            Ok "{\"tag\":\"notification-queued-v1\",\"generation\":1}",
             AccountFlowCodec.event.Encode(NotificationQueued 1)
         )
 
         Assert.Equal(
-            Ok "{\"tag\":\"notification-send-failed-v2\",\"generation\":3}",
+            Ok "{\"tag\":\"notification-send-failed-v1\",\"generation\":3}",
             AccountFlowCodec.event.Encode(NotificationSendFailed 3)
         )
 
-        match AccountFlowCodec.event.Decode "{\"tag\":\"notification-sent-v2\",\"generation\":0}" with
+        match AccountFlowCodec.event.Decode "{\"tag\":\"notification-sent-v1\",\"generation\":0}" with
         | Error _ -> ()
         | Ok value -> Assert.Fail $"A generation below one decoded as %A{value}."
 
         match AccountFlowCodec.event.Decode "{\"tag\":\"notification-sent-v1\"}" with
         | Error _ -> ()
-        | Ok value -> Assert.Fail $"A superseded generation-less tag decoded as %A{value}."
+        | Ok value -> Assert.Fail $"A generation-less payload decoded as %A{value}."
 
     let ``flow action codec carries a validated generation`` () =
         Assert.Equal(
-            Ok "{\"tag\":\"send-notification-v2\",\"generation\":2}",
+            Ok "{\"tag\":\"send-notification-v1\",\"generation\":2}",
             AccountFlowCodec.action.Encode(SendNotification 2)
         )
 
         Assert.Equal(
             Ok(SendNotification 2),
-            AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v2\",\"generation\":2}"
+            AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v1\",\"generation\":2}"
         )
 
-        match AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v2\",\"generation\":0}" with
+        match AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v1\",\"generation\":0}" with
         | Error _ -> ()
         | Ok value -> Assert.Fail $"A generation below one decoded as %A{value}."
 
         match AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v1\"}" with
         | Error _ -> ()
-        | Ok value -> Assert.Fail $"A superseded action tag decoded as %A{value}."
+        | Ok value -> Assert.Fail $"A generation-less action decoded as %A{value}."
 
     let ``capabilities are 256-bit scoped keyed hashes`` () =
         let key =
@@ -621,11 +621,11 @@ module UnitTests =
 
         let event = OrderSubmitted pending
         let json = OrderCodec.event.Encode event |> Result.defaultWith string
-        Assert.Contains("\"tag\":\"order-submitted-v2\"", json)
+        Assert.Contains("\"tag\":\"order-submitted-v1\"", json)
         Assert.Equal(Ok event, OrderCodec.event.Decode json)
         let state = ReservationPending pending
         Assert.Equal(Ok state, OrderCodec.state.Encode state |> Result.bind OrderCodec.state.Decode)
-        Assert.True(Result.isError (OrderCodec.event.Decode "{\"tag\":\"unknown-v2\"}"))
+        Assert.True(Result.isError (OrderCodec.event.Decode "{\"tag\":\"unknown-v1\"}"))
         Assert.True(Result.isError (OrderCodec.event.Decode "{\"tag\":\"order-submitted-v1\"}"))
 
     let private makeAuthorizationAttempt () : AuthorizationAttempt =
@@ -736,7 +736,7 @@ module UnitTests =
         Assert.Equal([ CommitStock reserved.ReservationIds ], authorized.Actions)
 
         let declined =
-            expectOrderResolution pending (PaymentDeclined(attempt, "do-not-honor"))
+            expectOrderResolution pending (PaymentDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
         Assert.Equal(AwaitingAuthorization reserved, declined.Next)
         Assert.Empty(declined.Actions)
@@ -753,7 +753,7 @@ module UnitTests =
             PaymentOperationId.create "authorize:v1:two" |> Result.defaultWith Assert.Fail
 
         expectOrderAbsorbed pending (PaymentAuthorized(stale, "sim-stale"))
-        expectOrderAbsorbed pending (PaymentDeclined(stale, "do-not-honor"))
+        expectOrderAbsorbed pending (PaymentDeclined(stale, (ReasonCode.ofLiteral "do-not-honor")))
 
     let ``stock commitment places the order`` () =
         let reserved = reservedOrder ()
@@ -790,7 +790,7 @@ module UnitTests =
 
         Assert.Equal(
             [ ReleaseReservations reserved.ReservationIds
-              RequestPaymentCancellation "customer-cancelled" ],
+              RequestPaymentCancellation(ReasonCode.ofLiteral "customer-cancelled") ],
             cancelling.Actions
         )
 
@@ -824,7 +824,7 @@ module UnitTests =
                 .Next
 
         expectOrderAbsorbed cancelling (PaymentAuthorized(attempt, "sim-late"))
-        expectOrderAbsorbed cancelling (PaymentDeclined(attempt, "do-not-honor"))
+        expectOrderAbsorbed cancelling (PaymentDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
     let ``payment chart authorizes notifies and voids`` () =
         let attempt = makeAuthorizationAttempt ()
@@ -859,7 +859,7 @@ module UnitTests =
         let voiding =
             expectPaymentResolution
                 authorized.Next
-                (PaymentCancellationRequested(attempt.OrderId, "customer-cancelled"))
+                (PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         Assert.Equal(
             VoidPending
@@ -892,7 +892,9 @@ module UnitTests =
             expectPaymentResolution Payments.initialState (AuthorizeRequested attempt)
 
         let cancelling =
-            expectPaymentResolution started.Next (PaymentCancellationRequested(attempt.OrderId, "customer-cancelled"))
+            expectPaymentResolution
+                started.Next
+                (PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         match cancelling.Next with
         | AuthorizationPending pending -> Assert.True(pending.CancelRequested)
@@ -918,7 +920,9 @@ module UnitTests =
          | _ -> Assert.Fail "expected void pending")
 
         let declined =
-            expectPaymentResolution cancelling.Next (AuthorizationDeclined(attempt, "do-not-honor"))
+            expectPaymentResolution
+                cancelling.Next
+                (AuthorizationDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
         Assert.Equal(CancelledWithoutCharge, declined.Next)
         Assert.Equal([ NotifyOrderCancelled attempt.OrderId ], declined.Actions)
@@ -942,7 +946,9 @@ module UnitTests =
         Assert.Empty(parked.Actions)
 
         let cancelling =
-            expectPaymentResolution parked.Next (PaymentCancellationRequested(attempt.OrderId, "customer-cancelled"))
+            expectPaymentResolution
+                parked.Next
+                (PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         Assert.Equal(
             AuthorizationUnknown
@@ -957,7 +963,9 @@ module UnitTests =
         let orderId = $"order:{Guid.NewGuid():D}"
 
         let closed =
-            expectPaymentResolution Payments.initialState (PaymentCancellationRequested(orderId, "customer-cancelled"))
+            expectPaymentResolution
+                Payments.initialState
+                (PaymentCancellationRequested(orderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         Assert.Equal(CancelledWithoutCharge, closed.Next)
         Assert.Equal([ NotifyOrderCancelled orderId ], closed.Actions)
@@ -969,9 +977,9 @@ module UnitTests =
             expectPaymentResolution Payments.initialState (AuthorizeRequested attempt)
 
         let declined =
-            expectPaymentResolution started.Next (AuthorizationDeclined(attempt, "do-not-honor"))
+            expectPaymentResolution started.Next (AuthorizationDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
-        Assert.Equal(Declined "do-not-honor", declined.Next)
+        Assert.Equal(Declined(ReasonCode.ofLiteral "do-not-honor"), declined.Next)
 
         let retried =
             expectPaymentResolution
@@ -990,7 +998,7 @@ module UnitTests =
 
         let request = AuthorizeRequested attempt
         let json = PaymentCodec.event.Encode request |> Result.defaultWith string
-        Assert.Contains("\"tag\":\"authorize-requested-v2\"", json)
+        Assert.Contains("\"tag\":\"authorize-requested-v1\"", json)
         Assert.Equal(Ok request, PaymentCodec.event.Decode json)
 
         let authorized =
@@ -1001,7 +1009,9 @@ module UnitTests =
 
         Assert.Equal(Ok authorized, PaymentCodec.state.Encode authorized |> Result.bind PaymentCodec.state.Decode)
 
-        let cancel = PaymentCancellationRequested(attempt.OrderId, "customer-cancelled")
+        let cancel =
+            PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled"))
+
         Assert.Equal(Ok cancel, PaymentCodec.event.Encode cancel |> Result.bind PaymentCodec.event.Decode)
 
         let notify = NotifyOrderCancelled attempt.OrderId
@@ -1021,19 +1031,19 @@ module UnitTests =
         let events =
             [ AuthorizeRequested attempt
               AuthorizationSucceeded(attempt, "sim-abc123", expiry)
-              AuthorizationDeclined(attempt, "do-not-honor")
+              AuthorizationDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor"))
               AuthorizationOutcomeUnknown attempt
-              PaymentCancellationRequested(attempt.OrderId, "customer-cancelled")
+              PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled"))
               VoidSucceeded authorized
               VoidOutcomeUnknown authorized
-              MarkManualReview "reconciliation-exhausted" ]
+              MarkManualReview(ReasonCode.ofLiteral "reconciliation-exhausted") ]
 
         let actions =
             [ CallGatewayAuthorize attempt
               QueryGatewayAuthorization attempt
               CallGatewayVoid authorized
               NotifyOrderAuthorized authorized
-              NotifyOrderDeclined(attempt, "do-not-honor")
+              NotifyOrderDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor"))
               NotifyOrderCancelled attempt.OrderId
               NotifyOrderVoided authorized ]
 
@@ -1650,7 +1660,7 @@ module UnitTests =
             expectReturnResolution inspected.Next (App.Returns.ReturnEvent.RestockCompleted request.ReturnId)
 
         let refunding =
-            expectReturnResolution restocked.Next App.Returns.ReturnEvent.CloseRequested
+            expectReturnResolution restocked.Next App.Returns.ReturnEvent.RefundStartRequested
 
         let refundId =
             match refunding.Next with

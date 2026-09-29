@@ -85,43 +85,49 @@ module RefundCodec =
             (fun (state: RefundState) ->
                 let dto =
                     match state with
-                    | Initial -> empty "initial"
-                    | AllocationPending r -> withRequest "allocation-pending" r
-                    | PendingGateway a -> withApproval "pending-gateway" a
-                    | OutcomeUnknown a -> withApproval "outcome-unknown" a
+                    | Initial -> empty "initial-v1"
+                    | AllocationPending r -> withRequest "allocation-pending-v1" r
+                    | PendingGateway a -> withApproval "pending-gateway-v1" a
+                    | OutcomeUnknown a -> withApproval "outcome-unknown-v1" a
                     | SettlementPending(a, reference) ->
-                        { withApproval "settlement-pending" a with
+                        { withApproval "settlement-pending-v1" a with
                             ProviderRefundReference = reference }
-                    | Succeeded r -> withRequest "succeeded" r
+                    | Succeeded r -> withRequest "succeeded-v1" r
                     | Failed(r, reason) ->
-                        { withRequest "failed" r with
-                            Reason = reason }
+                        { withRequest "failed-v1" r with
+                            Reason = ReasonCode.value reason }
                     | ManualReview(r, reason) ->
-                        { withRequest "manual-review" r with
-                            Reason = reason }
-                    | Closed r -> withRequest "closed" r
+                        { withRequest "manual-review-v1" r with
+                            Reason = ReasonCode.value reason }
+                    | Closed r -> withRequest "closed-v1" r
 
                 encode "RefundState" dto)
             (fun json ->
                 decode "RefundState" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "initial" -> Ok Initial
-                    | "allocation-pending" -> request "RefundState" dto |> Result.map AllocationPending
-                    | "pending-gateway" -> approved "RefundState" dto |> Result.map PendingGateway
-                    | "outcome-unknown" -> approved "RefundState" dto |> Result.map OutcomeUnknown
-                    | "settlement-pending" ->
+                    | "initial-v1" -> Ok Initial
+                    | "allocation-pending-v1" -> request "RefundState" dto |> Result.map AllocationPending
+                    | "pending-gateway-v1" -> approved "RefundState" dto |> Result.map PendingGateway
+                    | "outcome-unknown-v1" -> approved "RefundState" dto |> Result.map OutcomeUnknown
+                    | "settlement-pending-v1" ->
                         approved "RefundState" dto
                         |> Result.bind (fun a ->
                             if String.IsNullOrWhiteSpace dto.ProviderRefundReference then
                                 Error(error "RefundState" "Missing refund reference.")
                             else
                                 Ok(SettlementPending(a, dto.ProviderRefundReference)))
-                    | "succeeded" -> request "RefundState" dto |> Result.map Succeeded
-                    | "failed" -> request "RefundState" dto |> Result.map (fun r -> Failed(r, dto.Reason))
-                    | "manual-review" ->
-                        request "RefundState" dto |> Result.map (fun r -> ManualReview(r, dto.Reason))
-                    | "closed" -> request "RefundState" dto |> Result.map Closed
+                    | "succeeded-v1" -> request "RefundState" dto |> Result.map Succeeded
+                    | "failed-v1" ->
+                        request "RefundState" dto
+                        |> Result.bind (fun r ->
+                            CodecSupport.reason dto.Reason |> Result.map (fun reason -> Failed(r, reason)))
+                    | "manual-review-v1" ->
+                        request "RefundState" dto
+                        |> Result.bind (fun r ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> ManualReview(r, reason)))
+                    | "closed-v1" -> request "RefundState" dto |> Result.map Closed
                     | _ -> Error(error "RefundState" "Unknown refund state.")))
 
     let event: Codec<RefundEvent> =
@@ -129,49 +135,54 @@ module RefundCodec =
             (fun (value: RefundEvent) ->
                 let dto =
                     match value with
-                    | RefundRequested r -> withRequest "requested" r
-                    | AllocationApproved a -> withApproval "allocation-approved" a
+                    | RefundRequested r -> withRequest "requested-v1" r
+                    | AllocationApproved a -> withApproval "allocation-approved-v1" a
                     | AllocationDenied(r, reason) ->
-                        { withRequest "allocation-denied" r with
-                            Reason = reason }
+                        { withRequest "allocation-denied-v1" r with
+                            Reason = ReasonCode.value reason }
                     | GatewayRefunded(a, reference) ->
-                        { withApproval "gateway-refunded" a with
+                        { withApproval "gateway-refunded-v1" a with
                             ProviderRefundReference = reference }
                     | GatewayDeclined(a, reason) ->
-                        { withApproval "gateway-declined" a with
-                            Reason = reason }
-                    | GatewayUnknown a -> withApproval "gateway-unknown" a
+                        { withApproval "gateway-declined-v1" a with
+                            Reason = ReasonCode.value reason }
+                    | GatewayUnknown a -> withApproval "gateway-unknown-v1" a
                     | AllocationSettled id ->
-                        { empty "allocation-settled" with
+                        { empty "allocation-settled-v1" with
                             AllocationId = RefundAllocationId.wireString id }
                     | ManualReviewRequested reason ->
-                        { empty "manual-review-requested" with
-                            Reason = reason }
-                    | CloseRequested -> empty "close-requested"
+                        { empty "manual-review-requested-v1" with
+                            Reason = ReasonCode.value reason }
+                    | CloseRequested -> empty "close-requested-v1"
 
                 encode "RefundEvent" dto)
             (fun json ->
                 decode "RefundEvent" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "requested" -> request "RefundEvent" dto |> Result.map RefundRequested
-                    | "allocation-approved" -> approved "RefundEvent" dto |> Result.map AllocationApproved
-                    | "allocation-denied" ->
+                    | "requested-v1" -> request "RefundEvent" dto |> Result.map RefundRequested
+                    | "allocation-approved-v1" -> approved "RefundEvent" dto |> Result.map AllocationApproved
+                    | "allocation-denied-v1" ->
                         request "RefundEvent" dto
-                        |> Result.map (fun r -> AllocationDenied(r, dto.Reason))
-                    | "gateway-refunded" ->
+                        |> Result.bind (fun r ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> AllocationDenied(r, reason)))
+                    | "gateway-refunded-v1" ->
                         approved "RefundEvent" dto
                         |> Result.map (fun a -> GatewayRefunded(a, dto.ProviderRefundReference))
-                    | "gateway-declined" ->
+                    | "gateway-declined-v1" ->
                         approved "RefundEvent" dto
-                        |> Result.map (fun a -> GatewayDeclined(a, dto.Reason))
-                    | "gateway-unknown" -> approved "RefundEvent" dto |> Result.map GatewayUnknown
-                    | "allocation-settled" ->
+                        |> Result.bind (fun a ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> GatewayDeclined(a, reason)))
+                    | "gateway-unknown-v1" -> approved "RefundEvent" dto |> Result.map GatewayUnknown
+                    | "allocation-settled-v1" ->
                         RefundAllocationId.tryParse dto.AllocationId
                         |> Result.mapError (error "RefundEvent")
                         |> Result.map AllocationSettled
-                    | "manual-review-requested" -> Ok(ManualReviewRequested dto.Reason)
-                    | "close-requested" -> Ok CloseRequested
+                    | "manual-review-requested-v1" ->
+                        (CodecSupport.reason dto.Reason |> Result.map ManualReviewRequested)
+                    | "close-requested-v1" -> Ok CloseRequested
                     | _ -> Error(error "RefundEvent" "Unknown refund event.")))
 
     let action: Codec<RefundAction> =
@@ -179,34 +190,36 @@ module RefundCodec =
             (fun (value: RefundAction) ->
                 let dto =
                     match value with
-                    | RequestAllocation r -> withRequest "request-allocation" r
-                    | CallGatewayRefund a -> withApproval "call-gateway-refund" a
-                    | QueryGatewayRefund a -> withApproval "query-gateway-refund" a
+                    | RequestAllocation r -> withRequest "request-allocation-v1" r
+                    | CallGatewayRefund a -> withApproval "call-gateway-refund-v1" a
+                    | QueryGatewayRefund a -> withApproval "query-gateway-refund-v1" a
                     | SettleAllocation(a, reference) ->
-                        { withApproval "settle-allocation" a with
+                        { withApproval "settle-allocation-v1" a with
                             ProviderRefundReference = reference }
-                    | ReleaseAllocation r -> withRequest "release-allocation" r
-                    | NotifyOriginSucceeded r -> withRequest "notify-origin-succeeded" r
+                    | ReleaseAllocation r -> withRequest "release-allocation-v1" r
+                    | NotifyOriginSucceeded r -> withRequest "notify-origin-succeeded-v1" r
                     | NotifyOriginFailed(r, reason) ->
-                        { withRequest "notify-origin-failed" r with
-                            Reason = reason }
+                        { withRequest "notify-origin-failed-v1" r with
+                            Reason = ReasonCode.value reason }
 
                 encode "RefundAction" dto)
             (fun json ->
                 decode "RefundAction" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "request-allocation" -> request "RefundAction" dto |> Result.map RequestAllocation
-                    | "call-gateway-refund" -> approved "RefundAction" dto |> Result.map CallGatewayRefund
-                    | "query-gateway-refund" -> approved "RefundAction" dto |> Result.map QueryGatewayRefund
-                    | "settle-allocation" ->
+                    | "request-allocation-v1" -> request "RefundAction" dto |> Result.map RequestAllocation
+                    | "call-gateway-refund-v1" -> approved "RefundAction" dto |> Result.map CallGatewayRefund
+                    | "query-gateway-refund-v1" -> approved "RefundAction" dto |> Result.map QueryGatewayRefund
+                    | "settle-allocation-v1" ->
                         approved "RefundAction" dto
                         |> Result.map (fun a -> SettleAllocation(a, dto.ProviderRefundReference))
-                    | "release-allocation" -> request "RefundAction" dto |> Result.map ReleaseAllocation
-                    | "notify-origin-succeeded" -> request "RefundAction" dto |> Result.map NotifyOriginSucceeded
-                    | "notify-origin-failed" ->
+                    | "release-allocation-v1" -> request "RefundAction" dto |> Result.map ReleaseAllocation
+                    | "notify-origin-succeeded-v1" -> request "RefundAction" dto |> Result.map NotifyOriginSucceeded
+                    | "notify-origin-failed-v1" ->
                         request "RefundAction" dto
-                        |> Result.map (fun r -> NotifyOriginFailed(r, dto.Reason))
+                        |> Result.bind (fun r ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> NotifyOriginFailed(r, reason)))
                     | _ -> Error(error "RefundAction" "Unknown refund action.")))
 
     let actionError: Codec<RefundActionError> =
@@ -214,20 +227,20 @@ module RefundCodec =
             (fun (value: RefundActionError) ->
                 let tag =
                     match value with
-                    | RefundActionError.CallbackEncodingFailed -> "callback-encoding"
-                    | RefundActionError.ActionReceiptMismatch -> "receipt-mismatch"
-                    | RefundActionError.OperationConflict -> "operation-conflict"
-                    | RefundActionError.InvalidAction -> "invalid-action"
+                    | RefundActionError.CallbackEncodingFailed -> "callback-encoding-v1"
+                    | RefundActionError.ActionReceiptMismatch -> "receipt-mismatch-v1"
+                    | RefundActionError.OperationConflict -> "operation-conflict-v1"
+                    | RefundActionError.InvalidAction -> "invalid-action-v1"
 
                 encode "RefundActionError" (empty tag))
             (fun json ->
                 decode "RefundActionError" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "callback-encoding" -> Ok RefundActionError.CallbackEncodingFailed
-                    | "receipt-mismatch" -> Ok RefundActionError.ActionReceiptMismatch
-                    | "operation-conflict" -> Ok RefundActionError.OperationConflict
-                    | "invalid-action" -> Ok RefundActionError.InvalidAction
+                    | "callback-encoding-v1" -> Ok RefundActionError.CallbackEncodingFailed
+                    | "receipt-mismatch-v1" -> Ok RefundActionError.ActionReceiptMismatch
+                    | "operation-conflict-v1" -> Ok RefundActionError.OperationConflict
+                    | "invalid-action-v1" -> Ok RefundActionError.InvalidAction
                     | _ -> Error(error "RefundActionError" "Unknown refund action error.")))
 
     let storeOptions
@@ -246,7 +259,7 @@ module RefundCodec =
             machineId Refunds.MachineKey
         ) {
             chart Refunds.chartValue
-            chartVersion 1
+            chartVersion Refunds.ChartVersion
             initialState Refunds.initialState
             store storeArg
             logger log

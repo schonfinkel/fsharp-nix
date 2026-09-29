@@ -36,7 +36,7 @@ type ShipmentInTransit =
 
 type FailedShipmentDelivery =
     { Transit: ShipmentInTransit
-      ReasonCode: string }
+      ReasonCode: ReasonCode }
 
 type CompletedShipment =
     { Transit: ShipmentInTransit
@@ -52,13 +52,13 @@ type ShipmentState =
     | Delivered of CompletedShipment
     | ReturnedToSender of CompletedShipment
     | Lost of CompletedShipment
-    | ManualReview of ShipmentRequest * reasonCode: string
+    | ManualReview of ShipmentRequest * reasonCode: ReasonCode
     | Closed of ShipmentRequest
 
 [<RequireQualifiedAccess>]
 type CarrierTrackingStatus =
     | InTransit
-    | DeliveryFailed of reasonCode: string
+    | DeliveryFailed of reasonCode: ReasonCode
     | Delivered
     | ReturnedToSender
     | Lost
@@ -72,15 +72,15 @@ type CarrierTrackingUpdate =
 type ShipmentEvent =
     | ShipmentRequested of ShipmentRequest
     | AllocationConfirmed of ShipmentAllocationId
-    | AllocationRejected of ShipmentAllocationId * reasonCode: string
+    | AllocationRejected of ShipmentAllocationId * reasonCode: ReasonCode
     | PreparationCompleted
     | LabelCreated of generation: int64 * carrierReference: CarrierReference
-    | LabelCreationFailed of generation: int64 * reasonCode: string
+    | LabelCreationFailed of generation: int64 * reasonCode: ReasonCode
     | DispatchConfirmed of dispatchedAt: DateTimeOffset
     | CarrierTrackingReceived of CarrierTrackingUpdate
     | DeliveryRetryRequested
     | MarkLost of expectedGeneration: int64 * expectedLastScan: DateTimeOffset option * detectedAt: DateTimeOffset
-    | ManualReviewRequested of reasonCode: string
+    | ManualReviewRequested of reasonCode: ReasonCode
     | ShipmentCloseRequested
 
 type ShipmentAction =
@@ -110,6 +110,11 @@ module Shipments =
 
     [<Literal>]
     let ActionQueue = "shipment_actions"
+
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
 
     [<Literal>]
     let MaxDeliveryAttempts = 3

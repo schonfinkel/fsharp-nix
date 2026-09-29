@@ -19,6 +19,8 @@ open Npgsql
 /// </summary>
 [<RequireQualifiedAccess>]
 module ShipmentEffects =
+    let private labelFailed = ReasonCode.ofLiteral "label-failed"
+
     let actionKind =
         function
         | ConfirmAllocation _ -> "confirm-allocation"
@@ -233,7 +235,7 @@ module ShipmentEffects =
                         if exists then
                             AllocationConfirmed allocationId
                         else
-                            AllocationRejected(allocationId, "allocation-not-found")
+                            AllocationRejected(allocationId, ReasonCode.ofLiteral "allocation-not-found")
 
                     let! callbackOutcome = selfCallback connection tx record "allocation-result" event ct
 
@@ -309,7 +311,8 @@ module ShipmentEffects =
                         let reference, event =
                             match outcome with
                             | CarrierLabelCreated reference -> Some reference, LabelCreated(generation, reference)
-                            | CarrierLabelFailed reason -> None, LabelCreationFailed(generation, reason)
+                            | CarrierLabelFailed reason ->
+                                None, LabelCreationFailed(generation, ReasonCode.sanitize labelFailed reason)
 
                         match reference with
                         | Some reference -> do! recordCarrierReference settleConnection settleTx shipmentId reference ct

@@ -419,49 +419,42 @@ module PaymentCodec =
             (fun state ->
                 let dto =
                     match state with
-                    | Initial -> empty "initial-v2"
-                    | AuthorizationPending pending -> pendingDto "authorization-pending-v2" pending
-                    | AuthorizationUnknown pending -> pendingDto "authorization-unknown-v2" pending
-                    | Authorized authorized -> authorizedDto "authorized-v2" authorized
-                    | CapturePending pending -> pendingCaptureDto "capture-pending-v2" pending
-                    | CaptureUnknown pending -> pendingCaptureDto "capture-unknown-v2" pending
-                    | PartiallyCaptured payment -> capturedDto "partially-captured-v2" payment
-                    | Captured payment -> capturedDto "captured-v2" payment
-                    | RefundAllocationPending payment -> capturedDto "refund-allocation-pending-v3" payment
-                    | VoidPending authorized -> authorizedDto "void-pending-v2" authorized
-                    | VoidUnknown authorized -> authorizedDto "void-unknown-v2" authorized
-                    | Voided authorized -> authorizedDto "voided-v2" authorized
+                    | Initial -> empty "initial-v1"
+                    | AuthorizationPending pending -> pendingDto "authorization-pending-v1" pending
+                    | AuthorizationUnknown pending -> pendingDto "authorization-unknown-v1" pending
+                    | Authorized authorized -> authorizedDto "authorized-v1" authorized
+                    | CapturePending pending -> pendingCaptureDto "capture-pending-v1" pending
+                    | CaptureUnknown pending -> pendingCaptureDto "capture-unknown-v1" pending
+                    | PartiallyCaptured payment -> capturedDto "partially-captured-v1" payment
+                    | Captured payment -> capturedDto "captured-v1" payment
+                    | RefundAllocationPending payment -> capturedDto "refund-allocation-pending-v1" payment
+                    | VoidPending authorized -> authorizedDto "void-pending-v1" authorized
+                    | VoidUnknown authorized -> authorizedDto "void-unknown-v1" authorized
+                    | Voided authorized -> authorizedDto "voided-v1" authorized
                     | Declined reason ->
-                        { empty "declined-v2" with
-                            Reason = reason }
-                    | CancelledWithoutCharge -> empty "cancelled-without-charge-v2"
+                        { empty "declined-v1" with
+                            Reason = ReasonCode.value reason }
+                    | CancelledWithoutCharge -> empty "cancelled-without-charge-v1"
                     | ManualReview reason ->
-                        { empty "manual-review-v2" with
-                            Reason = reason }
+                        { empty "manual-review-v1" with
+                            Reason = ReasonCode.value reason }
 
                 encode "PaymentState" dto)
             (fun json ->
                 decode "PaymentState" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "initial-v1"
-                    | "initial-v2" -> Ok Initial
-                    | "cancelled-without-charge-v1"
-                    | "cancelled-without-charge-v2" -> Ok CancelledWithoutCharge
-                    | "declined-v1"
-                    | "declined-v2" when not (String.IsNullOrWhiteSpace dto.Reason) -> Ok(Declined dto.Reason)
-                    | "manual-review-v1"
-                    | "manual-review-v2" when not (String.IsNullOrWhiteSpace dto.Reason) ->
-                        Ok(ManualReview dto.Reason)
-                    | "authorization-pending-v1"
-                    | "authorization-pending-v2" -> pendingOfDto "PaymentState" dto |> Result.map AuthorizationPending
-                    | "authorization-unknown-v1"
-                    | "authorization-unknown-v2" -> pendingOfDto "PaymentState" dto |> Result.map AuthorizationUnknown
-                    | "authorized-v1"
-                    | "authorized-v2" -> authorizedOfDto "PaymentState" dto |> Result.map Authorized
-                    | "capture-pending-v2" -> pendingCaptureOfDto "PaymentState" dto |> Result.map CapturePending
-                    | "capture-unknown-v2" -> pendingCaptureOfDto "PaymentState" dto |> Result.map CaptureUnknown
-                    | "partially-captured-v2" ->
+                    | "initial-v1" -> Ok Initial
+                    | "cancelled-without-charge-v1" -> Ok CancelledWithoutCharge
+                    | "declined-v1" -> (CodecSupport.reason dto.Reason |> Result.map Declined)
+                    | "manual-review-v1" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        (CodecSupport.reason dto.Reason |> Result.map ManualReview)
+                    | "authorization-pending-v1" -> pendingOfDto "PaymentState" dto |> Result.map AuthorizationPending
+                    | "authorization-unknown-v1" -> pendingOfDto "PaymentState" dto |> Result.map AuthorizationUnknown
+                    | "authorized-v1" -> authorizedOfDto "PaymentState" dto |> Result.map Authorized
+                    | "capture-pending-v1" -> pendingCaptureOfDto "PaymentState" dto |> Result.map CapturePending
+                    | "capture-unknown-v1" -> pendingCaptureOfDto "PaymentState" dto |> Result.map CaptureUnknown
+                    | "partially-captured-v1" ->
                         capturedOfDto "PaymentState" dto
                         |> Result.bind (fun payment ->
                             let total =
@@ -472,7 +465,7 @@ module PaymentCodec =
                                 Ok(PartiallyCaptured payment)
                             else
                                 Error(codecError "PaymentState" "Invalid partially captured total."))
-                    | "captured-v2" ->
+                    | "captured-v1" ->
                         capturedOfDto "PaymentState" dto
                         |> Result.bind (fun payment ->
                             let total =
@@ -483,19 +476,16 @@ module PaymentCodec =
                                 Ok(Captured payment)
                             else
                                 Error(codecError "PaymentState" "Invalid captured total."))
-                    | "refund-allocation-pending-v3" ->
+                    | "refund-allocation-pending-v1" ->
                         capturedOfDto "PaymentState" dto
                         |> Result.bind (fun payment ->
                             if payment.Refunds |> List.exists (fun row -> row.Status = "pending") then
                                 Ok(RefundAllocationPending payment)
                             else
                                 Error(codecError "PaymentState" "No pending refund allocations."))
-                    | "void-pending-v1"
-                    | "void-pending-v2" -> authorizedOfDto "PaymentState" dto |> Result.map VoidPending
-                    | "void-unknown-v1"
-                    | "void-unknown-v2" -> authorizedOfDto "PaymentState" dto |> Result.map VoidUnknown
-                    | "voided-v1"
-                    | "voided-v2" -> authorizedOfDto "PaymentState" dto |> Result.map Voided
+                    | "void-pending-v1" -> authorizedOfDto "PaymentState" dto |> Result.map VoidPending
+                    | "void-unknown-v1" -> authorizedOfDto "PaymentState" dto |> Result.map VoidUnknown
+                    | "voided-v1" -> authorizedOfDto "PaymentState" dto |> Result.map Voided
                     | tag -> Error(codecError "PaymentState" $"Unknown or invalid tag '{tag}'.")))
 
     let event: Codec<PaymentEvent> =
@@ -503,51 +493,49 @@ module PaymentCodec =
             (fun event ->
                 let dto =
                     match event with
-                    | AuthorizeRequested attempt -> attemptDto "authorize-requested-v2" attempt
+                    | AuthorizeRequested attempt -> attemptDto "authorize-requested-v1" attempt
                     | AuthorizationSucceeded(attempt, reference, expiresAt) ->
-                        { (attemptDto "authorization-succeeded-v2" attempt) with
+                        { (attemptDto "authorization-succeeded-v1" attempt) with
                             ProviderReference = reference
                             ExpiresAt = expiresAt.ToUnixTimeMilliseconds() }
                     | AuthorizationDeclined(attempt, reason) ->
-                        { (attemptDto "authorization-declined-v2" attempt) with
-                            Reason = reason }
-                    | AuthorizationOutcomeUnknown attempt -> attemptDto "authorization-outcome-unknown-v2" attempt
-                    | CaptureRequested request -> captureRequestDto "capture-requested-v2" request
+                        { (attemptDto "authorization-declined-v1" attempt) with
+                            Reason = ReasonCode.value reason }
+                    | AuthorizationOutcomeUnknown attempt -> attemptDto "authorization-outcome-unknown-v1" attempt
+                    | CaptureRequested request -> captureRequestDto "capture-requested-v1" request
                     | CaptureSucceeded(request, reference) ->
-                        { (captureRequestDto "capture-succeeded-v2" request) with
+                        { (captureRequestDto "capture-succeeded-v1" request) with
                             ProviderReference = reference }
-                    | CaptureOutcomeUnknown request -> captureRequestDto "capture-outcome-unknown-v2" request
+                    | CaptureOutcomeUnknown request -> captureRequestDto "capture-outcome-unknown-v1" request
                     | CaptureDeclined(request, reason) ->
-                        { (captureRequestDto "capture-declined-v2" request) with
-                            Reason = reason }
+                        { (captureRequestDto "capture-declined-v1" request) with
+                            Reason = ReasonCode.value reason }
                     | RefundAllocationRequested request ->
-                        { empty "refund-allocation-requested-v3" with
+                        { empty "refund-allocation-requested-v1" with
                             Refund = refundDto request }
                     | RefundAllocationSettled id ->
-                        { empty "refund-allocation-settled-v3" with
+                        { empty "refund-allocation-settled-v1" with
                             RefundAllocationId = RefundAllocationId.wireString id }
                     | RefundAllocationReleased id ->
-                        { empty "refund-allocation-released-v3" with
+                        { empty "refund-allocation-released-v1" with
                             RefundAllocationId = RefundAllocationId.wireString id }
                     | PaymentCancellationRequested(orderId, reason) ->
-                        { empty "cancel-requested-v2" with
+                        { empty "cancel-requested-v1" with
                             OrderId = orderId
-                            Reason = reason }
-                    | VoidSucceeded authorized -> authorizedDto "void-succeeded-v2" authorized
-                    | VoidOutcomeUnknown authorized -> authorizedDto "void-outcome-unknown-v2" authorized
+                            Reason = ReasonCode.value reason }
+                    | VoidSucceeded authorized -> authorizedDto "void-succeeded-v1" authorized
+                    | VoidOutcomeUnknown authorized -> authorizedDto "void-outcome-unknown-v1" authorized
                     | MarkManualReview reason ->
-                        { empty "mark-manual-review-v2" with
-                            Reason = reason }
+                        { empty "mark-manual-review-v1" with
+                            Reason = ReasonCode.value reason }
 
                 encode "PaymentEvent" dto)
             (fun json ->
                 decode "PaymentEvent" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "authorize-requested-v1"
-                    | "authorize-requested-v2" -> attemptOfDto "PaymentEvent" dto |> Result.map AuthorizeRequested
-                    | "authorization-succeeded-v1"
-                    | "authorization-succeeded-v2" ->
+                    | "authorize-requested-v1" -> attemptOfDto "PaymentEvent" dto |> Result.map AuthorizeRequested
+                    | "authorization-succeeded-v1" ->
                         attemptOfDto "PaymentEvent" dto
                         |> Result.bind (fun attempt ->
                             NonEmptyString.create 200 dto.ProviderReference
@@ -562,65 +550,53 @@ module PaymentCodec =
                                     |> Ok
                                 with _ ->
                                     Error(codecError "PaymentEvent" "Invalid authorization expiry.")))
-                    | "authorization-declined-v1"
-                    | "authorization-declined-v2" ->
+                    | "authorization-declined-v1" ->
                         attemptOfDto "PaymentEvent" dto
                         |> Result.bind (fun attempt ->
-                            NonEmptyString.create 200 dto.Reason
-                            |> Result.mapError (fun m -> codecError "PaymentEvent" m)
-                            |> Result.map (fun reason -> AuthorizationDeclined(attempt, NonEmptyString.value reason)))
-                    | "authorization-outcome-unknown-v1"
-                    | "authorization-outcome-unknown-v2" ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> AuthorizationDeclined(attempt, reason)))
+                    | "authorization-outcome-unknown-v1" ->
                         attemptOfDto "PaymentEvent" dto |> Result.map AuthorizationOutcomeUnknown
-                    | "capture-requested-v2" -> captureRequestOfDto "PaymentEvent" dto |> Result.map CaptureRequested
-                    | "capture-succeeded-v2" ->
+                    | "capture-requested-v1" -> captureRequestOfDto "PaymentEvent" dto |> Result.map CaptureRequested
+                    | "capture-succeeded-v1" ->
                         captureRequestOfDto "PaymentEvent" dto
                         |> Result.bind (fun request ->
                             NonEmptyString.create 200 dto.ProviderReference
                             |> Result.mapError (fun m -> codecError "PaymentEvent" m)
                             |> Result.map (fun reference ->
                                 CaptureSucceeded(request, NonEmptyString.value reference)))
-                    | "capture-outcome-unknown-v2" ->
+                    | "capture-outcome-unknown-v1" ->
                         captureRequestOfDto "PaymentEvent" dto |> Result.map CaptureOutcomeUnknown
-                    | "capture-declined-v2" ->
+                    | "capture-declined-v1" ->
                         captureRequestOfDto "PaymentEvent" dto
                         |> Result.bind (fun request ->
-                            NonEmptyString.create 200 dto.Reason
-                            |> Result.mapError (fun m -> codecError "PaymentEvent" m)
-                            |> Result.map (fun reason -> CaptureDeclined(request, NonEmptyString.value reason)))
-                    | "refund-allocation-requested-v3" ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> CaptureDeclined(request, reason)))
+                    | "refund-allocation-requested-v1" ->
                         refundOfDto "PaymentEvent" dto.Refund |> Result.map RefundAllocationRequested
-                    | "refund-allocation-settled-v3" ->
+                    | "refund-allocation-settled-v1" ->
                         RefundAllocationId.tryParse dto.RefundAllocationId
                         |> Result.mapError (codecError "PaymentEvent")
                         |> Result.map RefundAllocationSettled
-                    | "refund-allocation-released-v3" ->
+                    | "refund-allocation-released-v1" ->
                         RefundAllocationId.tryParse dto.RefundAllocationId
                         |> Result.mapError (codecError "PaymentEvent")
                         |> Result.map RefundAllocationReleased
-                    | "cancel-requested-v1"
-                    | "cancel-requested-v2" ->
+                    | "cancel-requested-v1" ->
                         NonEmptyString.create 100 dto.OrderId
                         |> Result.mapError (fun m -> codecError "PaymentEvent" m)
                         |> Result.bind (fun orderId ->
-                            NonEmptyString.create 200 dto.Reason
-                            |> Result.mapError (fun m -> codecError "PaymentEvent" m)
+                            CodecSupport.reason dto.Reason
                             |> Result.map (fun reason ->
-                                PaymentCancellationRequested(
-                                    NonEmptyString.value orderId,
-                                    NonEmptyString.value reason
-                                )))
-                    | "void-succeeded-v1"
-                    | "void-succeeded-v2" ->
+                                PaymentCancellationRequested(NonEmptyString.value orderId, reason)))
+                    | "void-succeeded-v1" ->
                         authorizedOfDto "PaymentEvent" dto
                         |> Result.map (fun authorized -> VoidSucceeded authorized)
-                    | "void-outcome-unknown-v1"
-                    | "void-outcome-unknown-v2" ->
+                    | "void-outcome-unknown-v1" ->
                         authorizedOfDto "PaymentEvent" dto
                         |> Result.map (fun authorized -> VoidOutcomeUnknown authorized)
-                    | "mark-manual-review-v1"
-                    | "mark-manual-review-v2" when not (String.IsNullOrWhiteSpace dto.Reason) ->
-                        Ok(MarkManualReview dto.Reason)
+                    | "mark-manual-review-v1" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        (CodecSupport.reason dto.Reason |> Result.map MarkManualReview)
                     | tag -> Error(codecError "PaymentEvent" $"Unknown tag '{tag}'.")))
 
     let action: Codec<PaymentAction> =
@@ -628,35 +604,35 @@ module PaymentCodec =
             (fun action ->
                 let dto =
                     match action with
-                    | CallGatewayAuthorize attempt -> attemptDto "call-gateway-authorize-v2" attempt
-                    | QueryGatewayAuthorization attempt -> attemptDto "query-gateway-authorization-v2" attempt
+                    | CallGatewayAuthorize attempt -> attemptDto "call-gateway-authorize-v1" attempt
+                    | QueryGatewayAuthorization attempt -> attemptDto "query-gateway-authorization-v1" attempt
                     | CallGatewayCapture(authorized, request) ->
-                        captureActionDto "call-gateway-capture-v2" authorized request
+                        captureActionDto "call-gateway-capture-v1" authorized request
                     | QueryGatewayCapture(authorized, request) ->
-                        captureActionDto "query-gateway-capture-v2" authorized request
-                    | CallGatewayVoid authorized -> authorizedDto "call-gateway-void-v2" authorized
-                    | NotifyOrderAuthorized authorized -> authorizedDto "notify-order-authorized-v2" authorized
+                        captureActionDto "query-gateway-capture-v1" authorized request
+                    | CallGatewayVoid authorized -> authorizedDto "call-gateway-void-v1" authorized
+                    | NotifyOrderAuthorized authorized -> authorizedDto "notify-order-authorized-v1" authorized
                     | NotifyOrderDeclined(attempt, reason) ->
-                        { (attemptDto "notify-order-declined-v2" attempt) with
-                            Reason = reason }
+                        { (attemptDto "notify-order-declined-v1" attempt) with
+                            Reason = ReasonCode.value reason }
                     | NotifyOrderCancelled orderId ->
-                        { empty "notify-order-cancelled-v2" with
+                        { empty "notify-order-cancelled-v1" with
                             OrderId = orderId }
-                    | NotifyOrderVoided authorized -> authorizedDto "notify-order-voided-v2" authorized
+                    | NotifyOrderVoided authorized -> authorizedDto "notify-order-voided-v1" authorized
                     | NotifyOrderCaptured capture ->
-                        { (captureRequestDto "notify-order-captured-v2" capture.Request) with
+                        { (captureRequestDto "notify-order-captured-v1" capture.Request) with
                             ProviderReference = capture.ProviderReference }
                     | NotifyRefundApproved approved ->
-                        { empty "notify-refund-approved-v3" with
+                        { empty "notify-refund-approved-v1" with
                             Refund =
                                 { refundDto approved.Request with
                                     PaymentReference = approved.PaymentReference } }
                     | NotifyRefundDenied(request, reason) ->
-                        { empty "notify-refund-denied-v3" with
+                        { empty "notify-refund-denied-v1" with
                             Refund = refundDto request
-                            Reason = reason }
+                            Reason = ReasonCode.value reason }
                     | NotifyRefundSettled request ->
-                        { empty "notify-refund-settled-v3" with
+                        { empty "notify-refund-settled-v1" with
                             Refund = refundDto request }
 
                 encode "PaymentAction" dto)
@@ -664,38 +640,30 @@ module PaymentCodec =
                 decode "PaymentAction" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "call-gateway-authorize-v1"
-                    | "call-gateway-authorize-v2" ->
+                    | "call-gateway-authorize-v1" ->
                         attemptOfDto "PaymentAction" dto |> Result.map CallGatewayAuthorize
-                    | "query-gateway-authorization-v1"
-                    | "query-gateway-authorization-v2" ->
+                    | "query-gateway-authorization-v1" ->
                         attemptOfDto "PaymentAction" dto |> Result.map QueryGatewayAuthorization
-                    | "call-gateway-capture-v2" ->
+                    | "call-gateway-capture-v1" ->
                         captureActionOfDto "PaymentAction" dto
                         |> Result.map (fun (authorized, request) -> CallGatewayCapture(authorized, request))
-                    | "query-gateway-capture-v2" ->
+                    | "query-gateway-capture-v1" ->
                         captureActionOfDto "PaymentAction" dto
                         |> Result.map (fun (authorized, request) -> QueryGatewayCapture(authorized, request))
-                    | "call-gateway-void-v1"
-                    | "call-gateway-void-v2" -> authorizedOfDto "PaymentAction" dto |> Result.map CallGatewayVoid
-                    | "notify-order-authorized-v1"
-                    | "notify-order-authorized-v2" ->
+                    | "call-gateway-void-v1" -> authorizedOfDto "PaymentAction" dto |> Result.map CallGatewayVoid
+                    | "notify-order-authorized-v1" ->
                         authorizedOfDto "PaymentAction" dto |> Result.map NotifyOrderAuthorized
-                    | "notify-order-declined-v1"
-                    | "notify-order-declined-v2" ->
+                    | "notify-order-declined-v1" ->
                         attemptOfDto "PaymentAction" dto
                         |> Result.bind (fun attempt ->
-                            NonEmptyString.create 200 dto.Reason
-                            |> Result.mapError (fun m -> codecError "PaymentAction" m)
-                            |> Result.map (fun reason -> NotifyOrderDeclined(attempt, NonEmptyString.value reason)))
-                    | "notify-order-cancelled-v1"
-                    | "notify-order-cancelled-v2" ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> NotifyOrderDeclined(attempt, reason)))
+                    | "notify-order-cancelled-v1" ->
                         NonEmptyString.create 100 dto.OrderId
                         |> Result.mapError (fun m -> codecError "PaymentAction" m)
                         |> Result.map (fun orderId -> NotifyOrderCancelled(NonEmptyString.value orderId))
-                    | "notify-order-voided-v1"
-                    | "notify-order-voided-v2" -> authorizedOfDto "PaymentAction" dto |> Result.map NotifyOrderVoided
-                    | "notify-order-captured-v2" ->
+                    | "notify-order-voided-v1" -> authorizedOfDto "PaymentAction" dto |> Result.map NotifyOrderVoided
+                    | "notify-order-captured-v1" ->
                         captureRequestOfDto "PaymentAction" dto
                         |> Result.bind (fun request ->
                             NonEmptyString.create 200 dto.ProviderReference
@@ -706,7 +674,7 @@ module PaymentCodec =
                                       ProviderReference = NonEmptyString.value reference }
                                     : CaptureRecord
                                 )))
-                    | "notify-refund-approved-v3" ->
+                    | "notify-refund-approved-v1" ->
                         refundOfDto "PaymentAction" dto.Refund
                         |> Result.bind (fun request ->
                             if String.IsNullOrWhiteSpace dto.Refund.PaymentReference then
@@ -717,10 +685,12 @@ module PaymentCodec =
                                         { Request = request
                                           PaymentReference = dto.Refund.PaymentReference }
                                 ))
-                    | "notify-refund-denied-v3" ->
+                    | "notify-refund-denied-v1" ->
                         refundOfDto "PaymentAction" dto.Refund
-                        |> Result.map (fun request -> NotifyRefundDenied(request, dto.Reason))
-                    | "notify-refund-settled-v3" ->
+                        |> Result.bind (fun request ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> NotifyRefundDenied(request, reason)))
+                    | "notify-refund-settled-v1" ->
                         refundOfDto "PaymentAction" dto.Refund |> Result.map NotifyRefundSettled
                     | tag -> Error(codecError "PaymentAction" $"Unknown tag '{tag}'.")))
 
@@ -729,27 +699,22 @@ module PaymentCodec =
             (fun errorValue ->
                 let tag =
                     match errorValue with
-                    | PaymentActionError.InvalidPaymentEntityId -> "invalid-payment-entity-id-v2"
-                    | PaymentActionError.CallbackEncodingFailed -> "callback-encoding-failed-v2"
-                    | PaymentActionError.ActionReceiptMismatch -> "action-receipt-mismatch-v2"
-                    | PaymentActionError.OperationConflict -> "operation-conflict-v2"
-                    | PaymentActionError.InvalidAction -> "invalid-action-v2"
+                    | PaymentActionError.InvalidPaymentEntityId -> "invalid-payment-entity-id-v1"
+                    | PaymentActionError.CallbackEncodingFailed -> "callback-encoding-failed-v1"
+                    | PaymentActionError.ActionReceiptMismatch -> "action-receipt-mismatch-v1"
+                    | PaymentActionError.OperationConflict -> "operation-conflict-v1"
+                    | PaymentActionError.InvalidAction -> "invalid-action-v1"
 
                 encode "PaymentActionError" (empty tag))
             (fun json ->
                 decode "PaymentActionError" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "invalid-payment-entity-id-v1"
-                    | "invalid-payment-entity-id-v2" -> Ok PaymentActionError.InvalidPaymentEntityId
-                    | "callback-encoding-failed-v1"
-                    | "callback-encoding-failed-v2" -> Ok PaymentActionError.CallbackEncodingFailed
-                    | "action-receipt-mismatch-v1"
-                    | "action-receipt-mismatch-v2" -> Ok PaymentActionError.ActionReceiptMismatch
-                    | "operation-conflict-v1"
-                    | "operation-conflict-v2" -> Ok PaymentActionError.OperationConflict
-                    | "invalid-action-v1"
-                    | "invalid-action-v2" -> Ok PaymentActionError.InvalidAction
+                    | "invalid-payment-entity-id-v1" -> Ok PaymentActionError.InvalidPaymentEntityId
+                    | "callback-encoding-failed-v1" -> Ok PaymentActionError.CallbackEncodingFailed
+                    | "action-receipt-mismatch-v1" -> Ok PaymentActionError.ActionReceiptMismatch
+                    | "operation-conflict-v1" -> Ok PaymentActionError.OperationConflict
+                    | "invalid-action-v1" -> Ok PaymentActionError.InvalidAction
                     | tag -> Error(codecError "PaymentActionError" $"Unknown tag '{tag}'.")))
 
     let storeOptions
@@ -776,7 +741,7 @@ module PaymentCodec =
             machineId Payments.MachineKey
         ) {
             chart Payments.chartValue
-            chartVersion 3
+            chartVersion Payments.ChartVersion
             initialState Payments.initialState
             store storeArg
             logger log

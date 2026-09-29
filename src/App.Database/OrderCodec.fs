@@ -535,72 +535,72 @@ module OrderCodec =
             (fun state ->
                 let dto =
                     match state with
-                    | Initial -> empty "initial-v2"
-                    | ReservationPending order -> pendingDto "reservation-pending-v2" order
+                    | Initial -> empty "initial-v1"
+                    | ReservationPending order -> pendingDto "reservation-pending-v1" order
                     | AwaitingAuthorization order ->
-                        { pendingDto "awaiting-authorization-v2" order.Pending with
+                        { pendingDto "awaiting-authorization-v1" order.Pending with
                             ReservationIds = order.ReservationIds |> List.map ReservationId.wireString |> List.toArray }
                     | PaymentPending order ->
-                        { pendingDto "payment-pending-v2" order.Reserved.Pending with
+                        { pendingDto "payment-pending-v1" order.Reserved.Pending with
                             ReservationIds =
                                 order.Reserved.ReservationIds
                                 |> List.map ReservationId.wireString
                                 |> List.toArray
                             Attempt = PaymentOperationId.value order.Attempt }
                     | StockCommitPending order ->
-                        { pendingDto "stock-commit-pending-v2" order.Reserved.Pending with
+                        { pendingDto "stock-commit-pending-v1" order.Reserved.Pending with
                             ReservationIds =
                                 order.Reserved.ReservationIds
                                 |> List.map ReservationId.wireString
                                 |> List.toArray
                             ProviderReference = order.ProviderReference }
                     | Placed order ->
-                        { pendingDto "placed-v2" order.Reserved.Pending with
+                        { pendingDto "placed-v1" order.Reserved.Pending with
                             ReservationIds =
                                 order.Reserved.ReservationIds
                                 |> List.map ReservationId.wireString
                                 |> List.toArray
                             ProviderReference = order.ProviderReference }
                     | HeldForReview held ->
-                        { fulfilmentDto "held-for-review-v3" held.Fulfilment with
-                            Reason = held.Reason }
-                    | FulfilmentPending order -> fulfilmentDto "fulfilment-pending-v3" order
-                    | Processing order -> fulfilmentDto "processing-v3" order
-                    | PartiallyShipped order -> fulfilmentDto "partially-shipped-v3" order
-                    | Shipped order -> fulfilmentDto "shipped-v3" order
-                    | OrderState.Delivered order -> fulfilmentDto "delivered-v3" order
-                    | CancellationCompensating order -> fulfilmentDto "cancellation-compensating-v4" order
-                    | CancelledAfterRefund order -> fulfilmentDto "cancelled-after-refund-v4" order
+                        { fulfilmentDto "held-for-review-v1" held.Fulfilment with
+                            Reason = ReasonCode.value held.Reason }
+                    | FulfilmentPending order -> fulfilmentDto "fulfilment-pending-v1" order
+                    | Processing order -> fulfilmentDto "processing-v1" order
+                    | PartiallyShipped order -> fulfilmentDto "partially-shipped-v1" order
+                    | Shipped order -> fulfilmentDto "shipped-v1" order
+                    | OrderState.Delivered order -> fulfilmentDto "delivered-v1" order
+                    | CancellationCompensating order -> fulfilmentDto "cancellation-compensating-v1" order
+                    | CancelledAfterRefund order -> fulfilmentDto "cancelled-after-refund-v1" order
                     | CancellationPending order ->
-                        { pendingDto "cancellation-pending-v2" order.Order with
+                        { pendingDto "cancellation-pending-v1" order.Order with
                             ReservationIds = order.ReservationIds |> List.map ReservationId.wireString |> List.toArray
-                            Reason = order.Reason
+                            Reason = ReasonCode.value order.Reason
                             ReservationsSettled = order.ReservationsSettled
                             PaymentSettled = order.PaymentSettled }
-                    | Cancelled -> empty "cancelled-v2"
+                    | Cancelled -> empty "cancelled-v1"
                     | ReservationFailed code ->
-                        { empty "reservation-failed-v2" with
-                            Failure = code }
+                        { empty "reservation-failed-v1" with
+                            Failure = ReasonCode.value code }
                     | ManualReview reason ->
-                        { empty "manual-review-v2" with
-                            Reason = reason }
-                    | Closed -> empty "closed-v2"
+                        { empty "manual-review-v1" with
+                            Reason = ReasonCode.value reason }
+                    | Closed -> empty "closed-v1"
 
                 encode "OrderState" dto)
             (fun json ->
                 decode "OrderState" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "initial-v2" -> Ok Initial
-                    | "cancelled-v2" -> Ok Cancelled
-                    | "closed-v2" -> Ok Closed
-                    | "reservation-failed-v2" when not (String.IsNullOrWhiteSpace dto.Failure) ->
-                        Ok(ReservationFailed dto.Failure)
-                    | "manual-review-v2" when not (String.IsNullOrWhiteSpace dto.Reason) ->
-                        Ok(ManualReview dto.Reason)
-                    | "reservation-pending-v2" -> pendingOfDto dto |> Result.map ReservationPending
-                    | "awaiting-authorization-v2" -> reservedOfDto dto |> Result.map AwaitingAuthorization
-                    | "payment-pending-v2" ->
+                    | "initial-v1" -> Ok Initial
+                    | "cancelled-v1" -> Ok Cancelled
+                    | "closed-v1" -> Ok Closed
+                    | "reservation-failed-v1" when not (String.IsNullOrWhiteSpace dto.Failure) ->
+                        (CodecSupport.reason dto.Failure |> Result.map ReservationFailed)
+                    | "manual-review-v1" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        (CodecSupport.reason dto.Reason |> Result.map ManualReview)
+                    | "reservation-pending-v1" -> pendingOfDto dto |> Result.map ReservationPending
+                    | "awaiting-authorization-v1" -> reservedOfDto dto |> Result.map AwaitingAuthorization
+                    | "payment-pending-v1" ->
                         reservedOfDto dto
                         |> Result.bind (fun reserved ->
                             PaymentOperationId.tryParse dto.Attempt
@@ -609,7 +609,7 @@ module OrderCodec =
                                 PaymentPending
                                     { Reserved = reserved
                                       Attempt = attempt }))
-                    | "stock-commit-pending-v2" ->
+                    | "stock-commit-pending-v1" ->
                         reservedOfDto dto
                         |> Result.bind (fun reserved ->
                             NonEmptyString.create 200 dto.ProviderReference
@@ -618,7 +618,7 @@ module OrderCodec =
                                 StockCommitPending
                                     { Reserved = reserved
                                       ProviderReference = NonEmptyString.value reference }))
-                    | "placed-v2" ->
+                    | "placed-v1" ->
                         reservedOfDto dto
                         |> Result.bind (fun reserved ->
                             NonEmptyString.create 200 dto.ProviderReference
@@ -627,31 +627,32 @@ module OrderCodec =
                                 Placed
                                     { Reserved = reserved
                                       ProviderReference = NonEmptyString.value reference }))
-                    | "held-for-review-v3" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                    | "held-for-review-v1" ->
                         fulfilmentOfDto dto
-                        |> Result.map (fun fulfilment ->
-                            HeldForReview
-                                { Fulfilment = fulfilment
-                                  Reason = dto.Reason })
-                    | "fulfilment-pending-v3" -> fulfilmentOfDto dto |> Result.map FulfilmentPending
-                    | "processing-v3" -> fulfilmentOfDto dto |> Result.map Processing
-                    | "partially-shipped-v3" -> fulfilmentOfDto dto |> Result.map PartiallyShipped
-                    | "shipped-v3" -> fulfilmentOfDto dto |> Result.map Shipped
-                    | "delivered-v3" -> fulfilmentOfDto dto |> Result.map OrderState.Delivered
-                    | "cancellation-compensating-v4" -> fulfilmentOfDto dto |> Result.map CancellationCompensating
-                    | "cancelled-after-refund-v4" -> fulfilmentOfDto dto |> Result.map CancelledAfterRefund
-                    | "cancellation-pending-v2" ->
+                        |> Result.bind (fun fulfilment ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason ->
+                                HeldForReview
+                                    { Fulfilment = fulfilment
+                                      Reason = reason }))
+                    | "fulfilment-pending-v1" -> fulfilmentOfDto dto |> Result.map FulfilmentPending
+                    | "processing-v1" -> fulfilmentOfDto dto |> Result.map Processing
+                    | "partially-shipped-v1" -> fulfilmentOfDto dto |> Result.map PartiallyShipped
+                    | "shipped-v1" -> fulfilmentOfDto dto |> Result.map Shipped
+                    | "delivered-v1" -> fulfilmentOfDto dto |> Result.map OrderState.Delivered
+                    | "cancellation-compensating-v1" -> fulfilmentOfDto dto |> Result.map CancellationCompensating
+                    | "cancelled-after-refund-v1" -> fulfilmentOfDto dto |> Result.map CancelledAfterRefund
+                    | "cancellation-pending-v1" ->
                         pendingOfDto dto
                         |> Result.bind (fun pending ->
                             reservationIdsOfDto "OrderState" dto
                             |> Result.bind (fun ids ->
-                                NonEmptyString.create 200 dto.Reason
-                                |> Result.mapError (fun m -> codecError "OrderState" m)
+                                CodecSupport.reason dto.Reason
                                 |> Result.map (fun reason ->
                                     CancellationPending
                                         { Order = pending
                                           ReservationIds = ids
-                                          Reason = NonEmptyString.value reason
+                                          Reason = reason
                                           ReservationsSettled = dto.ReservationsSettled
                                           PaymentSettled = dto.PaymentSettled })))
                     | tag -> Error(codecError "OrderState" $"Unknown or invalid tag '{tag}'.")))
@@ -661,119 +662,119 @@ module OrderCodec =
             (fun event ->
                 let dto =
                     match event with
-                    | OrderSubmitted order -> pendingDto "order-submitted-v2" order
+                    | OrderSubmitted order -> pendingDto "order-submitted-v1" order
                     | StockReserved(ids, generation) ->
-                        { empty "stock-reserved-v2" with
+                        { empty "stock-reserved-v1" with
                             ReservationIds = ids |> List.map ReservationId.wireString |> List.toArray
                             Generation = generation }
                     | StockReservationFailed failure ->
-                        { empty "stock-reservation-failed-v2" with
+                        { empty "stock-reservation-failed-v1" with
                             Failure = string failure }
                     | ReservationExpired(generation, deadline) ->
-                        { empty "reservation-expired-v2" with
+                        { empty "reservation-expired-v1" with
                             Generation = generation
                             Deadline = deadline.ToUnixTimeMilliseconds() }
-                    | CancelRequested -> empty "cancel-requested-v2"
-                    | ReservationsReleased -> empty "reservations-released-v2"
+                    | CancelRequested -> empty "cancel-requested-v1"
+                    | ReservationsReleased -> empty "reservations-released-v1"
                     | AuthorizePaymentRequested(method, attempt) ->
-                        { empty "authorize-payment-requested-v2" with
+                        { empty "authorize-payment-requested-v1" with
                             Method = PaymentMethodReference.value method
                             Attempt = PaymentOperationId.value attempt }
                     | PaymentAuthorized(attempt, reference) ->
-                        { empty "payment-authorized-v2" with
+                        { empty "payment-authorized-v1" with
                             Attempt = PaymentOperationId.value attempt
                             ProviderReference = reference }
                     | PaymentDeclined(attempt, reason) ->
-                        { empty "payment-declined-v2" with
+                        { empty "payment-declined-v1" with
                             Attempt = PaymentOperationId.value attempt
-                            Failure = reason }
-                    | PaymentSettled -> empty "payment-settled-v2"
-                    | StockCommitted -> empty "stock-committed-v2"
+                            Failure = ReasonCode.value reason }
+                    | PaymentSettled -> empty "payment-settled-v1"
+                    | StockCommitted -> empty "stock-committed-v1"
                     | StockCommitFailed reason ->
-                        { empty "stock-commit-failed-v2" with
-                            Failure = reason }
+                        { empty "stock-commit-failed-v1" with
+                            Failure = ReasonCode.value reason }
                     | MarkManualReview reason ->
-                        { empty "mark-manual-review-v2" with
-                            Reason = reason }
+                        { empty "mark-manual-review-v1" with
+                            Reason = ReasonCode.value reason }
                     | FulfilmentRequested plan ->
-                        { empty "fulfilment-requested-v3" with
+                        { empty "fulfilment-requested-v1" with
                             Shipments = plan |> List.map (statusOfPlan >> shipmentDto) |> List.toArray }
                     | ShipmentCreated(shipmentId, allocationId) ->
-                        { empty "shipment-created-v3" with
+                        { empty "shipment-created-v1" with
                             ShipmentId = ShipmentId.wireString shipmentId
                             AllocationId = ShipmentAllocationId.wireString allocationId }
                     | ShipmentCreationFailed(shipmentId, allocationId, reason) ->
-                        { empty "shipment-creation-failed-v3" with
+                        { empty "shipment-creation-failed-v1" with
                             ShipmentId = ShipmentId.wireString shipmentId
                             AllocationId = ShipmentAllocationId.wireString allocationId
-                            Reason = reason }
+                            Reason = ReasonCode.value reason }
                     | ShipmentDispatched(shipmentId, allocationId) ->
-                        { empty "shipment-dispatched-v3" with
+                        { empty "shipment-dispatched-v1" with
                             ShipmentId = ShipmentId.wireString shipmentId
                             AllocationId = ShipmentAllocationId.wireString allocationId }
                     | ShipmentDelivered(shipmentId, allocationId) ->
-                        { empty "shipment-delivered-v3" with
+                        { empty "shipment-delivered-v1" with
                             ShipmentId = ShipmentId.wireString shipmentId
                             AllocationId = ShipmentAllocationId.wireString allocationId }
                     | PaymentCaptured(captureId, operationId) ->
-                        { empty "payment-captured-v3" with
+                        { empty "payment-captured-v1" with
                             CaptureId = CaptureId.wireString captureId
                             OperationId = PaymentOperationId.value operationId }
                     | HoldRequested reason ->
-                        { empty "hold-requested-v3" with
-                            Reason = reason }
-                    | ReleaseHoldRequested -> empty "release-hold-requested-v3"
+                        { empty "hold-requested-v1" with
+                            Reason = ReasonCode.value reason }
+                    | ReleaseHoldRequested -> empty "release-hold-requested-v1"
                     | AddressSnapshotChanged snapshotId ->
-                        { empty "address-snapshot-changed-v3" with
+                        { empty "address-snapshot-changed-v1" with
                             AddressSnapshotId = OrderSnapshotId.wireString snapshotId }
                     | ReturnRequested request ->
-                        { empty "return-requested-v4" with
+                        { empty "return-requested-v1" with
                             Returns =
                                 [| returnDto
                                        { Request = request
                                          Status = "pending" } |] }
                     | ReturnRefunded id ->
-                        { empty "return-refunded-v4" with
+                        { empty "return-refunded-v1" with
                             ReturnId = ReturnId.wireString id }
                     | ReturnRejected id ->
-                        { empty "return-rejected-v4" with
+                        { empty "return-rejected-v1" with
                             ReturnId = ReturnId.wireString id }
                     | OrderRefunded id ->
-                        { empty "order-refunded-v4" with
+                        { empty "order-refunded-v1" with
                             RefundId = RefundId.wireString id }
                     | OrderRefundFailed(id, reason) ->
-                        { empty "order-refund-failed-v4" with
+                        { empty "order-refund-failed-v1" with
                             RefundId = RefundId.wireString id
-                            Reason = reason }
+                            Reason = ReasonCode.value reason }
 
                 encode "OrderEvent" dto)
             (fun json ->
                 decode "OrderEvent" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "order-submitted-v2" -> pendingOfDto dto |> Result.map OrderSubmitted
-                    | "cancel-requested-v2" -> Ok CancelRequested
-                    | "reservations-released-v2" -> Ok ReservationsReleased
-                    | "payment-settled-v2" -> Ok PaymentSettled
-                    | "stock-committed-v2" -> Ok StockCommitted
-                    | "mark-manual-review-v2" when not (String.IsNullOrWhiteSpace dto.Reason) ->
-                        Ok(MarkManualReview dto.Reason)
-                    | "stock-commit-failed-v2" when not (String.IsNullOrWhiteSpace dto.Failure) ->
-                        Ok(StockCommitFailed dto.Failure)
-                    | "stock-reservation-failed-v2" ->
+                    | "order-submitted-v1" -> pendingOfDto dto |> Result.map OrderSubmitted
+                    | "cancel-requested-v1" -> Ok CancelRequested
+                    | "reservations-released-v1" -> Ok ReservationsReleased
+                    | "payment-settled-v1" -> Ok PaymentSettled
+                    | "stock-committed-v1" -> Ok StockCommitted
+                    | "mark-manual-review-v1" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        (CodecSupport.reason dto.Reason |> Result.map MarkManualReview)
+                    | "stock-commit-failed-v1" when not (String.IsNullOrWhiteSpace dto.Failure) ->
+                        (CodecSupport.reason dto.Failure |> Result.map StockCommitFailed)
+                    | "stock-reservation-failed-v1" ->
                         match dto.Failure with
                         | "InsufficientStock" -> Ok(StockReservationFailed ReservationFailure.InsufficientStock)
                         | "ProductInactive" -> Ok(StockReservationFailed ReservationFailure.ProductInactive)
                         | "PriceVersionMismatch" -> Ok(StockReservationFailed ReservationFailure.PriceVersionMismatch)
                         | _ -> Ok(StockReservationFailed ReservationFailure.InvalidReservation)
-                    | "authorize-payment-requested-v2" ->
+                    | "authorize-payment-requested-v1" ->
                         PaymentMethodReference.tryParse dto.Method
                         |> Result.mapError (fun m -> codecError "OrderEvent" m)
                         |> Result.bind (fun method ->
                             PaymentOperationId.tryParse dto.Attempt
                             |> Result.mapError (fun m -> codecError "OrderEvent" m)
                             |> Result.map (fun attempt -> AuthorizePaymentRequested(method, attempt)))
-                    | "payment-authorized-v2" ->
+                    | "payment-authorized-v1" ->
                         PaymentOperationId.tryParse dto.Attempt
                         |> Result.mapError (fun m -> codecError "OrderEvent" m)
                         |> Result.bind (fun attempt ->
@@ -781,23 +782,22 @@ module OrderCodec =
                             |> Result.mapError (fun m -> codecError "OrderEvent" m)
                             |> Result.map (fun reference ->
                                 PaymentAuthorized(attempt, NonEmptyString.value reference)))
-                    | "payment-declined-v2" ->
+                    | "payment-declined-v1" ->
                         PaymentOperationId.tryParse dto.Attempt
                         |> Result.mapError (fun m -> codecError "OrderEvent" m)
                         |> Result.bind (fun attempt ->
-                            NonEmptyString.create 200 dto.Failure
-                            |> Result.mapError (fun m -> codecError "OrderEvent" m)
-                            |> Result.map (fun reason -> PaymentDeclined(attempt, NonEmptyString.value reason)))
-                    | "stock-reserved-v2" ->
+                            CodecSupport.reason dto.Failure
+                            |> Result.map (fun reason -> PaymentDeclined(attempt, reason)))
+                    | "stock-reserved-v1" ->
                         reservationIdsOfDto "OrderEvent" dto
                         |> Result.map (fun ids -> StockReserved(ids, dto.Generation))
-                    | "reservation-expired-v2" ->
+                    | "reservation-expired-v1" ->
                         try
                             DateTimeOffset.FromUnixTimeMilliseconds dto.Deadline
                             |> fun deadline -> Ok(ReservationExpired(dto.Generation, deadline))
                         with _ ->
                             Error(codecError "OrderEvent" "Invalid deadline.")
-                    | "fulfilment-requested-v3" ->
+                    | "fulfilment-requested-v1" ->
                         (if isNull dto.Shipments then
                              []
                          else
@@ -818,70 +818,73 @@ module OrderCodec =
                                 Error(codecError "OrderEvent" "Invalid fulfilment plan.")
                             else
                                 Ok(FulfilmentRequested(shipments |> List.map _.Plan)))
-                    | "shipment-created-v3" -> shipmentIdentityOfDto "OrderEvent" dto |> Result.map ShipmentCreated
-                    | "shipment-creation-failed-v3" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                    | "shipment-created-v1" -> shipmentIdentityOfDto "OrderEvent" dto |> Result.map ShipmentCreated
+                    | "shipment-creation-failed-v1" ->
                         shipmentIdentityOfDto "OrderEvent" dto
-                        |> Result.map (fun (shipmentId, allocationId) ->
-                            ShipmentCreationFailed(shipmentId, allocationId, dto.Reason))
-                    | "shipment-dispatched-v3" ->
+                        |> Result.bind (fun (shipmentId, allocationId) ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> ShipmentCreationFailed(shipmentId, allocationId, reason)))
+                    | "shipment-dispatched-v1" ->
                         shipmentIdentityOfDto "OrderEvent" dto |> Result.map ShipmentDispatched
-                    | "shipment-delivered-v3" ->
+                    | "shipment-delivered-v1" ->
                         shipmentIdentityOfDto "OrderEvent" dto |> Result.map ShipmentDelivered
-                    | "payment-captured-v3" ->
+                    | "payment-captured-v1" ->
                         idValue CaptureId.tryParse "OrderEvent" dto.CaptureId
                         |> Result.bind (fun captureId ->
                             idValue PaymentOperationId.tryParse "OrderEvent" dto.OperationId
                             |> Result.map (fun operationId -> PaymentCaptured(captureId, operationId)))
-                    | "hold-requested-v3" when not (String.IsNullOrWhiteSpace dto.Reason) ->
-                        Ok(HoldRequested dto.Reason)
-                    | "release-hold-requested-v3" -> Ok ReleaseHoldRequested
-                    | "address-snapshot-changed-v3" ->
+                    | "hold-requested-v1" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        (CodecSupport.reason dto.Reason |> Result.map HoldRequested)
+                    | "release-hold-requested-v1" -> Ok ReleaseHoldRequested
+                    | "address-snapshot-changed-v1" ->
                         guid "OrderEvent" dto.AddressSnapshotId
                         |> Result.bind (
                             OrderSnapshotId.create
                             >> Result.mapError (fun message -> codecError "OrderEvent" message)
                         )
                         |> Result.map AddressSnapshotChanged
-                    | "return-requested-v4" when not (isNull dto.Returns) && dto.Returns.Length = 1 ->
+                    | "return-requested-v1" when not (isNull dto.Returns) && dto.Returns.Length = 1 ->
                         returnOfDto "OrderEvent" dto.Returns[0]
                         |> Result.map (fun entry -> ReturnRequested entry.Request)
-                    | "return-refunded-v4" ->
+                    | "return-refunded-v1" ->
                         ReturnId.tryParse dto.ReturnId
                         |> Result.mapError (codecError "OrderEvent")
                         |> Result.map ReturnRefunded
-                    | "return-rejected-v4" ->
+                    | "return-rejected-v1" ->
                         ReturnId.tryParse dto.ReturnId
                         |> Result.mapError (codecError "OrderEvent")
                         |> Result.map ReturnRejected
-                    | "order-refunded-v4" ->
+                    | "order-refunded-v1" ->
                         RefundId.tryParse dto.RefundId
                         |> Result.mapError (codecError "OrderEvent")
                         |> Result.map OrderRefunded
-                    | "order-refund-failed-v4" ->
+                    | "order-refund-failed-v1" ->
                         RefundId.tryParse dto.RefundId
                         |> Result.mapError (codecError "OrderEvent")
-                        |> Result.map (fun id -> OrderRefundFailed(id, dto.Reason))
+                        |> Result.bind (fun id ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> OrderRefundFailed(id, reason)))
                     | tag -> Error(codecError "OrderEvent" $"Unknown tag '{tag}'.")))
 
     let action: Codec<OrderAction> =
         Codec.create
             (fun action ->
                 match action with
-                | ReserveStock order -> encode "OrderAction" (pendingDto "reserve-stock-v2" order)
+                | ReserveStock order -> encode "OrderAction" (pendingDto "reserve-stock-v1" order)
                 | ReleaseReservations ids ->
                     encode
                         "OrderAction"
-                        { empty "release-reservations-v2" with
+                        { empty "release-reservations-v1" with
                             ReservationIds = ids |> List.map ReservationId.wireString |> List.toArray }
                 | NotifyCartConverted cartId ->
                     encode
                         "OrderAction"
-                        { empty "notify-cart-converted-v2" with
+                        { empty "notify-cart-converted-v1" with
                             CartId = cartId }
                 | RequestAuthorization(method, attempt, amount) ->
                     encode
                         "OrderAction"
-                        { empty "request-authorization-v2" with
+                        { empty "request-authorization-v1" with
                             Method = PaymentMethodReference.value method
                             Attempt = PaymentOperationId.value attempt
                             Total = Money.wireAmount amount
@@ -889,17 +892,17 @@ module OrderCodec =
                 | RequestPaymentCancellation reason ->
                     encode
                         "OrderAction"
-                        { empty "request-payment-cancellation-v2" with
-                            Reason = reason }
+                        { empty "request-payment-cancellation-v1" with
+                            Reason = ReasonCode.value reason }
                 | CommitStock ids ->
                     encode
                         "OrderAction"
-                        { empty "commit-stock-v2" with
+                        { empty "commit-stock-v1" with
                             ReservationIds = ids |> List.map ReservationId.wireString |> List.toArray }
                 | CreateShipment(shipment, addressSnapshotId) ->
                     encode
                         "OrderAction"
-                        { empty "create-shipment-v3" with
+                        { empty "create-shipment-v1" with
                             AddressSnapshotId = OrderSnapshotId.wireString addressSnapshotId
                             Shipments = [| shipment |> statusOfPlan |> shipmentDto |] }
                 | RequestCapture(shipmentId, allocation, captureId, operationId, providerReference) ->
@@ -911,13 +914,13 @@ module OrderCodec =
 
                     encode
                         "OrderAction"
-                        { empty "request-capture-v3" with
+                        { empty "request-capture-v1" with
                             ProviderReference = providerReference
                             Shipments = [| shipment |> statusOfPlan |> shipmentDto |] }
                 | StartReturn request ->
                     encode
                         "OrderAction"
-                        { empty "start-return-v4" with
+                        { empty "start-return-v1" with
                             Returns =
                                 [| returnDto
                                        { Request = request
@@ -925,16 +928,16 @@ module OrderCodec =
                 | StartRefund request ->
                     encode
                         "OrderAction"
-                        { empty "start-refund-v4" with
+                        { empty "start-refund-v1" with
                             Refund = PaymentCodec.refundDto request })
             (fun json ->
                 decode "OrderAction" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "reserve-stock-v2" -> pendingOfDto dto |> Result.map ReserveStock
-                    | "notify-cart-converted-v2" when not (String.IsNullOrWhiteSpace dto.CartId) ->
+                    | "reserve-stock-v1" -> pendingOfDto dto |> Result.map ReserveStock
+                    | "notify-cart-converted-v1" when not (String.IsNullOrWhiteSpace dto.CartId) ->
                         Ok(NotifyCartConverted dto.CartId)
-                    | "request-authorization-v2" ->
+                    | "request-authorization-v1" ->
                         PaymentMethodReference.tryParse dto.Method
                         |> Result.mapError (fun m -> codecError "OrderAction" m)
                         |> Result.bind (fun method ->
@@ -944,12 +947,12 @@ module OrderCodec =
                                 Money.tryOfWire dto.Total dto.Currency
                                 |> Result.mapError (fun m -> codecError "OrderAction" m)
                                 |> Result.map (fun amount -> RequestAuthorization(method, attempt, amount))))
-                    | "request-payment-cancellation-v2" when not (String.IsNullOrWhiteSpace dto.Reason) ->
-                        Ok(RequestPaymentCancellation dto.Reason)
-                    | "commit-stock-v2" -> reservationIdsOfDto "OrderAction" dto |> Result.map CommitStock
-                    | "release-reservations-v2" ->
+                    | "request-payment-cancellation-v1" when not (String.IsNullOrWhiteSpace dto.Reason) ->
+                        (CodecSupport.reason dto.Reason |> Result.map RequestPaymentCancellation)
+                    | "commit-stock-v1" -> reservationIdsOfDto "OrderAction" dto |> Result.map CommitStock
+                    | "release-reservations-v1" ->
                         reservationIdsOfDto "OrderAction" dto |> Result.map ReleaseReservations
-                    | "create-shipment-v3" ->
+                    | "create-shipment-v1" ->
                         guid "OrderAction" dto.AddressSnapshotId
                         |> Result.bind (
                             OrderSnapshotId.create
@@ -971,7 +974,7 @@ module OrderCodec =
                                         Error(codecError "OrderAction" "CreateShipment contains status flags.")
                                     else
                                         Ok(CreateShipment(shipment.Plan, snapshotId))))
-                    | "request-capture-v3" when not (String.IsNullOrWhiteSpace dto.ProviderReference) ->
+                    | "request-capture-v1" when not (String.IsNullOrWhiteSpace dto.ProviderReference) ->
                         if isNull dto.Shipments || dto.Shipments.Length <> 1 then
                             Error(codecError "OrderAction" "RequestCapture requires exactly one allocation.")
                         else
@@ -995,10 +998,10 @@ module OrderCodec =
                                             dto.ProviderReference
                                         )
                                     ))
-                    | "start-return-v4" when not (isNull dto.Returns) && dto.Returns.Length = 1 ->
+                    | "start-return-v1" when not (isNull dto.Returns) && dto.Returns.Length = 1 ->
                         returnOfDto "OrderAction" dto.Returns[0]
                         |> Result.map (fun entry -> StartReturn entry.Request)
-                    | "start-refund-v4" -> PaymentCodec.refundOfDto "OrderAction" dto.Refund |> Result.map StartRefund
+                    | "start-refund-v1" -> PaymentCodec.refundOfDto "OrderAction" dto.Refund |> Result.map StartRefund
                     | tag -> Error(codecError "OrderAction" $"Unknown tag '{tag}'.")))
 
     let error: Codec<OrderActionError> =
@@ -1006,22 +1009,22 @@ module OrderCodec =
             (fun errorValue ->
                 let tag =
                     match errorValue with
-                    | OrderActionError.InvalidOrderEntityId -> "invalid-order-entity-id-v2"
-                    | OrderActionError.SnapshotMissing -> "snapshot-missing-v2"
-                    | OrderActionError.CallbackEncodingFailed -> "callback-encoding-v2"
-                    | OrderActionError.ActionReceiptMismatch -> "action-receipt-mismatch-v2"
-                    | OrderActionError.InvalidAction -> "invalid-action-v2"
+                    | OrderActionError.InvalidOrderEntityId -> "invalid-order-entity-id-v1"
+                    | OrderActionError.SnapshotMissing -> "snapshot-missing-v1"
+                    | OrderActionError.CallbackEncodingFailed -> "callback-encoding-v1"
+                    | OrderActionError.ActionReceiptMismatch -> "action-receipt-mismatch-v1"
+                    | OrderActionError.InvalidAction -> "invalid-action-v1"
 
                 encode "OrderActionError" (empty tag))
             (fun json ->
                 decode "OrderActionError" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "invalid-order-entity-id-v2" -> Ok OrderActionError.InvalidOrderEntityId
-                    | "snapshot-missing-v2" -> Ok OrderActionError.SnapshotMissing
-                    | "callback-encoding-v2" -> Ok OrderActionError.CallbackEncodingFailed
-                    | "action-receipt-mismatch-v2" -> Ok OrderActionError.ActionReceiptMismatch
-                    | "invalid-action-v2" -> Ok OrderActionError.InvalidAction
+                    | "invalid-order-entity-id-v1" -> Ok OrderActionError.InvalidOrderEntityId
+                    | "snapshot-missing-v1" -> Ok OrderActionError.SnapshotMissing
+                    | "callback-encoding-v1" -> Ok OrderActionError.CallbackEncodingFailed
+                    | "action-receipt-mismatch-v1" -> Ok OrderActionError.ActionReceiptMismatch
+                    | "invalid-action-v1" -> Ok OrderActionError.InvalidAction
                     | tag -> Error(codecError "OrderActionError" $"Unknown tag '{tag}'.")))
 
     let storeOptions
@@ -1046,7 +1049,7 @@ module OrderCodec =
     let private build (log: ILogger) storeArg =
         machine<OrderId, OrderState, OrderEvent, OrderAction, OrderActionError> (machineId Orders.MachineKey) {
             chart Orders.chartValue
-            chartVersion 4
+            chartVersion Orders.ChartVersion
             initialState Orders.initialState
             store storeArg
             logger log

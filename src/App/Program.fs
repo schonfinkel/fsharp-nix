@@ -198,6 +198,32 @@ module Application =
         CapabilityHashKey.create keyId bytes
         |> Result.defaultWith (fun message -> invalidOp message)
 
+    /// <summary>Supervised worker registration for one machine: the worker store owns LISTEN and
+    /// processing, the chart registry is shared, and action delivery resolves the scoped
+    /// <c>IActionHandler</c>.</summary>
+    let private worker<'Id, 'State, 'Event, 'Action, 'Error when 'Id: equality>
+        machineKey
+        loggerName
+        (buildWorker:
+            Microsoft.Extensions.Logging.ILogger
+                -> PostgresContext
+                -> Result<
+                    ByzantineSystems.Automata.Runtime.Machine<'Id, 'State, 'Event, 'Action, 'Error>,
+                    ByzantineSystems.Automata.Runtime.MachineConfigError list
+                 >)
+        =
+        { MachineKey = machineKey
+          Supervisor = AutomataSupervisorOptions.defaults machineKey
+          Actions = ActionDelivery.registered<'Id, 'Action, 'Error>
+          MachineFactory =
+            fun (provider: IServiceProvider) ->
+                buildWorker
+                    (provider.GetRequiredService<ILoggerFactory>().CreateLogger(loggerName: string))
+                    (provider.GetRequiredService<PostgresContext>())
+          ChartRegistry =
+            fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+          TimeProvider = TimeProvider.System }
+
     let configureServices (builder: WebApplicationBuilder) =
         builder.Services.AddRouting() |> ignore
         builder.Services.AddAntiforgery() |> ignore
@@ -391,110 +417,14 @@ module Application =
             .AddHostedService<CartAbandonmentScanner>()
             .AddHostedService<CartMergeScanner>()
             .AddHostedService<ReturnWindowScanner>()
-            .AddAutomata(
-                { MachineKey = Probe.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Probe.MachineKey
-                  Actions = ActionDelivery.registered<ProbeId, ProbeAction, ProbeActionError>
-                  MachineFactory =
-                    fun provider ->
-                        Probe.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "probes")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = AccountFlow.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults AccountFlow.MachineKey
-                  Actions = ActionDelivery.registered<FlowId, FlowAction, FlowActionError>
-                  MachineFactory =
-                    fun provider ->
-                        AccountFlowCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "flows")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Cart.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Cart.MachineKey
-                  Actions = ActionDelivery.registered<CartId, CartAction, CartActionError>
-                  MachineFactory =
-                    fun provider ->
-                        CartCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "carts")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Orders.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Orders.MachineKey
-                  Actions = ActionDelivery.registered<OrderId, OrderAction, OrderActionError>
-                  MachineFactory =
-                    fun provider ->
-                        OrderCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "orders")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Payments.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Payments.MachineKey
-                  Actions = ActionDelivery.registered<PaymentId, PaymentAction, PaymentActionError>
-                  MachineFactory =
-                    fun provider ->
-                        PaymentCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "payments")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Shipments.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Shipments.MachineKey
-                  Actions = ActionDelivery.registered<ShipmentEntityId, ShipmentAction, ShipmentActionError>
-                  MachineFactory =
-                    fun provider ->
-                        ShipmentCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "shipments")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Refunds.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Refunds.MachineKey
-                  Actions = ActionDelivery.registered<RefundEntityId, RefundAction, RefundActionError>
-                  MachineFactory =
-                    fun provider ->
-                        RefundCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "refunds")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Returns.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Returns.MachineKey
-                  Actions = ActionDelivery.registered<ReturnEntityId, ReturnAction, ReturnActionError>
-                  MachineFactory =
-                    fun provider ->
-                        ReturnCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "returns")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
+            .AddAutomata(worker Probe.MachineKey "probes" Probe.buildWorker)
+            .AddAutomata(worker AccountFlow.MachineKey "flows" AccountFlowCodec.buildWorker)
+            .AddAutomata(worker Cart.MachineKey "carts" CartCodec.buildWorker)
+            .AddAutomata(worker Orders.MachineKey "orders" OrderCodec.buildWorker)
+            .AddAutomata(worker Payments.MachineKey "payments" PaymentCodec.buildWorker)
+            .AddAutomata(worker Shipments.MachineKey "shipments" ShipmentCodec.buildWorker)
+            .AddAutomata(worker Refunds.MachineKey "refunds" RefundCodec.buildWorker)
+            .AddAutomata(worker Returns.MachineKey "returns" ReturnCodec.buildWorker)
             .AddAutomataMaintenance(
                 { MaintenanceOptions.defaults (fun provider ->
                       PostgresMaintenance(provider.GetRequiredService<PostgresContext>())) with

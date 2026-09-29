@@ -11,19 +11,19 @@ type RefundState =
     | OutcomeUnknown of ApprovedRefund
     | SettlementPending of ApprovedRefund * providerRefundReference: string
     | Succeeded of RefundRequest
-    | Failed of RefundRequest * reasonCode: string
-    | ManualReview of RefundRequest * reasonCode: string
+    | Failed of RefundRequest * reasonCode: ReasonCode
+    | ManualReview of RefundRequest * reasonCode: ReasonCode
     | Closed of RefundRequest
 
 type RefundEvent =
     | RefundRequested of RefundRequest
     | AllocationApproved of ApprovedRefund
-    | AllocationDenied of RefundRequest * reasonCode: string
+    | AllocationDenied of RefundRequest * reasonCode: ReasonCode
     | GatewayRefunded of ApprovedRefund * providerRefundReference: string
-    | GatewayDeclined of ApprovedRefund * reasonCode: string
+    | GatewayDeclined of ApprovedRefund * reasonCode: ReasonCode
     | GatewayUnknown of ApprovedRefund
     | AllocationSettled of RefundAllocationId
-    | ManualReviewRequested of reasonCode: string
+    | ManualReviewRequested of reasonCode: ReasonCode
     | CloseRequested
 
 type RefundAction =
@@ -33,7 +33,7 @@ type RefundAction =
     | SettleAllocation of ApprovedRefund * providerRefundReference: string
     | ReleaseAllocation of RefundRequest
     | NotifyOriginSucceeded of RefundRequest
-    | NotifyOriginFailed of RefundRequest * reasonCode: string
+    | NotifyOriginFailed of RefundRequest * reasonCode: ReasonCode
 
 [<RequireQualifiedAccess>]
 type RefundActionError =
@@ -52,6 +52,11 @@ module Refunds =
 
     [<Literal>]
     let ActionQueue = "refund_actions"
+
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
 
     let initialState = Initial
 

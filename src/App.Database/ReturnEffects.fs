@@ -13,6 +13,8 @@ open Npgsql
 
 [<RequireQualifiedAccess>]
 module ReturnEffects =
+    let private labelFailed = ReasonCode.ofLiteral "label-failed"
+
     let actionKind =
         function
         | VerifyAuthorization _ -> "verify-return-authorization"
@@ -27,8 +29,11 @@ module ReturnEffects =
         | Error _ -> Task.FromResult(Error ReturnActionError.CallbackEncodingFailed)
         | Ok json ->
             task {
-                let! first = WorkflowEffects.receipt connection tx record (actionKind record.Action) json ct
-                return Ok first
+                match! WorkflowEffects.receipt connection tx record (actionKind record.Action) json ct with
+                | Ok ReceiptStatus.FirstRun -> return Ok true
+                | Ok ReceiptStatus.Duplicate -> return Ok false
+                | Error ReceiptFailure.EncodingFailed -> return Error ReturnActionError.CallbackEncodingFailed
+                | Error ReceiptFailure.Mismatch -> return Error ReturnActionError.ActionReceiptMismatch
             }
 
     let private deliver connection tx record purpose machine entity value (codec: Codec<'Event>) ct =
@@ -58,7 +63,7 @@ module ReturnEffects =
                 let event =
                     match outcome with
                     | CarrierLabelCreated reference -> LabelCreated reference
-                    | CarrierLabelFailed reason -> LabelFailed reason
+                    | CarrierLabelFailed reason -> LabelFailed(ReasonCode.sanitize labelFailed reason)
 
                 use connection = dataSource.CreateConnection()
                 do! connection.OpenAsync ct
@@ -129,7 +134,10 @@ module ReturnEffects =
                                 if valid :?> bool then
                                     AuthorizationApproved request.AuthorizationId
                                 else
-                                    AuthorizationRejected(request.AuthorizationId, "return-not-authorized")
+                                    AuthorizationRejected(
+                                        request.AuthorizationId,
+                                        ReasonCode.ofLiteral "return-not-authorized"
+                                    )
 
                             return!
                                 deliver

@@ -507,7 +507,7 @@ module OrderEffects =
                         if committed > 0 then
                             StockCommitted
                         else
-                            StockCommitFailed "no-open-reservations"
+                            StockCommitFailed(ReasonCode.ofLiteral "no-open-reservations")
 
                     match OrderCodec.event.Encode event with
                     | Error _ ->

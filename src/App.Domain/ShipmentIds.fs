@@ -12,6 +12,9 @@ module ShipmentId =
         else
             Ok(ShipmentId value)
 
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : ShipmentId = ShipmentId(Guid.CreateVersion7())
+
     let value (ShipmentId value) = value
 
     let tryParse (value: string) : Result<ShipmentId, string> =
@@ -31,6 +34,10 @@ module ShipmentAllocationId =
         else
             Ok(ShipmentAllocationId value)
 
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : ShipmentAllocationId =
+        ShipmentAllocationId(Guid.CreateVersion7())
+
     let value (ShipmentAllocationId value) = value
 
     let tryParse (value: string) : Result<ShipmentAllocationId, string> =
@@ -49,6 +56,9 @@ module CaptureId =
             Error "A capture id must not be empty."
         else
             Ok(CaptureId value)
+
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : CaptureId = CaptureId(Guid.CreateVersion7())
 
     let value (CaptureId value) = value
 
@@ -102,3 +112,12 @@ module CarrierReference =
     let value (CarrierReference value) = value
 
     let tryParse (value: string) = create value
+
+[<RequireQualifiedAccess>]
+module PaymentOperationIds =
+    /// <summary>The deterministic capture operation id for a shipment: the provider idempotency
+    /// key for the partial capture triggered by that shipment's dispatch.</summary>
+    let forCapture (shipmentId: ShipmentId) : PaymentOperationId =
+        match PaymentOperationId.create $"capture:v1:{ShipmentId.value shipmentId:N}" with
+        | Ok id -> id
+        | Error message -> invalidOp message

@@ -2,6 +2,7 @@ namespace App
 
 open System
 open System.Collections.Generic
+open Microsoft.FSharp.Reflection
 
 [<RequireQualifiedAccess>]
 type RuntimeComponent =
@@ -43,6 +44,40 @@ module RuntimeComponent =
         | RuntimeComponent.CartMergeScanner -> "cart-merge-scanner"
         | RuntimeComponent.ReservationExpiryScanner -> "reservation-expiry-scanner"
 
+    /// <summary>Every component, derived from the union so the health table and readiness
+    /// gates can never miss a newly added case.</summary>
+    let all: RuntimeComponent list =
+        FSharpType.GetUnionCases typeof<RuntimeComponent>
+        |> Array.map (fun case -> FSharpValue.MakeUnion(case, [||]) :?> RuntimeComponent)
+        |> List.ofArray
+
+    /// <summary>Startup components gate <c>/health/startup</c>; workers must also report a
+    /// recent successful pass for <c>/health/ready</c>. Exhaustive so every new case is
+    /// classified at compile time.</summary>
+    [<RequireQualifiedAccess>]
+    type Kind =
+        | Startup
+        | Worker
+
+    let kind =
+        function
+        | RuntimeComponent.Boot
+        | RuntimeComponent.ProbeMachine
+        | RuntimeComponent.AccountFlowMachine
+        | RuntimeComponent.CartMachine
+        | RuntimeComponent.OrderMachine
+        | RuntimeComponent.PaymentMachine
+        | RuntimeComponent.ShipmentMachine
+        | RuntimeComponent.RefundMachine
+        | RuntimeComponent.ReturnMachine -> Kind.Startup
+        | RuntimeComponent.ReturnWindowScanner
+        | RuntimeComponent.IntegrationOutboxRelay
+        | RuntimeComponent.EmailDeliveryRelay
+        | RuntimeComponent.FlowDeadlineScanner
+        | RuntimeComponent.CartAbandonmentScanner
+        | RuntimeComponent.CartMergeScanner
+        | RuntimeComponent.ReservationExpiryScanner -> Kind.Worker
+
 [<RequireQualifiedAccess>]
 type RuntimeFailure =
     | InvalidChart
@@ -78,22 +113,7 @@ type RuntimeHealth(timeProvider: TimeProvider) =
 
     let observations =
         Dictionary<RuntimeComponent, RuntimeObservation>(
-            [ RuntimeComponent.Boot
-              RuntimeComponent.ProbeMachine
-              RuntimeComponent.AccountFlowMachine
-              RuntimeComponent.CartMachine
-              RuntimeComponent.OrderMachine
-              RuntimeComponent.PaymentMachine
-              RuntimeComponent.ShipmentMachine
-              RuntimeComponent.RefundMachine
-              RuntimeComponent.ReturnMachine
-              RuntimeComponent.ReturnWindowScanner
-              RuntimeComponent.IntegrationOutboxRelay
-              RuntimeComponent.EmailDeliveryRelay
-              RuntimeComponent.FlowDeadlineScanner
-              RuntimeComponent.CartAbandonmentScanner
-              RuntimeComponent.CartMergeScanner
-              RuntimeComponent.ReservationExpiryScanner ]
+            RuntimeComponent.all
             |> Seq.map (fun service -> KeyValuePair(service, initial service))
         )
 
@@ -143,15 +163,12 @@ type RuntimeHealth(timeProvider: TimeProvider) =
 
 [<RequireQualifiedAccess>]
 module RuntimeHealth =
+    let private ofKind expected =
+        RuntimeComponent.all
+        |> List.filter (fun service -> RuntimeComponent.kind service = expected)
+
     let startupReady (snapshot: Map<RuntimeComponent, RuntimeObservation>) =
-        [ RuntimeComponent.Boot
-          RuntimeComponent.ProbeMachine
-          RuntimeComponent.AccountFlowMachine
-          RuntimeComponent.CartMachine
-          RuntimeComponent.OrderMachine
-          RuntimeComponent.PaymentMachine
-          RuntimeComponent.ShipmentMachine ]
-        @ [ RuntimeComponent.RefundMachine; RuntimeComponent.ReturnMachine ]
+        ofKind RuntimeComponent.Kind.Startup
         |> List.forall (fun service -> snapshot[service].Phase = RuntimePhase.Healthy)
 
     let workersReady
@@ -159,13 +176,7 @@ module RuntimeHealth =
         (maximumAge: TimeSpan)
         (snapshot: Map<RuntimeComponent, RuntimeObservation>)
         =
-        [ RuntimeComponent.IntegrationOutboxRelay
-          RuntimeComponent.EmailDeliveryRelay
-          RuntimeComponent.FlowDeadlineScanner
-          RuntimeComponent.CartAbandonmentScanner
-          RuntimeComponent.CartMergeScanner ]
-        @ [ RuntimeComponent.ReservationExpiryScanner
-            RuntimeComponent.ReturnWindowScanner ]
+        ofKind RuntimeComponent.Kind.Worker
         |> List.forall (fun service ->
             let observation = snapshot[service]
 

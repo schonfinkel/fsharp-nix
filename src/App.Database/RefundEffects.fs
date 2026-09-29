@@ -29,8 +29,11 @@ module RefundEffects =
         | Error _ -> Task.FromResult(Error RefundActionError.CallbackEncodingFailed)
         | Ok json ->
             task {
-                let! first = WorkflowEffects.receipt connection tx record (actionKind record.Action) json ct
-                return Ok first
+                match! WorkflowEffects.receipt connection tx record (actionKind record.Action) json ct with
+                | Ok ReceiptStatus.FirstRun -> return Ok true
+                | Ok ReceiptStatus.Duplicate -> return Ok false
+                | Error ReceiptFailure.EncodingFailed -> return Error RefundActionError.CallbackEncodingFailed
+                | Error ReceiptFailure.Mismatch -> return Error RefundActionError.ActionReceiptMismatch
             }
 
     let private deliver connection tx record purpose machine entity codecEvent (codec: Codec<'Event>) ct =
@@ -194,6 +197,8 @@ module RefundEffects =
                     return Ok()
         }
 
+    let private providerDeclined = ReasonCode.ofLiteral "provider-declined"
+
     let private recordedEvent approved status reference result =
         match status with
         | "succeeded" ->
@@ -202,7 +207,13 @@ module RefundEffects =
                 reference
                 |> Option.defaultWith (fun () -> invalidOp "Missing refund reference.")
             )
-        | "failed" -> GatewayDeclined(approved, result |> Option.defaultValue "provider-declined")
+        | "failed" ->
+            GatewayDeclined(
+                approved,
+                result
+                |> Option.map (ReasonCode.sanitize providerDeclined)
+                |> Option.defaultValue providerDeclined
+            )
         | _ -> GatewayUnknown approved
 
     let applyGateway
@@ -327,10 +338,9 @@ module RefundEffects =
                                 not (String.IsNullOrWhiteSpace providerRef) && providerRef.Length <= 256
                                 ->
                                 "succeeded", Some providerRef, "refunded", GatewayRefunded(approved, providerRef)
-                            | GatewayRefund.GatewayRefundDeclined code when
-                                not (String.IsNullOrWhiteSpace code) && code.Length <= 64
-                                ->
-                                "failed", None, code, GatewayDeclined(approved, code)
+                            | GatewayRefund.GatewayRefundDeclined text ->
+                                let reason = ReasonCode.sanitize providerDeclined text
+                                "failed", None, ReasonCode.value reason, GatewayDeclined(approved, reason)
                             | _ -> "unknown", None, "outcome-unknown", GatewayUnknown approved
 
                         use settleConnection = dataSource.CreateConnection()

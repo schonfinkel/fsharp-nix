@@ -7,6 +7,9 @@ type RefundId = private RefundId of Guid
 
 [<RequireQualifiedAccess>]
 module RefundId =
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : RefundId = RefundId(Guid.CreateVersion7())
+
     let create value =
         if value = Guid.Empty then
             Error "A refund id is required."
@@ -26,6 +29,10 @@ type RefundAllocationId = private RefundAllocationId of Guid
 
 [<RequireQualifiedAccess>]
 module RefundAllocationId =
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : RefundAllocationId =
+        RefundAllocationId(Guid.CreateVersion7())
+
     let create value =
         if value = Guid.Empty then
             Error "A refund allocation id is required."

@@ -789,7 +789,7 @@ module CartCodec =
     let private build (log: ILogger) storeArg =
         machine<CartId, CartState, CartEvent, CartAction, CartActionError> (machineId Cart.MachineKey) {
             chart Cart.chartValue
-            chartVersion 2
+            chartVersion Cart.ChartVersion
             initialState Cart.initialState
             store storeArg
             logger log

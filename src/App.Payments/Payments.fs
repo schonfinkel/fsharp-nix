@@ -64,26 +64,26 @@ type PaymentState =
     | VoidPending of AuthorizedPayment
     | VoidUnknown of AuthorizedPayment
     | Voided of AuthorizedPayment
-    | Declined of reasonCode: string
+    | Declined of reasonCode: ReasonCode
     | CancelledWithoutCharge
-    | ManualReview of reasonCode: string
+    | ManualReview of reasonCode: ReasonCode
 
 type PaymentEvent =
     | AuthorizeRequested of AuthorizationAttempt
     | AuthorizationSucceeded of AuthorizationAttempt * providerReference: string * expiresAt: DateTimeOffset
-    | AuthorizationDeclined of AuthorizationAttempt * reasonCode: string
+    | AuthorizationDeclined of AuthorizationAttempt * reasonCode: ReasonCode
     | AuthorizationOutcomeUnknown of AuthorizationAttempt
     | CaptureRequested of CaptureRequest
     | CaptureSucceeded of CaptureRequest * providerReference: string
     | CaptureOutcomeUnknown of CaptureRequest
-    | CaptureDeclined of CaptureRequest * reasonCode: string
+    | CaptureDeclined of CaptureRequest * reasonCode: ReasonCode
     | RefundAllocationRequested of RefundRequest
     | RefundAllocationSettled of RefundAllocationId
     | RefundAllocationReleased of RefundAllocationId
-    | PaymentCancellationRequested of orderId: string * reason: string
+    | PaymentCancellationRequested of orderId: string * reason: ReasonCode
     | VoidSucceeded of AuthorizedPayment
     | VoidOutcomeUnknown of AuthorizedPayment
-    | MarkManualReview of reasonCode: string
+    | MarkManualReview of reasonCode: ReasonCode
 
 type PaymentAction =
     | CallGatewayAuthorize of AuthorizationAttempt
@@ -92,12 +92,12 @@ type PaymentAction =
     | QueryGatewayCapture of AuthorizedPayment * CaptureRequest
     | CallGatewayVoid of AuthorizedPayment
     | NotifyOrderAuthorized of AuthorizedPayment
-    | NotifyOrderDeclined of AuthorizationAttempt * reasonCode: string
+    | NotifyOrderDeclined of AuthorizationAttempt * reasonCode: ReasonCode
     | NotifyOrderCancelled of orderId: string
     | NotifyOrderVoided of AuthorizedPayment
     | NotifyOrderCaptured of CaptureRecord
     | NotifyRefundApproved of ApprovedRefund
-    | NotifyRefundDenied of RefundRequest * reasonCode: string
+    | NotifyRefundDenied of RefundRequest * reasonCode: ReasonCode
     | NotifyRefundSettled of RefundRequest
 
 [<RequireQualifiedAccess>]
@@ -118,6 +118,11 @@ module Payments =
 
     [<Literal>]
     let ActionQueue = "payment_actions"
+
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
 
     let initialState = Initial
 
@@ -318,17 +323,17 @@ module Payments =
                       { Request = request
                         PaymentReference = payment.Authorization.ProviderReference } ],
                 state
-            | Some _ -> [ NotifyRefundDenied(request, "allocation-conflict") ], state
+            | Some _ -> [ NotifyRefundDenied(request, (ReasonCode.ofLiteral "allocation-conflict")) ], state
             | None ->
                 match refundableTotal payment with
-                | Error _ -> [ NotifyRefundDenied(request, "balance-invalid") ], state
+                | Error _ -> [ NotifyRefundDenied(request, (ReasonCode.ofLiteral "balance-invalid")) ], state
                 | Ok remaining when
                     RefundOrigin.orderId request.Origin <> expectedOrder
                     || Money.currencyCode request.Amount <> Money.currencyCode remaining
                     || Money.amount request.Amount <= 0m
                     || request.Amount > remaining
                     ->
-                    [ NotifyRefundDenied(request, "insufficient-captured-balance") ], state
+                    [ NotifyRefundDenied(request, (ReasonCode.ofLiteral "insufficient-captured-balance")) ], state
                 | Ok _ ->
                     let updated =
                         { payment with
@@ -515,7 +520,7 @@ module Payments =
                     | CapturePending pending -> settleCapture true pending event
                     | _ -> [], state)
 
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "cancellation-during-capture")
+                on cancelAfterCapture (fun _ _ -> [], ManualReview(ReasonCode.ofLiteral "cancellation-during-capture"))
                 internalOn absorb (fun _ _ -> [])
             }
 
@@ -525,7 +530,9 @@ module Payments =
                     | CaptureUnknown pending -> settleCapture false pending event
                     | _ -> [], state)
 
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "cancellation-during-unknown-capture")
+                on cancelAfterCapture (fun _ _ ->
+                    [], ManualReview(ReasonCode.ofLiteral "cancellation-during-unknown-capture"))
+
                 internalOn absorb (fun _ _ -> [])
             }
 
@@ -537,14 +544,14 @@ module Payments =
                         CapturePending { Payment = payment; Request = request }
                     | _ -> [], state)
 
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
+                on cancelAfterCapture (fun _ _ -> [], ManualReview(ReasonCode.ofLiteral "void-requested-after-capture"))
                 on refundRequest applyRefundRequest
                 on refundSettlement applyRefundSettlement
                 internalOn absorb (fun _ _ -> [])
             }
 
             state "captured" {
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
+                on cancelAfterCapture (fun _ _ -> [], ManualReview(ReasonCode.ofLiteral "void-requested-after-capture"))
                 on refundRequest applyRefundRequest
                 on refundSettlement applyRefundSettlement
                 internalOn absorb (fun _ _ -> [])

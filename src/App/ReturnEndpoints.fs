@@ -1,6 +1,7 @@
 namespace App
 
 open System
+open System.Threading.Tasks
 open App.Database
 open App.Domain
 open App.Returns
@@ -233,25 +234,64 @@ module ReturnEndpoints =
 
                                                     button (type' = "submit") { "Start refund" }
                                                 }
+
+                                            if
+                                                (match snapshot.State with
+                                                 | ReturnState.Rejected _
+                                                 | Refunded _
+                                                 | RejectedAfterInspection _ -> true
+                                                 | _ -> false)
+                                            then
+                                                form (action = $"{actionRoot}/close", method = "post") {
+                                                    context.GetAntiforgeryInput()
+
+                                                    input (
+                                                        type' = "hidden",
+                                                        name = "key",
+                                                        value = Guid.NewGuid().ToString("D")
+                                                    )
+
+                                                    button (type' = "submit") { "Close return" }
+                                                }
                                         })
                                 )
                     | _ -> return! notFound context
             }
 
+    /// <summary>The operator operations exposed on <c>/admin/returns/{id}/{action}</c>.</summary>
+    [<RequireQualifiedAccess>]
+    type private AdminOperation =
+        | Scan
+        | Receive
+        | Approve
+        | Reject
+        | Refund
+        | Close
+
+    let private parseOperation =
+        function
+        | "scan" -> Some AdminOperation.Scan
+        | "receive" -> Some AdminOperation.Receive
+        | "approve" -> Some AdminOperation.Approve
+        | "reject" -> Some AdminOperation.Reject
+        | "refund" -> Some AdminOperation.Refund
+        | "close" -> Some AdminOperation.Close
+        | _ -> None
+
+    let private operatorRejected = ReasonCode.ofLiteral "operator-rejected"
+
     let adminAction: EndpointHandler =
         fun context ->
             task {
-                match routeId context with
-                | Error _ -> return! notFound context
-                | Ok id ->
-                    let action = context.TryGetRouteValue("action") |> Option.defaultValue ""
+                match routeId context, context.TryGetRouteValue("action") |> Option.bind parseOperation with
+                | Error _, _
+                | _, None -> return! HttpErrors.notFound "Return operation not found." context
+                | Ok id, Some operation ->
                     let! form = context.Request.ReadFormAsync context.RequestAborted
                     let key = formValue form "key"
 
                     match Guid.TryParseExact(key, "D") with
-                    | false, _ ->
-                        context.Response.StatusCode <- StatusCodes.Status422UnprocessableEntity
-                        return! context.WriteHtmlView(p (class' = "error") { "Invalid operation key." })
+                    | false, _ -> return! HttpErrors.badRequest "Invalid operation key." context
                     | true, _ ->
                         let quantities =
                             match
@@ -265,23 +305,23 @@ module ReturnEndpoints =
                             | _ -> None
 
                         let event =
-                            match action, quantities with
-                            | "scan", _ ->
+                            match operation, quantities with
+                            | AdminOperation.Scan, _ ->
                                 ReturnTrackingEventId.create $"scan:{key}"
                                 |> Result.map CarrierScanReceived
                                 |> Result.toOption
-                            | "receive", Some lines -> Some(ItemsReceived lines)
-                            | "approve", Some lines -> Some(InspectionApproved lines)
-                            | "reject", _ -> Some(InspectionRejected "operator-rejected")
-                            | "refund", _ -> Some CloseRequested
-                            | _ -> None
+                            | AdminOperation.Receive, Some lines -> Some(ItemsReceived lines)
+                            | AdminOperation.Approve, Some lines -> Some(InspectionApproved lines)
+                            | AdminOperation.Reject, _ -> Some(InspectionRejected operatorRejected)
+                            | AdminOperation.Refund, _ -> Some RefundStartRequested
+                            | AdminOperation.Close, _ -> Some CloseRequested
+                            | (AdminOperation.Receive | AdminOperation.Approve), None -> None
 
                         match event with
-                        | None ->
-                            context.Response.StatusCode <- StatusCodes.Status422UnprocessableEntity
-                            return! context.WriteHtmlView(p (class' = "error") { "Invalid return operation." })
+                        | None -> return! HttpErrors.unprocessable "Invalid return operation." context
                         | Some event ->
                             let returns = context.GetService<ReturnMachineClient>()
+                            let action = context.TryGetRouteValue("action") |> Option.defaultValue ""
 
                             let! outcome =
                                 Machine.send
@@ -290,14 +330,11 @@ module ReturnEndpoints =
                                     (EventEnvelope.create $"return-op:{ReturnId.wireString id}:{action}:{key}" event)
                                     context.RequestAborted
 
-                            match outcome with
-                            | Ok(CommandResult.Committed _) ->
-                                return! Web.redirect $"/admin/returns/{ReturnId.wireString id}" context
-                            | _ ->
-                                context.Response.StatusCode <- StatusCodes.Status409Conflict
-
-                                return!
-                                    context.WriteHtmlView(
-                                        p (class' = "error") { "The return cannot make that transition." }
-                                    )
+                            return!
+                                HttpErrors.respond
+                                    (HttpOutcome.ofSend outcome)
+                                    "The return cannot make that transition."
+                                    (fun context ->
+                                        Web.redirect $"/admin/returns/{ReturnId.wireString id}" context :> Task)
+                                    context
             }

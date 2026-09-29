@@ -8,6 +8,9 @@ type ProductId = private ProductId of value: Guid
 
 module ProductId =
 
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : ProductId = ProductId(Guid.CreateVersion7())
+
     let create (value: Guid) : Result<ProductId, string> =
         if value = Guid.Empty then
             Error "A product id must not be empty."
@@ -89,6 +92,9 @@ module PriceVersion =
 type OrderLineId = private OrderLineId of Guid
 
 module OrderLineId =
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : OrderLineId = OrderLineId(Guid.CreateVersion7())
+
     let create (value: Guid) =
         if value = Guid.Empty then
             Error "An order-line id must not be empty."
@@ -104,6 +110,9 @@ module OrderLineId =
 type ReservationId = private ReservationId of Guid
 
 module ReservationId =
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : ReservationId = ReservationId(Guid.CreateVersion7())
+
     let create (value: Guid) =
         if value = Guid.Empty then
             Error "A reservation id must not be empty."
@@ -119,6 +128,9 @@ module ReservationId =
 type OrderSnapshotId = private OrderSnapshotId of Guid
 
 module OrderSnapshotId =
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : OrderSnapshotId = OrderSnapshotId(Guid.CreateVersion7())
+
     let create (value: Guid) =
         if value = Guid.Empty then
             Error "An order snapshot id must not be empty."

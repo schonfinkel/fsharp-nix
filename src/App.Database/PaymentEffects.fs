@@ -298,11 +298,13 @@ module PaymentEffects =
         && value
            |> Seq.forall (fun c -> Char.IsAsciiLetterOrDigit c || c = ':' || c = '/' || c = '_' || c = '-')
 
-    let private validResultCode (value: string) =
-        not (String.IsNullOrWhiteSpace value)
-        && value.Length <= 64
-        && value
-           |> Seq.forall (fun c -> Char.IsAsciiLetterLower c || Char.IsDigit c || c = '-')
+    let private providerDeclined = ReasonCode.ofLiteral "provider-declined"
+
+    /// <summary>The recorded decline reason of a settled operation row.</summary>
+    let private recordedReason (row: OperationRow) =
+        row.ResultCode
+        |> Option.map (ReasonCode.sanitize providerDeclined)
+        |> Option.defaultValue providerDeclined
 
     let private authorizeOutcome attempt (outcome: GatewayAuthorization) =
         match outcome with
@@ -314,10 +316,9 @@ module PaymentEffects =
             AuthorizationSucceeded(attempt, reference, expiresAt)
         | GatewayAuthorized _ ->
             "unknown", None, Some "invalid-provider-response", None, AuthorizationOutcomeUnknown attempt
-        | GatewayAuthorization.GatewayDeclined reason when validResultCode reason ->
-            "failed", None, Some reason, None, AuthorizationDeclined(attempt, reason)
-        | GatewayAuthorization.GatewayDeclined _ ->
-            "failed", None, Some "provider-declined", None, AuthorizationDeclined(attempt, "provider-declined")
+        | GatewayAuthorization.GatewayDeclined text ->
+            let reason = ReasonCode.sanitize providerDeclined text
+            "failed", None, Some(ReasonCode.value reason), None, AuthorizationDeclined(attempt, reason)
         | GatewayOutcomeUnknown -> "unknown", None, Some "outcome-unknown", None, AuthorizationOutcomeUnknown attempt
 
     let private authorizeRowEvent attempt (row: OperationRow) =
@@ -330,7 +331,7 @@ module PaymentEffects =
                 row.ExpiresAt
                 |> Option.defaultWith (fun () -> invalidOp "succeeded authorizations carry an expiry")
             )
-        | "failed" -> AuthorizationDeclined(attempt, row.ResultCode |> Option.defaultValue "unknown")
+        | "failed" -> AuthorizationDeclined(attempt, recordedReason row)
         | _ -> AuthorizationOutcomeUnknown attempt
 
     let private captureOutcome request (outcome: GatewayCapture) =
@@ -338,10 +339,9 @@ module PaymentEffects =
         | GatewayCaptured reference when validProviderReference reference ->
             "succeeded", Some reference, Some "captured", None, CaptureSucceeded(request, reference)
         | GatewayCaptured _ -> "unknown", None, Some "invalid-provider-response", None, CaptureOutcomeUnknown request
-        | GatewayCaptureDeclined reason when validResultCode reason ->
-            "failed", None, Some reason, None, CaptureDeclined(request, reason)
-        | GatewayCaptureDeclined _ ->
-            "failed", None, Some "provider-declined", None, CaptureDeclined(request, "provider-declined")
+        | GatewayCaptureDeclined text ->
+            let reason = ReasonCode.sanitize providerDeclined text
+            "failed", None, Some(ReasonCode.value reason), None, CaptureDeclined(request, reason)
         | GatewayCaptureUnknown -> "unknown", None, Some "outcome-unknown", None, CaptureOutcomeUnknown request
 
     let private captureRowEvent request (row: OperationRow) =
@@ -352,7 +352,7 @@ module PaymentEffects =
                 row.ProviderReference
                 |> Option.defaultWith (fun () -> invalidOp "succeeded captures carry a reference")
             )
-        | "failed" -> CaptureDeclined(request, row.ResultCode |> Option.defaultValue "unknown")
+        | "failed" -> CaptureDeclined(request, recordedReason row)
         | _ -> CaptureOutcomeUnknown request
 
     let private recordAndSettle

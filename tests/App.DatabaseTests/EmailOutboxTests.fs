@@ -166,7 +166,7 @@ type EmailOutboxTests(fixture: PostgreSqlFixture) =
             Assert.Equal(None, lastError)
 
             let! callback = outboxCallback (EmailOutbox.sentCallbackKey flowId 1)
-            Assert.Equal(Some("notification-sent-v2", 1), callback)
+            Assert.Equal(Some("notification-sent-v1", 1), callback)
         }
 
     member _.``settlement is fenced by the claiming lease owner``() =
@@ -222,7 +222,7 @@ type EmailOutboxTests(fixture: PostgreSqlFixture) =
             Assert.Equal(Some "smtp-status-550", lastError)
 
             let! callback = outboxCallback (EmailOutbox.failedCallbackKey flowId 1)
-            Assert.Equal(Some("notification-send-failed-v2", 1), callback)
+            Assert.Equal(Some("notification-send-failed-v1", 1), callback)
         }
 
     member _.``exhausted attempts dead-letter even a retryable classification``() =

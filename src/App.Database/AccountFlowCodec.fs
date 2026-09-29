@@ -139,13 +139,13 @@ module AccountFlowCodec =
         let StartRequestedEvent = "start-requested-v1"
 
         [<Literal>]
-        let NotificationQueuedEvent = "notification-queued-v2"
+        let NotificationQueuedEvent = "notification-queued-v1"
 
         [<Literal>]
-        let NotificationSentEvent = "notification-sent-v2"
+        let NotificationSentEvent = "notification-sent-v1"
 
         [<Literal>]
-        let NotificationSendFailedEvent = "notification-send-failed-v2"
+        let NotificationSendFailedEvent = "notification-send-failed-v1"
 
         [<Literal>]
         let CompletionSucceededEvent = "completion-succeeded-v1"
@@ -160,7 +160,7 @@ module AccountFlowCodec =
         let MarkedForManualReviewEvent = "marked-for-manual-review-v1"
 
         [<Literal>]
-        let SendNotificationAction = "send-notification-v2"
+        let SendNotificationAction = "send-notification-v1"
 
         [<Literal>]
         let InvalidFlowEntityIdError = "invalid-flow-entity-id-v1"
@@ -561,7 +561,7 @@ module AccountFlowCodec =
     let private build (log: ILogger) storeArg =
         machine<FlowId, FlowState, FlowEvent, FlowAction, FlowActionError> (machineId AccountFlow.MachineKey) {
             chart AccountFlow.chartValue
-            chartVersion 5
+            chartVersion AccountFlow.ChartVersion
             initialState AccountFlow.initialState
             store storeArg
             logger log

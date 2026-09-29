@@ -30,11 +30,13 @@
     <Compile Include="FeatureFlagStore.fs" />
     <Compile Include="FeatureChangeSource.fs" />
     <Compile Include="AutomataStore.fs" />
+    <Compile Include="Execution.fs" />
+    <Compile Include="LeasedLedger.fs" />
+    <Compile Include="CodecSupport.fs" />
     <Compile Include="AccountFlowCodec.fs" />
     <Compile Include="AccountFlowEffects.fs" />
     <Compile Include="AccountOperations.fs" />
     <Compile Include="AccountFlowRequests.fs" />
-    <Compile Include="FlowDeadlines.fs" />
     <Compile Include="IdentityStore.fs" />
     <Compile Include="Outbox.fs" />
     <Compile Include="EmailOutbox.fs" />
@@ -44,7 +46,6 @@
     <Compile Include="CartCodec.fs" />
     <Compile Include="CartGuestCapabilities.fs" />
     <Compile Include="CartMerge.fs" />
-    <Compile Include="CartDeadlines.fs" />
     <Compile Include="CartChangeSource.fs" />
     <Compile Include="CartEffects.fs" />
     <Compile Include="PaymentCodec.fs" />
@@ -54,7 +55,6 @@
     <Compile Include="WorkflowEffects.fs" />
     <Compile Include="OrderSnapshots.fs" />
     <Compile Include="StockReservations.fs" />
-    <Compile Include="ReservationDeadlines.fs" />
     <Compile Include="PaymentGateway.fs" />
     <Compile Include="Carrier.fs" />
     <Compile Include="ShipmentCodec.fs" />
