@@ -146,6 +146,8 @@ type OrderEvent =
     | ReturnRejected of ReturnId
     | OrderRefunded of RefundId
     | OrderRefundFailed of RefundId * reasonCode: ReasonCode
+    /// <summary>The payment's authorization lapsed before it was fully captured.</summary>
+    | PaymentAuthorizationExpired
 
 type OrderAction =
     | ReserveStock of ReservationPendingOrder
@@ -288,7 +290,8 @@ module Orders =
         | ReturnRefunded _
         | ReturnRejected _
         | OrderRefunded _
-        | OrderRefundFailed _ -> true
+        | OrderRefundFailed _
+        | PaymentAuthorizationExpired -> true
         | OrderSubmitted _
         | CancelRequested
         | AuthorizePaymentRequested _
@@ -716,6 +719,29 @@ module Orders =
             [], classifyUpdated state updated
         | _ -> [], state
 
+    let private authorizationExpired state event =
+        match state, event with
+        | (Placed _ | FulfilmentPending _ | Processing _ | PartiallyShipped _ | Shipped _), PaymentAuthorizationExpired ->
+            true
+        | _ -> false
+
+    /// <summary>Nothing more may ship against a lapsed authorization: fulfilment is held for an
+    /// operator, and an order not yet in fulfilment goes to manual review.</summary>
+    let private applyAuthorizationExpired state _ =
+        let reason = ReasonCode.ofLiteral "authorization-expired"
+
+        match state with
+        | Placed _ -> [], ManualReview reason
+        | FulfilmentPending fulfilment
+        | Processing fulfilment
+        | PartiallyShipped fulfilment
+        | Shipped fulfilment ->
+            [],
+            HeldForReview
+                { Fulfilment = fulfilment
+                  Reason = reason }
+        | _ -> [], state
+
     let private applyHoldRequested state event =
         match fulfilmentOfState state, event with
         | Some fulfilment, HoldRequested reason ->
@@ -858,6 +884,8 @@ module Orders =
             }
 
             state "placed" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on fulfilmentRequested (fun state event ->
                     match state, event with
                     | Placed placed, FulfilmentRequested plan ->
@@ -921,6 +949,8 @@ module Orders =
             }
 
             state "fulfilment-pending" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on shipmentCreated applyShipmentCreated
                 on shipmentCreationFailed applyShipmentCreationFailed
                 on holdRequested applyHoldRequested
@@ -929,6 +959,8 @@ module Orders =
             }
 
             state "processing" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on shipmentDispatched applyShipmentDispatched
                 on holdRequested applyHoldRequested
                 on addressSnapshotChanged applyAddressSnapshotChanged
@@ -936,6 +968,8 @@ module Orders =
             }
 
             state "partially-shipped" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on shipmentDispatched applyShipmentDispatched
                 on shipmentDelivered applyShipmentDelivered
                 on paymentCaptured applyPaymentCaptured
@@ -944,6 +978,8 @@ module Orders =
             }
 
             state "shipped" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on cancelCaptured beginCapturedCancellation
                 on shipmentDelivered applyShipmentDelivered
                 on paymentCaptured applyPaymentCaptured

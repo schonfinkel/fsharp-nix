@@ -534,6 +534,10 @@ module PaymentCodec =
                     | ReconciliationExhausted operation ->
                         { empty "reconciliation-exhausted-v1" with
                             OperationId = PaymentOperationId.value operation }
+                    | AuthorizationExpired(operation, expiresAt) ->
+                        { empty "authorization-expired-v1" with
+                            OperationId = PaymentOperationId.value operation
+                            ExpiresAt = expiresAt.ToUnixTimeMilliseconds() }
 
                 encode "PaymentEvent" dto)
             (fun json ->
@@ -611,6 +615,11 @@ module PaymentCodec =
                         PaymentOperationId.tryParse dto.OperationId
                         |> Result.mapError (codecError "PaymentEvent")
                         |> Result.map ReconciliationExhausted
+                    | "authorization-expired-v1" when dto.ExpiresAt > 0L ->
+                        PaymentOperationId.tryParse dto.OperationId
+                        |> Result.mapError (codecError "PaymentEvent")
+                        |> Result.map (fun operation ->
+                            AuthorizationExpired(operation, DateTimeOffset.FromUnixTimeMilliseconds dto.ExpiresAt))
                     | tag -> Error(codecError "PaymentEvent" $"Unknown tag '{tag}'.")))
 
     let action: Codec<PaymentAction> =
@@ -633,6 +642,8 @@ module PaymentCodec =
                         { empty "notify-order-cancelled-v1" with
                             OrderId = orderId }
                     | NotifyOrderVoided authorized -> authorizedDto "notify-order-voided-v1" authorized
+                    | NotifyOrderAuthorizationExpired authorized ->
+                        authorizedDto "notify-order-authorization-expired-v1" authorized
                     | NotifyOrderCaptured capture ->
                         { (captureRequestDto "notify-order-captured-v1" capture.Request) with
                             ProviderReference = capture.ProviderReference }
@@ -677,6 +688,9 @@ module PaymentCodec =
                         |> Result.mapError (fun m -> codecError "PaymentAction" m)
                         |> Result.map (fun orderId -> NotifyOrderCancelled(NonEmptyString.value orderId))
                     | "notify-order-voided-v1" -> authorizedOfDto "PaymentAction" dto |> Result.map NotifyOrderVoided
+                    | "notify-order-authorization-expired-v1" ->
+                        authorizedOfDto "PaymentAction" dto
+                        |> Result.map NotifyOrderAuthorizationExpired
                     | "notify-order-captured-v1" ->
                         captureRequestOfDto "PaymentAction" dto
                         |> Result.bind (fun request ->

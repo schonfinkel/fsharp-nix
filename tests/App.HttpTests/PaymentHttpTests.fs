@@ -528,3 +528,55 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
 
             Assert.Equal("unknown:6:true", row)
         }
+
+    member _.``a lapsed authorization sends the placed order to review``() =
+        task {
+            use factory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, userId = customerId)
+
+            use client =
+                factory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            do! seedCart factory
+            let! orderId, _ = submitCheckout client
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | AwaitingAuthorization _ -> true
+                    | _ -> false)
+
+            let! attempt = authorize client orderId PaymentMethodReference.Sandbox.Success
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | Placed _ -> true
+                    | _ -> false)
+
+            let operation = PaymentOperationId.value attempt
+
+            let! armed =
+                scalar
+                    string
+                    $"SELECT status || ':' || (deadline > statement_timestamp()) FROM fsnix.payment_deadlines WHERE payment_entity_id='payment:{orderId:D}' AND operation_id='{operation}'"
+
+            Assert.Equal("pending:true", armed)
+
+            let! _ =
+                scalar
+                    ignore
+                    $"UPDATE fsnix.payment_deadlines SET deadline = statement_timestamp() - interval '1 second' WHERE operation_id='{operation}'"
+
+            let! _ =
+                waitForPayment factory orderId (function
+                    | PaymentState.ManualReview reason -> ReasonCode.value reason = "authorization-expired"
+                    | _ -> false)
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | OrderState.ManualReview reason -> ReasonCode.value reason = "authorization-expired"
+                    | _ -> false)
+
+            let! fired = scalar string $"SELECT status FROM fsnix.payment_deadlines WHERE operation_id='{operation}'"
+
+            Assert.Equal("fired", fired)
+        }

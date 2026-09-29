@@ -494,6 +494,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.ReservationExpiryScanner
         health.Succeeded RuntimeComponent.ReturnWindowScanner
         health.Succeeded RuntimeComponent.GatewayReconciliationScanner
+        health.Succeeded RuntimeComponent.AuthorizationExpiryScanner
         let snapshot = health.Snapshot()
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) snapshot)
 
@@ -2120,6 +2121,96 @@ module UnitTests =
                 |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
             )
 
+    let ``lapsed authorizations hold the order for review`` () =
+        let attempt = makeAuthorizationAttempt ()
+
+        let authorized =
+            { Attempt = attempt
+              ProviderReference = "sim-abc123"
+              ExpiresAt = DateTimeOffset.UtcNow.AddDays 6. }
+
+        let expired = AuthorizationExpired(attempt.OperationId, authorized.ExpiresAt)
+        let reason = ReasonCode.ofLiteral "authorization-expired"
+
+        let open' = expectPaymentResolution (Authorized authorized) expired
+        Assert.Equal(PaymentState.ManualReview reason, open'.Next)
+        Assert.Equal([ NotifyOrderAuthorizationExpired authorized ], open'.Actions)
+
+        let partial =
+            PartiallyCaptured
+                { Authorization = authorized
+                  Captures = []
+                  Refunds = [] }
+
+        let partialExpired = expectPaymentResolution partial expired
+        Assert.Equal(PaymentState.ManualReview reason, partialExpired.Next)
+
+        let captured =
+            Captured
+                { Authorization = authorized
+                  Captures = []
+                  Refunds = [] }
+
+        let absorbed = expectPaymentResolution captured expired
+        Assert.Equal(captured, absorbed.Next)
+        Assert.Empty(absorbed.Actions)
+
+        let stale =
+            expectPaymentResolution
+                (Authorized authorized)
+                (AuthorizationExpired((makeAuthorizationAttempt ()).OperationId, authorized.ExpiresAt))
+
+        Assert.Equal(Authorized authorized, stale.Next)
+
+        let reserved = reservedOrder ()
+
+        let placed =
+            Placed
+                { Reserved = reserved
+                  ProviderReference = "sim-abc123" }
+
+        let review = expectOrderResolution placed PaymentAuthorizationExpired
+        Assert.Equal(OrderState.ManualReview reason, review.Next)
+
+        let fulfilment =
+            { PlacedOrder =
+                { Reserved = reserved
+                  ProviderReference = "sim-abc123" }
+              AddressSnapshotId = reserved.Pending.SnapshotId
+              Shipments = []
+              Returns = [] }
+
+        let held = expectOrderResolution (Processing fulfilment) PaymentAuthorizationExpired
+
+        Assert.Equal(
+            HeldForReview
+                { Fulfilment = fulfilment
+                  Reason = reason },
+            held.Next
+        )
+
+        expectOrderAbsorbed (OrderState.Delivered fulfilment) PaymentAuthorizationExpired
+
+        let roundTrip (codec: Codec<'T>) (value: 'T) =
+            let json = codec.Encode value |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            let decoded =
+                codec.Decode json |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            decoded
+
+        match roundTrip PaymentCodec.event expired with
+        | AuthorizationExpired(operation, expiresAt) ->
+            Assert.Equal(attempt.OperationId, operation)
+            Assert.Equal(authorized.ExpiresAt.ToUnixTimeMilliseconds(), expiresAt.ToUnixTimeMilliseconds())
+        | other -> Assert.Fail $"Expected AuthorizationExpired, got %A{other}."
+
+        Assert.Equal(PaymentAuthorizationExpired, roundTrip OrderCodec.event PaymentAuthorizationExpired)
+
+        match roundTrip PaymentCodec.action (NotifyOrderAuthorizationExpired authorized) with
+        | NotifyOrderAuthorizationExpired decoded -> Assert.Equal(authorized.Attempt, decoded.Attempt)
+        | other -> Assert.Fail $"Expected NotifyOrderAuthorizationExpired, got %A{other}."
+
     let tests =
         testList
             "unit"
@@ -2245,4 +2336,5 @@ module UnitTests =
               testCase "invoice pdf is deterministic per snapshot" ``invoice pdf is deterministic per snapshot``
               testCase
                   "unknown provider calls reconcile and park"
-                  ``unknown provider calls reconcile on request and park when exhausted`` ]
+                  ``unknown provider calls reconcile on request and park when exhausted``
+              testCase "lapsed authorizations hold the order" ``lapsed authorizations hold the order for review`` ]

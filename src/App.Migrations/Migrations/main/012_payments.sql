@@ -48,3 +48,26 @@ CREATE INDEX ix_payment_operations_open ON fsnix.payment_operations (updated_at,
 WHERE
     status IN ('pending', 'unknown');
 
+-- Authorization expiry deadlines, armed in the same transaction as the AuthorizationSucceeded
+-- callback and gated on it, so expiry can never overtake the authorization it expires.
+CREATE TABLE fsnix.payment_deadlines (
+    deadline_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payment_entity_id text NOT NULL,
+    operation_id text NOT NULL,
+    deadline timestamptz NOT NULL,
+    gate_callback_key text NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    lease_owner text,
+    lease_until timestamptz,
+    fired_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    CONSTRAINT ck_payment_deadlines_status CHECK (status IN ('pending', 'fired', 'cancelled')),
+    CONSTRAINT ck_payment_deadlines_fired_pair CHECK ((status = 'fired') = (fired_at IS NOT NULL)),
+    CONSTRAINT ck_payment_deadlines_lease_pair CHECK ((lease_owner IS NULL) = (lease_until IS NULL)),
+    CONSTRAINT uq_payment_deadlines_operation UNIQUE (payment_entity_id, operation_id)
+);
+
+CREATE INDEX ix_payment_deadlines_due ON fsnix.payment_deadlines (deadline, deadline_id)
+WHERE
+    status = 'pending';
+

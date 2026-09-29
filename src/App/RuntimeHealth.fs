@@ -24,6 +24,7 @@ type RuntimeComponent =
     | CartMergeScanner
     | ReservationExpiryScanner
     | GatewayReconciliationScanner
+    | AuthorizationExpiryScanner
 
 [<RequireQualifiedAccess>]
 module RuntimeComponent =
@@ -47,6 +48,7 @@ module RuntimeComponent =
         | RuntimeComponent.CartMergeScanner -> "cart-merge-scanner"
         | RuntimeComponent.ReservationExpiryScanner -> "reservation-expiry-scanner"
         | RuntimeComponent.GatewayReconciliationScanner -> "gateway-reconciliation-scanner"
+        | RuntimeComponent.AuthorizationExpiryScanner -> "authorization-expiry-scanner"
 
     /// <summary>Every component, derived from the union so the health table and readiness
     /// gates can never miss a newly added case.</summary>
@@ -82,7 +84,8 @@ module RuntimeComponent =
         | RuntimeComponent.CartAbandonmentScanner
         | RuntimeComponent.CartMergeScanner
         | RuntimeComponent.ReservationExpiryScanner
-        | RuntimeComponent.GatewayReconciliationScanner -> Kind.Worker
+        | RuntimeComponent.GatewayReconciliationScanner
+        | RuntimeComponent.AuthorizationExpiryScanner -> Kind.Worker
 
 [<RequireQualifiedAccess>]
 type RuntimeFailure =

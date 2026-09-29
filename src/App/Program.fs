@@ -434,6 +434,7 @@ module Application =
             .AddHostedService<CartMergeScanner>()
             .AddHostedService<ReturnWindowScanner>()
             .AddHostedService<GatewayReconciliationScanner>()
+            .AddHostedService<AuthorizationExpiryScanner>()
             .AddAutomata(worker Probe.MachineKey "probes" Probe.buildWorker)
             .AddAutomata(worker AccountFlow.MachineKey "flows" AccountFlowCodec.buildWorker)
             .AddAutomata(worker Cart.MachineKey "carts" CartCodec.buildWorker)

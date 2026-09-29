@@ -12,6 +12,8 @@ module LedgerSql =
     let flowDeadlinesClaim = Sql.load "Ledgers/flow-deadlines-claim"
     let gatewayUnknownClaim = Sql.load "Ledgers/gateway-unknown-claim"
     let gatewayUnknownSettle = Sql.load "Ledgers/gateway-unknown-settle"
+    let paymentDeadlinesClaim = Sql.load "Ledgers/payment-deadlines-claim"
+    let paymentDeadlinesSettle = Sql.load "Ledgers/payment-deadlines-settle"
     let flowDeadlinesSettle = Sql.load "Ledgers/flow-deadlines-settle"
     let gateState = Sql.load "Ledgers/gate-state"
     let reservationDeadlinesClaim = Sql.load "Ledgers/reservation-deadlines-claim"
@@ -294,3 +296,22 @@ module Ledgers =
           Machine = reader.GetString 1
           Entity = reader.GetString 2
           Checks = reader.GetInt32 3 }
+
+    /// <summary>Authorization expiry deadlines (gated on the authorization's success callback).</summary>
+    let paymentDeadlines =
+        { Claim = LedgerSql.paymentDeadlinesClaim
+          Settle = LedgerSql.paymentDeadlinesSettle }
+
+    type PaymentDeadline =
+        { DeadlineId: int64
+          PaymentEntityId: string
+          OperationId: string
+          Deadline: DateTimeOffset
+          GateCallbackKey: string }
+
+    let readPaymentDeadline (reader: NpgsqlDataReader) =
+        { DeadlineId = reader.GetInt64 0
+          PaymentEntityId = reader.GetString 1
+          OperationId = reader.GetString 2
+          Deadline = reader.GetFieldValue<DateTimeOffset> 3
+          GateCallbackKey = reader.GetString 4 }

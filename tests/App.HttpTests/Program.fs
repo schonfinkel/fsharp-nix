@@ -101,7 +101,9 @@ let private tests =
                 DatabaseTest.isolated false "unknown authorization reconciles" (fun fixture ->
                     PaymentHttpTests(fixture).``an unknown authorization reconciles without customer action`` ())
                 DatabaseTest.isolated false "exhausted reconciliation parks payment" (fun fixture ->
-                    PaymentHttpTests(fixture).``exhausted reconciliation parks the payment for review`` ()) ] ]
+                    PaymentHttpTests(fixture).``exhausted reconciliation parks the payment for review`` ())
+                DatabaseTest.isolated false "lapsed authorization reviews order" (fun fixture ->
+                    PaymentHttpTests(fixture).``a lapsed authorization sends the placed order to review`` ()) ] ]
     |> testSequenced
 
 [<EntryPoint>]

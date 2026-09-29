@@ -746,6 +746,7 @@ module OrderCodec =
                         { empty "order-refund-failed-v1" with
                             RefundId = RefundId.wireString id
                             Reason = ReasonCode.value reason }
+                    | PaymentAuthorizationExpired -> empty "payment-authorization-expired-v1"
 
                 encode "OrderEvent" dto)
             (fun json ->
@@ -864,6 +865,7 @@ module OrderCodec =
                         |> Result.bind (fun id ->
                             CodecSupport.reason dto.Reason
                             |> Result.map (fun reason -> OrderRefundFailed(id, reason)))
+                    | "payment-authorization-expired-v1" -> Ok PaymentAuthorizationExpired
                     | tag -> Error(codecError "OrderEvent" $"Unknown tag '{tag}'.")))
 
     let action: Codec<OrderAction> =

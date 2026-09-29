@@ -15,6 +15,7 @@ open Npgsql
 
 [<RequireQualifiedAccess>]
 module PaymentSql =
+    let insertExpiryDeadline = Sql.load "Payments/insert-expiry-deadline"
     let insertOperation = Sql.load "Payments/insert-operation"
     let insertRefundAllocation = Sql.load "Payments/insert-refund-allocation"
     let operationRow = Sql.load "Payments/operation-row"
@@ -42,6 +43,7 @@ module PaymentEffects =
         | NotifyOrderCancelled _ -> "notify-order-cancelled"
         | NotifyOrderVoided _ -> "notify-order-voided"
         | NotifyOrderCaptured _ -> "notify-order-captured"
+        | NotifyOrderAuthorizationExpired _ -> "notify-order-authorization-expired"
         | NotifyRefundApproved _ -> "notify-refund-approved"
         | NotifyRefundDenied _ -> "notify-refund-denied"
         | NotifyRefundSettled _ -> "notify-refund-settled"
@@ -68,20 +70,31 @@ module PaymentEffects =
     let private callback connection tx callbackKey machine entity eventJson ct =
         WorkflowEffects.callback connection tx callbackKey machine entity eventJson ct
 
+    /// <summary>Queues a result event for this payment. A successful authorization also arms its
+    /// expiry deadline in the same transaction, gated on this callback, so the expiry can never
+    /// reach the machine before the authorization it expires.</summary>
     let private selfCallback connection tx record purpose (event: PaymentEvent) ct =
         task {
             match PaymentCodec.event.Encode event with
             | Error _ -> return Error PaymentActionError.CallbackEncodingFailed
             | Ok json ->
-                do!
-                    callback
-                        connection
-                        tx
-                        (key record purpose)
-                        Payments.MachineKey
-                        (EntityId.value record.EntityId)
-                        json
-                        ct
+                let callbackKey = key record purpose
+
+                do! callback connection tx callbackKey Payments.MachineKey (EntityId.value record.EntityId) json ct
+
+                match event with
+                | AuthorizationSucceeded(attempt, _, expiresAt) ->
+                    use arm = new NpgsqlCommand(PaymentSql.insertExpiryDeadline, connection, tx)
+                    arm.Parameters.AddWithValue("entity", EntityId.value record.EntityId) |> ignore
+
+                    arm.Parameters.AddWithValue("operation", PaymentOperationId.value attempt.OperationId)
+                    |> ignore
+
+                    arm.Parameters.AddWithValue("deadline", expiresAt) |> ignore
+                    arm.Parameters.AddWithValue("gate", callbackKey) |> ignore
+                    let! _ = arm.ExecuteNonQueryAsync ct
+                    ()
+                | _ -> ()
 
                 return Ok()
         }
@@ -610,6 +623,8 @@ module PaymentEffects =
                 | NotifyOrderCancelled orderId -> Some(PaymentSettled, orderId, "notify-order-cancelled")
                 | NotifyOrderVoided authorized ->
                     Some(PaymentSettled, authorized.Attempt.OrderId, "notify-order-voided")
+                | NotifyOrderAuthorizationExpired authorized ->
+                    Some(PaymentAuthorizationExpired, authorized.Attempt.OrderId, "notify-order-authorization-expired")
                 | NotifyOrderCaptured capture ->
                     Some(
                         PaymentCaptured(capture.Request.CaptureId, capture.Request.OperationId),

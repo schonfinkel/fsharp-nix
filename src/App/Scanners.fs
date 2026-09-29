@@ -197,6 +197,49 @@ type GatewayReconciliationScanner
                 do! LeasedLedger.settleCheck dataSource options row.OperationId settlement ct
         }
 
+/// <summary>Fires due authorization-expiry deadlines once the authorization's success callback
+/// is sent. The payment machine revalidates the operation, so an authorization that was since
+/// captured in full or voided ignores the expiry.</summary>
+type AuthorizationExpiryScanner
+    (dataSource: NpgsqlDataSource, payments: PaymentMachineClient, logger: ILogger<AuthorizationExpiryScanner>, health)
+    =
+    inherit PeriodicWorker(RuntimeComponent.AuthorizationExpiryScanner, TimeSpan.FromSeconds 5., logger, health)
+
+    let options = LeaseOptions.defaults (ScannerOwner.create "authorization-expiry")
+
+    override _.RunPass ct =
+        task {
+            let! claimed = LeasedLedger.claim dataSource Ledgers.paymentDeadlines options Ledgers.readPaymentDeadline ct
+
+            for row in claimed do
+                let! gate = LeasedLedger.gateState dataSource row.GateCallbackKey ct
+
+                let! settlement =
+                    match gate, PaymentOperationId.tryParse row.OperationId with
+                    | GateState.Sent, Ok operation ->
+                        task {
+                            let key =
+                                TimerKey.create
+                                    Payments.MachineKey
+                                    row.PaymentEntityId
+                                    "authorization-expiry"
+                                    row.DeadlineId
+
+                            let! outcome =
+                                Machine.enqueue
+                                    payments.Payments
+                                    (entityId row.PaymentEntityId)
+                                    (EventEnvelope.create key (AuthorizationExpired(operation, row.Deadline)))
+                                    ct
+
+                            return Enqueued.settlement outcome
+                        }
+                    | GateState.Pending, _ -> Task.FromResult Settlement.Released
+                    | _ -> Task.FromResult Settlement.Cancelled
+
+                do! LeasedLedger.settle dataSource Ledgers.paymentDeadlines options row.DeadlineId settlement ct
+        }
+
 /// <summary>Fires due return-window deadlines into the return machine.</summary>
 type ReturnWindowScanner
     (dataSource: NpgsqlDataSource, returns: ReturnMachineClient, logger: ILogger<ReturnWindowScanner>, health) =
