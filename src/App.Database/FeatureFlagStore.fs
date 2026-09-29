@@ -9,6 +9,10 @@ open Npgsql
 open NpgsqlTypes
 open SqlHydra.Query
 
+[<RequireQualifiedAccess>]
+module FeatureFlagSql =
+    let notifyScheduleChanged = Sql.load "FeatureFlags/notify-schedule-changed"
+
 [<AutoOpen>]
 module private FeatureFlagData =
     let utcOffset (value: DateTime) =
@@ -235,11 +239,7 @@ type PostgresFeatureFlagStore(dataSource: NpgsqlDataSource) =
                         let transaction = context.Transaction.Value :?> NpgsqlTransaction
 
                         use notify =
-                            new NpgsqlCommand(
-                                "SELECT pg_notify('fsnix_feature_schedule_changed', @feature_name)",
-                                connection,
-                                transaction
-                            )
+                            new NpgsqlCommand(FeatureFlagSql.notifyScheduleChanged, connection, transaction)
 
                         addText notify "feature_name" name
                         let! _ = notify.ExecuteNonQueryAsync cancellationToken

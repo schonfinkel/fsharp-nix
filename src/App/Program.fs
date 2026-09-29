@@ -39,6 +39,12 @@ open Serilog.Events
 type AppMarker = class end
 
 [<RequireQualifiedAccess>]
+module BootSql =
+    let appliedRepeatables = Sql.load "Boot/applied-repeatables"
+    let appliedScripts = Sql.load "Boot/applied-scripts"
+    let fsmSchemaExists = Sql.load "Boot/fsm-schema-exists"
+
+[<RequireQualifiedAccess>]
 module BootChecks =
 
     /// <summary>
@@ -58,19 +64,14 @@ module BootChecks =
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
 
-                use fsmExists =
-                    new NpgsqlCommand(
-                        "SELECT EXISTS (SELECT FROM information_schema.schemata WHERE schema_name = 'fsm')",
-                        connection
-                    )
+                use fsmExists = new NpgsqlCommand(BootSql.fsmSchemaExists, connection)
 
                 let! fsm = fsmExists.ExecuteScalarAsync()
 
                 if not (fsm :?> bool) then
                     return Error "The fsm schema is missing; run the deployment migration job (--migrate) first."
                 else
-                    use journal =
-                        new NpgsqlCommand("SELECT scriptname FROM fsnix.schemaversions", connection)
+                    use journal = new NpgsqlCommand(BootSql.appliedScripts, connection)
 
                     let! reader = journal.ExecuteReaderAsync()
                     let applied = HashSet<string>()
@@ -91,8 +92,7 @@ module BootChecks =
                         expected
                         |> List.filter (fun name -> name.Contains(".repeatable.", StringComparison.Ordinal))
 
-                    use repeatable =
-                        new NpgsqlCommand("SELECT script_name FROM fsnix.repeatable_migration_state", connection)
+                    use repeatable = new NpgsqlCommand(BootSql.appliedRepeatables, connection)
 
                     let! repeatableReader = repeatable.ExecuteReaderAsync()
                     let repeatableApplied = HashSet<string>()

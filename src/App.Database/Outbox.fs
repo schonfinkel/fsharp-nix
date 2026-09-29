@@ -78,6 +78,13 @@ module OutboxDestination =
         : OutboxDestination =
         forMachineProvider machineIdValue entityOf codec (fun () -> machine)
 
+[<RequireQualifiedAccess>]
+module OutboxSql =
+    let deadLetter = Sql.load "Outbox/dead-letter"
+    let retryLater = Sql.load "Outbox/retry-later"
+    let claimCallbacks = Sql.load "Outbox/claim-callbacks"
+    let markSent = Sql.load "Outbox/mark-sent"
+
 /// <summary>
 /// Leased, machine-routed delivery of committed local effects. One pass claims a bounded
 /// batch under a short transaction (lease + attempt increment), delivers outside the
@@ -124,27 +131,7 @@ module Outbox =
             do! connection.OpenAsync(ct)
             use! transaction = connection.BeginTransactionAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.integration_outbox AS target
-                       SET lease_owner = @owner,
-                           lease_until = statement_timestamp() + (@lease_seconds * interval '1 second'),
-                           attempts = target.attempts + 1
-                       WHERE target.outbox_id IN (
-                           SELECT candidate.outbox_id
-                           FROM fsnix.integration_outbox AS candidate
-                           WHERE candidate.status = 'pending'
-                             AND candidate.available_at <= statement_timestamp()
-                             AND (candidate.lease_until IS NULL
-                                  OR candidate.lease_until < statement_timestamp())
-                           ORDER BY candidate.available_at, candidate.outbox_id
-                           LIMIT @batch
-                           FOR UPDATE OF candidate SKIP LOCKED)
-                       RETURNING target.outbox_id, target.callback_key, target.machine_id,
-                                 target.entity_id, target.event, target.attempts, target.max_attempts""",
-                    connection,
-                    transaction
-                )
+            use command = new NpgsqlCommand(OutboxSql.claimCallbacks, connection, transaction)
 
             command.Parameters.AddWithValue("owner", options.Owner) |> ignore
 
@@ -181,16 +168,7 @@ module Outbox =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.integration_outbox
-                       SET status = 'sent', sent_at = statement_timestamp(),
-                           lease_owner = NULL, lease_until = NULL, last_error = NULL
-                       WHERE outbox_id = @outbox_id
-                         AND lease_owner = @owner
-                         AND status = 'pending'""",
-                    connection
-                )
+            use command = new NpgsqlCommand(OutboxSql.markSent, connection)
 
             command.Parameters.AddWithValue("outbox_id", outboxId) |> ignore
             command.Parameters.AddWithValue("owner", options.Owner) |> ignore
@@ -213,21 +191,9 @@ module Outbox =
 
             let sql =
                 if exhausted then
-                    """UPDATE fsnix.integration_outbox
-                       SET status = 'dead', failed_at = statement_timestamp(),
-                           lease_owner = NULL, lease_until = NULL,
-                           last_error = left(@message, 500)
-                       WHERE outbox_id = @outbox_id
-                         AND lease_owner = @owner
-                         AND status = 'pending'"""
+                    OutboxSql.deadLetter
                 else
-                    """UPDATE fsnix.integration_outbox
-                       SET available_at = statement_timestamp() + (@backoff_seconds * interval '1 second'),
-                            lease_owner = NULL, lease_until = NULL,
-                            last_error = left(@message, 500)
-                       WHERE outbox_id = @outbox_id
-                         AND lease_owner = @owner
-                         AND status = 'pending'"""
+                    OutboxSql.retryLater
 
             use command = new NpgsqlCommand(sql, connection)
             command.Parameters.AddWithValue("outbox_id", row.OutboxId) |> ignore

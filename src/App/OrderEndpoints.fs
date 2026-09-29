@@ -52,6 +52,10 @@ module CheckoutPricing =
         pricing
 
 [<RequireQualifiedAccess>]
+module OrderEndpointSql =
+    let lastDeliveredAt = Sql.load "Orders/last-delivered-at"
+
+[<RequireQualifiedAccess>]
 module OrderEndpoints =
     let private formValue (form: IFormCollection) name =
         match form.TryGetValue name with
@@ -678,11 +682,7 @@ module OrderEndpoints =
                                     use connection = dataSource.CreateConnection()
                                     do! connection.OpenAsync context.RequestAborted
 
-                                    use cmd =
-                                        new NpgsqlCommand(
-                                            "SELECT max(delivered_at) FROM fsnix.shipments WHERE order_id=@order",
-                                            connection
-                                        )
+                                    use cmd = new NpgsqlCommand(OrderEndpointSql.lastDeliveredAt, connection)
 
                                     cmd.Parameters.AddWithValue("order", EntityId.value orderId) |> ignore
                                     let! delivered = cmd.ExecuteScalarAsync context.RequestAborted

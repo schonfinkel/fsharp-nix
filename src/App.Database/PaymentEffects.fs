@@ -13,6 +13,14 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
 
+[<RequireQualifiedAccess>]
+module PaymentSql =
+    let insertOperation = Sql.load "Payments/insert-operation"
+    let insertRefundAllocation = Sql.load "Payments/insert-refund-allocation"
+    let operationRow = Sql.load "Payments/operation-row"
+    let refundAllocationRow = Sql.load "Payments/refund-allocation-row"
+    let settleOperation = Sql.load "Payments/settle-operation"
+
 /// <summary>
 /// Gateway-bound effects for the payments machine. Provider calls never run inside a database
 /// transaction: phase one durably records the operation, the call happens outside, and phase
@@ -94,12 +102,7 @@ module PaymentEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    "SELECT payment_entity_id,order_id,kind,status,provider_reference,result_code,expires_at FROM fsnix.payment_operations WHERE operation_id=@operation",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(PaymentSql.operationRow, connection, tx)
 
             command.Parameters.AddWithValue("operation", operationId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -136,12 +139,7 @@ module PaymentEffects =
         (ct: CancellationToken)
         =
         task {
-            use insert =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.payment_operations(operation_id,payment_entity_id,order_id,kind) VALUES(@operation,@entity,@order,@kind) ON CONFLICT(operation_id) DO NOTHING",
-                    connection,
-                    tx
-                )
+            use insert = new NpgsqlCommand(PaymentSql.insertOperation, connection, tx)
 
             insert.Parameters.AddWithValue("operation", operationId) |> ignore
 
@@ -175,20 +173,7 @@ module PaymentEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.payment_operations
-                       SET status=@status,
-                           provider_reference=@reference,
-                           result_code=@result,
-                           expires_at=@expires,
-                           attempts=attempts+1,
-                           updated_at=statement_timestamp()
-                       WHERE operation_id=@operation
-                         AND status IN ('pending','unknown')""",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(PaymentSql.settleOperation, connection, tx)
 
             command.Parameters.AddWithValue("operation", operationId) |> ignore
             command.Parameters.AddWithValue("status", status) |> ignore
@@ -682,12 +667,7 @@ module PaymentEffects =
                     return Error error
                 | Ok _ ->
                     if reserve then
-                        use insert =
-                            new NpgsqlCommand(
-                                "INSERT INTO fsnix.refund_allocations(allocation_id,refund_id,order_id,amount,currency,status) VALUES(@allocation,@refund,@order,@amount,@currency,'pending') ON CONFLICT(allocation_id) DO NOTHING",
-                                connection,
-                                tx
-                            )
+                        use insert = new NpgsqlCommand(PaymentSql.insertRefundAllocation, connection, tx)
 
                         insert.Parameters.AddWithValue("allocation", RefundAllocationId.value request.AllocationId)
                         |> ignore
@@ -705,12 +685,7 @@ module PaymentEffects =
 
                         let! _ = insert.ExecuteNonQueryAsync ct
 
-                        use verify =
-                            new NpgsqlCommand(
-                                "SELECT refund_id,order_id,amount,currency,status FROM fsnix.refund_allocations WHERE allocation_id=@allocation",
-                                connection,
-                                tx
-                            )
+                        use verify = new NpgsqlCommand(PaymentSql.refundAllocationRow, connection, tx)
 
                         verify.Parameters.AddWithValue("allocation", RefundAllocationId.value request.AllocationId)
                         |> ignore

@@ -7,6 +7,21 @@ open App.Orders
 open Npgsql
 
 [<RequireQualifiedAccess>]
+module StockSql =
+    let cancelAuthorizationIntent = Sql.load "Stock/cancel-authorization-intent"
+    let cancelReservationControl = Sql.load "Stock/cancel-reservation-control"
+    let commitReservations = Sql.load "Stock/commit-reservations"
+    let consumeReservedStock = Sql.load "Stock/consume-reserved-stock"
+    let insertReservation = Sql.load "Stock/insert-reservation"
+    let lockReservationControl = Sql.load "Stock/lock-reservation-control"
+    let lockStockRows = Sql.load "Stock/lock-stock-rows"
+    let openReservationControl = Sql.load "Stock/open-reservation-control"
+    let productAvailability = Sql.load "Stock/product-availability"
+    let releaseReservations = Sql.load "Stock/release-reservations"
+    let reserveStock = Sql.load "Stock/reserve-stock"
+    let reservedProducts = Sql.load "Stock/reserved-products"
+
+[<RequireQualifiedAccess>]
 module StockReservations =
     /// Locks all involved product rows in canonical UUID order, then validates and reserves
     /// the complete order or none of it. Call only inside the caller's transaction.
@@ -39,12 +54,7 @@ module StockReservations =
                     |> List.distinct
                     |> List.sort
 
-                use lockRows =
-                    new NpgsqlCommand(
-                        "SELECT product_id FROM fsnix.product_stock WHERE product_id = ANY(@ids) ORDER BY product_id FOR UPDATE",
-                        connection,
-                        transaction
-                    )
+                use lockRows = new NpgsqlCommand(StockSql.lockStockRows, connection, transaction)
 
                 lockRows.Parameters.AddWithValue("ids", products |> List.toArray) |> ignore
                 let! reader = lockRows.ExecuteReaderAsync(ct)
@@ -61,14 +71,7 @@ module StockReservations =
                     let mutable failure = None
 
                     for line in lines do
-                        use check =
-                            new NpgsqlCommand(
-                                """SELECT p.active, p.price_version, s.on_hand - s.reserved
-                                                           FROM fsnix.products p JOIN fsnix.product_stock s USING(product_id)
-                                                           WHERE p.product_id = @id""",
-                                connection,
-                                transaction
-                            )
+                        use check = new NpgsqlCommand(StockSql.productAvailability, connection, transaction)
 
                         check.Parameters.AddWithValue("id", App.Domain.ProductId.value line.ProductId)
                         |> ignore
@@ -99,15 +102,7 @@ module StockReservations =
                         for line in lines do
                             let reservationId = Guid.NewGuid()
 
-                            use insert =
-                                new NpgsqlCommand(
-                                    """INSERT INTO fsnix.stock_reservations
-                                (reservation_id, order_id, order_line_id, product_id, quantity, expires_at,
-                                 source_machine_id, source_command_id, source_ordinal)
-                                VALUES (@reservation, @order, @line, @product, @quantity, @expiry, @machine, @command, @ordinal)""",
-                                    connection,
-                                    transaction
-                                )
+                            use insert = new NpgsqlCommand(StockSql.insertReservation, connection, transaction)
 
                             insert.Parameters.AddWithValue("reservation", reservationId) |> ignore
                             insert.Parameters.AddWithValue("order", orderId) |> ignore
@@ -127,12 +122,7 @@ module StockReservations =
                             insert.Parameters.AddWithValue("ordinal", sourceOrdinal) |> ignore
                             let! _ = insert.ExecuteNonQueryAsync(ct)
 
-                            use update =
-                                new NpgsqlCommand(
-                                    "UPDATE fsnix.product_stock SET reserved = reserved + @quantity, updated_at = statement_timestamp() WHERE product_id = @product",
-                                    connection,
-                                    transaction
-                                )
+                            use update = new NpgsqlCommand(StockSql.reserveStock, connection, transaction)
 
                             update.Parameters.AddWithValue("quantity", App.Domain.Quantity.value line.Quantity)
                             |> ignore
@@ -149,22 +139,14 @@ module StockReservations =
     let reserve connection transaction orderId generation expiresAt sourceMachine sourceCommand sourceOrdinal lines ct =
         task {
             use insert =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.order_reservation_controls(order_id,generation,status) VALUES(@order,@generation,'open') ON CONFLICT(order_id) DO NOTHING",
-                    connection,
-                    transaction
-                )
+                new NpgsqlCommand(StockSql.openReservationControl, connection, transaction)
 
             insert.Parameters.AddWithValue("order", orderId) |> ignore
             insert.Parameters.AddWithValue("generation", generation) |> ignore
             let! _ = insert.ExecuteNonQueryAsync ct
 
             use check =
-                new NpgsqlCommand(
-                    "SELECT status,generation FROM fsnix.order_reservation_controls WHERE order_id=@order FOR UPDATE",
-                    connection,
-                    transaction
-                )
+                new NpgsqlCommand(StockSql.lockReservationControl, connection, transaction)
 
             check.Parameters.AddWithValue("order", orderId) |> ignore
             let! reader = check.ExecuteReaderAsync ct
@@ -202,12 +184,7 @@ module StockReservations =
         (ct: CancellationToken)
         : Task<int> =
         task {
-            use products =
-                new NpgsqlCommand(
-                    "SELECT DISTINCT product_id FROM fsnix.stock_reservations WHERE order_id=@order AND status='reserved'",
-                    connection,
-                    transaction
-                )
+            use products = new NpgsqlCommand(StockSql.reservedProducts, connection, transaction)
 
             products.Parameters.AddWithValue("order", orderId) |> ignore
             let! reader = products.ExecuteReaderAsync ct
@@ -221,12 +198,7 @@ module StockReservations =
             if ids.Count = 0 then
                 return 0
             else
-                use lockRows =
-                    new NpgsqlCommand(
-                        "SELECT product_id FROM fsnix.product_stock WHERE product_id = ANY(@ids) ORDER BY product_id FOR UPDATE",
-                        connection,
-                        transaction
-                    )
+                use lockRows = new NpgsqlCommand(StockSql.lockStockRows, connection, transaction)
 
                 lockRows.Parameters.AddWithValue("ids", ids.ToArray()) |> ignore
                 let! lockReader = lockRows.ExecuteReaderAsync ct
@@ -236,12 +208,7 @@ module StockReservations =
 
                 lockReader.Dispose()
 
-                use ledger =
-                    new NpgsqlCommand(
-                        "UPDATE fsnix.stock_reservations SET status='committed', settled_at=statement_timestamp() WHERE order_id=@order AND status='reserved' RETURNING product_id, quantity",
-                        connection,
-                        transaction
-                    )
+                use ledger = new NpgsqlCommand(StockSql.commitReservations, connection, transaction)
 
                 ledger.Parameters.AddWithValue("order", orderId) |> ignore
                 let! ledgerReader = ledger.ExecuteReaderAsync ct
@@ -262,11 +229,7 @@ module StockReservations =
 
                 for KeyValue(product, quantity) in totals do
                     use update =
-                        new NpgsqlCommand(
-                            "UPDATE fsnix.product_stock SET on_hand = on_hand - @quantity, reserved = reserved - @quantity, updated_at = statement_timestamp() WHERE product_id = @product",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(StockSql.consumeReservedStock, connection, transaction)
 
                     update.Parameters.AddWithValue("quantity", quantity) |> ignore
                     update.Parameters.AddWithValue("product", product) |> ignore
@@ -284,35 +247,19 @@ module StockReservations =
         : Task =
         task {
             use fence =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.order_reservation_controls(order_id,generation,status) VALUES(@order,1,'cancelled') ON CONFLICT(order_id) DO UPDATE SET status='cancelled',updated_at=statement_timestamp()",
-                    connection,
-                    transaction
-                )
+                new NpgsqlCommand(StockSql.cancelReservationControl, connection, transaction)
 
             fence.Parameters.AddWithValue("order", orderId) |> ignore
             let! _ = fence.ExecuteNonQueryAsync ct
 
             use command =
-                new NpgsqlCommand(
-                    """WITH released AS (
-                UPDATE fsnix.stock_reservations SET status = 'released', settled_at = statement_timestamp()
-                WHERE order_id = @order AND status = 'reserved' RETURNING product_id, quantity)
-                UPDATE fsnix.product_stock s SET reserved = s.reserved - released.quantity, updated_at = statement_timestamp()
-                FROM released WHERE s.product_id = released.product_id""",
-                    connection,
-                    transaction
-                )
+                new NpgsqlCommand(StockSql.releaseReservations, connection, transaction)
 
             command.Parameters.AddWithValue("order", orderId) |> ignore
             let! _ = command.ExecuteNonQueryAsync(ct)
 
             use intent =
-                new NpgsqlCommand(
-                    "UPDATE fsnix.authorization_intents SET status='cancelled' WHERE order_id=@order AND status IN ('pending','claimed')",
-                    connection,
-                    transaction
-                )
+                new NpgsqlCommand(StockSql.cancelAuthorizationIntent, connection, transaction)
 
             intent.Parameters.AddWithValue("order", orderId) |> ignore
             let! _ = intent.ExecuteNonQueryAsync ct

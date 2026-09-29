@@ -18,6 +18,13 @@ type ClaimedEmail =
       Attempts: int
       MaxAttempts: int }
 
+[<RequireQualifiedAccess>]
+module EmailOutboxSql =
+    let claimEmails = Sql.load "Accounts/claim-emails"
+    let deadLetterEmail = Sql.load "Accounts/dead-letter-email"
+    let releaseEmailRetry = Sql.load "Accounts/release-email-retry"
+    let settleEmailSent = Sql.load "Accounts/settle-email-sent"
+
 /// <summary>
 /// Leased delivery of pending account emails. Claiming follows the same protocol as the
 /// integration-outbox relay: a short transaction leases a bounded batch and increments the
@@ -64,28 +71,7 @@ module EmailOutbox =
             do! connection.OpenAsync(ct)
             use! transaction = connection.BeginTransactionAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.account_email_outbox AS target
-                       SET lease_owner = @owner,
-                           lease_until = statement_timestamp() + (@lease_seconds * interval '1 second'),
-                           attempts = target.attempts + 1
-                       WHERE target.email_id IN (
-                           SELECT candidate.email_id
-                           FROM fsnix.account_email_outbox AS candidate
-                           WHERE candidate.status = 'pending'
-                             AND candidate.available_at <= statement_timestamp()
-                             AND (candidate.lease_until IS NULL
-                                  OR candidate.lease_until < statement_timestamp())
-                           ORDER BY candidate.available_at, candidate.email_id
-                           LIMIT @batch
-                           FOR UPDATE OF candidate SKIP LOCKED)
-                       RETURNING target.email_id, target.flow_id, target.generation,
-                                 target.protected_payload, target.encryption_version,
-                                 target.attempts, target.max_attempts""",
-                    connection,
-                    transaction
-                )
+            use command = new NpgsqlCommand(EmailOutboxSql.claimEmails, connection, transaction)
 
             command.Parameters.AddWithValue("owner", options.Owner) |> ignore
 
@@ -124,23 +110,14 @@ module EmailOutbox =
         (eventJson: string)
         (ct: CancellationToken)
         : Task =
-        task {
-            use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.integration_outbox (callback_key, machine_id, entity_id, event)
-                       VALUES (@callback_key, @machine_id, @entity_id, @event::jsonb)
-                       ON CONFLICT (callback_key) DO NOTHING""",
-                    connection,
-                    transaction
-                )
-
-            command.Parameters.AddWithValue("callback_key", callbackKey) |> ignore
-            command.Parameters.AddWithValue("machine_id", AccountFlow.MachineKey) |> ignore
-            command.Parameters.AddWithValue("entity_id", entityIdString flowId) |> ignore
-            command.Parameters.AddWithValue("event", eventJson) |> ignore
-            let! _ = command.ExecuteNonQueryAsync(ct)
-            ()
-        }
+        WorkflowEffects.callback
+            connection
+            transaction
+            callbackKey
+            AccountFlow.MachineKey
+            (entityIdString flowId)
+            eventJson
+            ct
 
     /// <summary>Settles a claimed email as sent: erases the protected payload and enqueues the
     /// generation-matched <c>NotificationSent</c> callback in one transaction. Returns
@@ -161,17 +138,7 @@ module EmailOutbox =
                 use! transaction = connection.BeginTransactionAsync(ct)
 
                 use settle =
-                    new NpgsqlCommand(
-                        """UPDATE fsnix.account_email_outbox
-                           SET status = 'sent', sent_at = statement_timestamp(),
-                               protected_payload = NULL,
-                               lease_owner = NULL, lease_until = NULL, last_error = NULL
-                           WHERE email_id = @email_id
-                             AND lease_owner = @owner
-                             AND status = 'pending'""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(EmailOutboxSql.settleEmailSent, connection, transaction)
 
                 settle.Parameters.AddWithValue("email_id", email.EmailId) |> ignore
                 settle.Parameters.AddWithValue("owner", options.Owner) |> ignore
@@ -210,17 +177,7 @@ module EmailOutbox =
             do! connection.OpenAsync(ct)
 
             if not exhausted then
-                use release =
-                    new NpgsqlCommand(
-                        """UPDATE fsnix.account_email_outbox
-                           SET available_at = statement_timestamp() + (@backoff_seconds * interval '1 second'),
-                               lease_owner = NULL, lease_until = NULL,
-                               last_error = left(@classification, 500)
-                           WHERE email_id = @email_id
-                             AND lease_owner = @owner
-                             AND status = 'pending'""",
-                        connection
-                    )
+                use release = new NpgsqlCommand(EmailOutboxSql.releaseEmailRetry, connection)
 
                 release.Parameters.AddWithValue("email_id", email.EmailId) |> ignore
                 release.Parameters.AddWithValue("owner", options.Owner) |> ignore
@@ -238,18 +195,7 @@ module EmailOutbox =
                     use! transaction = connection.BeginTransactionAsync(ct)
 
                     use dead =
-                        new NpgsqlCommand(
-                            """UPDATE fsnix.account_email_outbox
-                               SET status = 'dead', failed_at = statement_timestamp(),
-                                   protected_payload = NULL,
-                                   lease_owner = NULL, lease_until = NULL,
-                                   last_error = left(@classification, 500)
-                               WHERE email_id = @email_id
-                                 AND lease_owner = @owner
-                                 AND status = 'pending'""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(EmailOutboxSql.deadLetterEmail, connection, transaction)
 
                     dead.Parameters.AddWithValue("email_id", email.EmailId) |> ignore
                     dead.Parameters.AddWithValue("owner", options.Owner) |> ignore

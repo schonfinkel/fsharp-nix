@@ -5,6 +5,18 @@ open System.Threading
 open System.Threading.Tasks
 open Npgsql
 
+[<RequireQualifiedAccess>]
+module LedgerSql =
+    let cartDeadlinesClaim = Sql.load "Ledgers/cart-deadlines-claim"
+    let cartDeadlinesSettle = Sql.load "Ledgers/cart-deadlines-settle"
+    let flowDeadlinesClaim = Sql.load "Ledgers/flow-deadlines-claim"
+    let flowDeadlinesSettle = Sql.load "Ledgers/flow-deadlines-settle"
+    let gateState = Sql.load "Ledgers/gate-state"
+    let reservationDeadlinesClaim = Sql.load "Ledgers/reservation-deadlines-claim"
+    let reservationDeadlinesSettle = Sql.load "Ledgers/reservation-deadlines-settle"
+    let returnWindowsClaim = Sql.load "Ledgers/return-windows-claim"
+    let returnWindowsSettle = Sql.load "Ledgers/return-windows-settle"
+
 /// <summary>
 /// Leased claim/settle over an app-owned due-work ledger (deadlines, render jobs, open gateway
 /// operations). Every ledger shares one protocol:
@@ -16,22 +28,15 @@ open Npgsql
 /// <item>settlement is fenced on the lease owner and <c>status = 'pending'</c>, so a pass whose
 /// lease expired cannot overwrite a newer claimant's result.</item>
 /// </list>
-/// Table and column names come only from compile-time <see cref="LedgerTable"/> constants, never
-/// from input, so interpolating them is not an injection vector.
+/// Each ledger's claim and settle statements are explicit files under <c>Sql/Ledgers</c>.
 /// </summary>
 type LedgerTable =
     {
-        Table: string
-        IdColumn: string
-        DueColumn: string
-        /// <summary>Columns returned after the id, in reader order starting at ordinal 1.</summary>
-        Columns: string list
-        /// <summary>Assignment applied when the work is done (e.g. <c>status = 'fired', fired_at = ...</c>).</summary>
-        Done: string
-        /// <summary>Assignment applied when the work became moot.</summary>
-        Cancelled: string
-        /// <summary>Optional extra predicate on due rows (a constant SQL fragment).</summary>
-        Filter: string option
+        /// <summary>Claims due rows; returns the id first, then the ledger's columns.</summary>
+        Claim: string
+        /// <summary>Settles one claimed row by <c>@id</c>, <c>@owner</c>, <c>@outcome</c> and the
+        /// nullable <c>@delay_seconds</c>.</summary>
+        Settle: string
     }
 
 type LeaseOptions =
@@ -75,33 +80,7 @@ module LeasedLedger =
             do! connection.OpenAsync ct
             use! transaction = connection.BeginTransactionAsync ct
 
-            let returning =
-                table.IdColumn :: table.Columns
-                |> List.map (fun column -> $"target.{column}")
-                |> String.concat ", "
-
-            let filter =
-                table.Filter |> Option.map (fun f -> $" AND ({f})") |> Option.defaultValue ""
-
-            use command =
-                new NpgsqlCommand(
-                    $"""UPDATE {table.Table} AS target
-                       SET lease_owner = @owner,
-                           lease_until = statement_timestamp() + (@lease_seconds * interval '1 second')
-                       WHERE target.{table.IdColumn} IN (
-                           SELECT candidate.{table.IdColumn}
-                           FROM {table.Table} AS candidate
-                           WHERE candidate.status = 'pending'
-                             AND candidate.{table.DueColumn} <= statement_timestamp()
-                             AND (candidate.lease_until IS NULL
-                                  OR candidate.lease_until < statement_timestamp()){filter}
-                           ORDER BY candidate.{table.DueColumn}, candidate.{table.IdColumn}
-                           LIMIT @batch
-                           FOR UPDATE OF candidate SKIP LOCKED)
-                       RETURNING {returning}""",
-                    connection,
-                    transaction
-                )
+            use command = new NpgsqlCommand(table.Claim, connection, transaction)
 
             command.Parameters.AddWithValue("owner", options.Owner) |> ignore
 
@@ -132,38 +111,26 @@ module LeasedLedger =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync ct
 
-            let assignment, delay =
+            let outcome, delay =
                 match settlement with
-                | Settlement.Done -> table.Done, None
-                | Settlement.Cancelled -> table.Cancelled, None
-                | Settlement.Released -> "status = 'pending'", None
-                | Settlement.RetryAfter delay -> "status = 'pending'", Some delay
+                | Settlement.Done -> "done", None
+                | Settlement.Cancelled -> "cancelled", None
+                | Settlement.Released -> "released", None
+                | Settlement.RetryAfter delay -> "released", Some(max 1L (int64 delay.TotalSeconds))
 
-            // A delayed retry keeps the lease stamped until the backoff elapses instead of
-            // clearing it, so the claim predicate skips the row until then.
-            let lease =
-                match delay with
-                | Some _ ->
-                    "lease_owner = NULL, lease_until = statement_timestamp() + (@delay_seconds * interval '1 second')"
-                | None -> "lease_owner = NULL, lease_until = NULL"
-
-            use command =
-                new NpgsqlCommand(
-                    $"""UPDATE {table.Table}
-                       SET {assignment}, {lease}
-                       WHERE {table.IdColumn} = @id
-                         AND lease_owner = @owner
-                         AND status = 'pending'""",
-                    connection
-                )
-
+            use command = new NpgsqlCommand(table.Settle, connection)
             command.Parameters.AddWithValue("id", id) |> ignore
             command.Parameters.AddWithValue("owner", options.Owner) |> ignore
+            command.Parameters.AddWithValue("outcome", outcome) |> ignore
 
-            delay
-            |> Option.iter (fun delay ->
-                command.Parameters.AddWithValue("delay_seconds", max 1L (int64 delay.TotalSeconds))
-                |> ignore)
+            command.Parameters.Add(
+                NpgsqlParameter(
+                    "delay_seconds",
+                    NpgsqlTypes.NpgsqlDbType.Bigint,
+                    Value = (delay |> Option.map box |> Option.defaultValue DBNull.Value)
+                )
+            )
+            |> ignore
 
             let! _ = command.ExecuteNonQueryAsync ct
             ()
@@ -176,11 +143,7 @@ module LeasedLedger =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync ct
 
-            use command =
-                new NpgsqlCommand(
-                    "SELECT status FROM fsnix.integration_outbox WHERE callback_key = @callback_key",
-                    connection
-                )
+            use command = new NpgsqlCommand(LedgerSql.gateState, connection)
 
             command.Parameters.AddWithValue("callback_key", callbackKey) |> ignore
             let! status = command.ExecuteScalarAsync ct
@@ -196,17 +159,10 @@ module LeasedLedger =
 /// <summary>The app's due-work ledgers.</summary>
 [<RequireQualifiedAccess>]
 module Ledgers =
-    let private fired = "status = 'fired', fired_at = statement_timestamp()"
-
     /// <summary>Account-flow expiry deadlines (gated on the flow's arming callback).</summary>
     let flowDeadlines =
-        { Table = "fsnix.flow_deadlines"
-          IdColumn = "deadline_id"
-          DueColumn = "deadline"
-          Columns = [ "flow_id"; "generation"; "deadline"; "gate_callback_key" ]
-          Done = fired
-          Cancelled = "status = 'cancelled'"
-          Filter = None }
+        { Claim = LedgerSql.flowDeadlinesClaim
+          Settle = LedgerSql.flowDeadlinesSettle }
 
     type FlowDeadline =
         { DeadlineId: int64
@@ -224,13 +180,8 @@ module Ledgers =
 
     /// <summary>Cart-abandonment deadlines; a stale generation is a no-op in the cart machine.</summary>
     let cartDeadlines =
-        { Table = "fsnix.cart_deadlines"
-          IdColumn = "deadline_id"
-          DueColumn = "deadline"
-          Columns = [ "cart_id"; "generation"; "deadline" ]
-          Done = fired
-          Cancelled = "status = 'cancelled'"
-          Filter = None }
+        { Claim = LedgerSql.cartDeadlinesClaim
+          Settle = LedgerSql.cartDeadlinesSettle }
 
     type CartDeadline =
         { DeadlineId: int64
@@ -246,13 +197,8 @@ module Ledgers =
 
     /// <summary>Stock-reservation expiry deadlines (gated on the reservation callback).</summary>
     let reservationDeadlines =
-        { Table = "fsnix.reservation_deadlines"
-          IdColumn = "deadline_id"
-          DueColumn = "deadline"
-          Columns = [ "order_id"; "generation"; "deadline"; "gate_callback_key" ]
-          Done = fired
-          Cancelled = "status = 'cancelled'"
-          Filter = None }
+        { Claim = LedgerSql.reservationDeadlinesClaim
+          Settle = LedgerSql.reservationDeadlinesSettle }
 
     type ReservationDeadline =
         { DeadlineId: int64
@@ -270,13 +216,8 @@ module Ledgers =
 
     /// <summary>Return-window expiry for open RMAs.</summary>
     let returnWindows =
-        { Table = "fsnix.return_requests"
-          IdColumn = "return_id"
-          DueColumn = "window_ends_at"
-          Columns = [ "authorization_id"; "window_ends_at" ]
-          Done = "status = 'expired'"
-          Cancelled = "status = 'closed'"
-          Filter = None }
+        { Claim = LedgerSql.returnWindowsClaim
+          Settle = LedgerSql.returnWindowsSettle }
 
     type ReturnWindow =
         { ReturnId: Guid

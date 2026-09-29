@@ -8,6 +8,10 @@ open App.Domain
 open Npgsql
 open SqlHydra.Query
 
+[<RequireQualifiedAccess>]
+module FeatureChangeSql =
+    let listen = Sql.load "FeatureFlags/listen"
+
 type private PostgresFeatureChangeSubscription(context: QueryContext, connection: NpgsqlConnection) =
     let heartbeat = TimeSpan.FromSeconds 15.
 
@@ -59,7 +63,7 @@ type PostgresFeatureChangeSource(dataSource: NpgsqlDataSource) =
                 let connection = context.Connection :?> NpgsqlConnection
 
                 try
-                    use command = new NpgsqlCommand("LISTEN fsnix_feature_schedule_changed", connection)
+                    use command = new NpgsqlCommand(FeatureChangeSql.listen, connection)
 
                     let! _ = command.ExecuteNonQueryAsync cancellationToken
                     return PostgresFeatureChangeSubscription(context, connection) :> IFeatureChangeSubscription

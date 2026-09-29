@@ -42,6 +42,10 @@ type OperationalHealthSnapshot =
       Deadlines: DeadlineHealthSnapshot list }
 
 [<RequireQualifiedAccess>]
+module OperationalHealthSql =
+    let healthSnapshot = Sql.load "Operations/health-snapshot"
+
+[<RequireQualifiedAccess>]
 module OperationalHealth =
     let private optionalTime (reader: NpgsqlDataReader) ordinal =
         if reader.IsDBNull ordinal then
@@ -71,53 +75,7 @@ module OperationalHealth =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT statement_timestamp();
-
-                       SELECT COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND available_at <= statement_timestamp()
-                                  AND (lease_until IS NULL OR lease_until < statement_timestamp()))::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND lease_until >= statement_timestamp())::bigint,
-                              COUNT(*) FILTER (WHERE status = 'sent')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'dead')::bigint,
-                              MIN(created_at) FILTER (WHERE status = 'pending'),
-                              MIN(available_at) FILTER (WHERE status = 'pending'),
-                              MAX(attempts) FILTER (WHERE status = 'pending')
-                       FROM fsnix.integration_outbox;
-
-                       SELECT COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND available_at <= statement_timestamp()
-                                  AND (lease_until IS NULL OR lease_until < statement_timestamp()))::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND lease_until >= statement_timestamp())::bigint,
-                              COUNT(*) FILTER (WHERE status = 'sent')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'dead')::bigint,
-                              MIN(created_at) FILTER (WHERE status = 'pending'),
-                              MIN(available_at) FILTER (WHERE status = 'pending'),
-                              MAX(attempts) FILTER (WHERE status = 'pending')
-                       FROM fsnix.account_email_outbox;
-
-                       SELECT flow_kind, status, COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'requested' AND expires_at <= statement_timestamp())::bigint,
-                              MIN(created_at),
-                              MIN(expires_at) FILTER (WHERE status = 'requested'),
-                              MAX(updated_at)
-                       FROM fsnix.account_flow_requests
-                       GROUP BY flow_kind, status
-                       ORDER BY flow_kind, status;
-
-                       SELECT timer_kind, status, COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND deadline <= statement_timestamp())::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND lease_until >= statement_timestamp())::bigint,
-                              MIN(deadline) FILTER (WHERE status = 'pending'),
-                              MAX(fired_at) FILTER (WHERE status = 'fired')
-                       FROM fsnix.flow_deadlines
-                       GROUP BY timer_kind, status
-                       ORDER BY timer_kind, status;""",
-                    connection
-                )
+            use command = new NpgsqlCommand(OperationalHealthSql.healthSnapshot, connection)
 
             let! reader = command.ExecuteReaderAsync(ct)
             let! capturedRow = reader.ReadAsync(ct)

@@ -7,6 +7,10 @@ open Npgsql
 open Polly
 open Polly.Retry
 
+[<RequireQualifiedAccess>]
+module ExecutionSql =
+    let setLocalTimeouts = Sql.load "Execution/set-local-timeouts"
+
 /// <summary>
 /// The three PostgreSQL execution policies (PLAN "Polly and PostgreSQL integration"), all over
 /// the one shared <see cref="NpgsqlDataSource"/>:
@@ -82,14 +86,16 @@ module Execution =
 
     let private setLocalTimeouts (connection: NpgsqlConnection) (tx: NpgsqlTransaction) (ct: CancellationToken) =
         task {
-            // SET LOCAL does not accept bind parameters; the values are integral milliseconds
-            // from trusted configuration, so formatting them is not an injection vector.
-            use command =
-                new NpgsqlCommand(
-                    $"SET LOCAL lock_timeout = {int64 defaults.LockTimeout.TotalMilliseconds}; SET LOCAL statement_timeout = {int64 defaults.StatementTimeout.TotalMilliseconds}",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(ExecutionSql.setLocalTimeouts, connection, tx)
+
+            command.Parameters.AddWithValue("lock_timeout", string (int64 defaults.LockTimeout.TotalMilliseconds))
+            |> ignore
+
+            command.Parameters.AddWithValue(
+                "statement_timeout",
+                string (int64 defaults.StatementTimeout.TotalMilliseconds)
+            )
+            |> ignore
 
             let! _ = command.ExecuteNonQueryAsync ct
             ()

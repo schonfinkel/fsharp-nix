@@ -13,6 +13,15 @@ open ByzantineSystems.Automata.Storage
 open Npgsql
 
 [<RequireQualifiedAccess>]
+module RefundSql =
+    let insertRefundOperation = Sql.load "Refunds/insert-refund-operation"
+    let refundOperationRow = Sql.load "Refunds/refund-operation-row"
+    let refundOperationStatus = Sql.load "Refunds/refund-operation-status"
+    let releaseAllocation = Sql.load "Refunds/release-allocation"
+    let settleAllocation = Sql.load "Refunds/settle-allocation"
+    let settleRefundOperation = Sql.load "Refunds/settle-refund-operation"
+
+[<RequireQualifiedAccess>]
 module RefundEffects =
     let actionKind =
         function
@@ -82,12 +91,7 @@ module RefundEffects =
                                     PaymentCodec.event
                                     ct
                         | SettleAllocation(approved, _) ->
-                            use update =
-                                new NpgsqlCommand(
-                                    "UPDATE fsnix.refund_allocations SET status='settled',updated_at=statement_timestamp() WHERE allocation_id=@id AND status='pending'",
-                                    connection,
-                                    tx
-                                )
+                            use update = new NpgsqlCommand(RefundSql.settleAllocation, connection, tx)
 
                             update.Parameters.AddWithValue("id", RefundAllocationId.value approved.Request.AllocationId)
                             |> ignore
@@ -106,12 +110,7 @@ module RefundEffects =
                                     PaymentCodec.event
                                     ct
                         | ReleaseAllocation request ->
-                            use update =
-                                new NpgsqlCommand(
-                                    "UPDATE fsnix.refund_allocations SET status='released',updated_at=statement_timestamp() WHERE allocation_id=@id AND status='pending'",
-                                    connection,
-                                    tx
-                                )
+                            use update = new NpgsqlCommand(RefundSql.releaseAllocation, connection, tx)
 
                             update.Parameters.AddWithValue("id", RefundAllocationId.value request.AllocationId)
                             |> ignore
@@ -244,12 +243,7 @@ module RefundEffects =
                     do! tx.RollbackAsync ct
                     return Error error
                 | Ok first ->
-                    use insert =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.payment_operations(operation_id,payment_entity_id,order_id,kind,amount,currency) VALUES(@id,@entity,@order,'refund',@amount,@currency) ON CONFLICT(operation_id) DO NOTHING",
-                            connection,
-                            tx
-                        )
+                    use insert = new NpgsqlCommand(RefundSql.insertRefundOperation, connection, tx)
 
                     insert.Parameters.AddWithValue("id", operationId) |> ignore
                     insert.Parameters.AddWithValue("entity", paymentEntity orderId) |> ignore
@@ -261,12 +255,7 @@ module RefundEffects =
 
                     let! _ = insert.ExecuteNonQueryAsync ct
 
-                    use read =
-                        new NpgsqlCommand(
-                            "SELECT payment_entity_id,order_id,kind,amount,currency,status,provider_reference,result_code FROM fsnix.payment_operations WHERE operation_id=@id",
-                            connection,
-                            tx
-                        )
+                    use read = new NpgsqlCommand(RefundSql.refundOperationRow, connection, tx)
 
                     read.Parameters.AddWithValue("id", operationId) |> ignore
                     use! reader = read.ExecuteReaderAsync ct
@@ -348,11 +337,7 @@ module RefundEffects =
                         use! settleTx = settleConnection.BeginTransactionAsync ct
 
                         use update =
-                            new NpgsqlCommand(
-                                "UPDATE fsnix.payment_operations SET status=@status,provider_reference=@ref,result_code=@result,attempts=attempts+1,updated_at=statement_timestamp() WHERE operation_id=@id AND status IN ('pending','unknown')",
-                                settleConnection,
-                                settleTx
-                            )
+                            new NpgsqlCommand(RefundSql.settleRefundOperation, settleConnection, settleTx)
 
                         update.Parameters.AddWithValue("id", operationId) |> ignore
                         update.Parameters.AddWithValue("status", status) |> ignore
@@ -372,11 +357,7 @@ module RefundEffects =
                             else
                                 task {
                                     use readBack =
-                                        new NpgsqlCommand(
-                                            "SELECT status,provider_reference,result_code FROM fsnix.payment_operations WHERE operation_id=@id",
-                                            settleConnection,
-                                            settleTx
-                                        )
+                                        new NpgsqlCommand(RefundSql.refundOperationStatus, settleConnection, settleTx)
 
                                     readBack.Parameters.AddWithValue("id", operationId) |> ignore
                                     use! row = readBack.ExecuteReaderAsync ct

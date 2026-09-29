@@ -1,0 +1,1 @@
+LISTEN fsnix_feature_schedule_changed

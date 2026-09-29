@@ -17,6 +17,20 @@ type AccountFlowRequestResult =
     | IdempotencyConflict
     | UserNotFound
 
+[<RequireQualifiedAccess>]
+module AccountFlowRequestSql =
+    let cancelSupersededFlowDeadlines =
+        Sql.load "Accounts/cancel-superseded-flow-deadlines"
+
+    let findActiveFlowByEmail = Sql.load "Accounts/find-active-flow-by-email"
+    let findIdempotentRequest = Sql.load "Accounts/find-idempotent-request"
+    let insertFirstFlowDeadline = Sql.load "Accounts/insert-first-flow-deadline"
+    let insertFlowCallback = Sql.load "Accounts/insert-flow-callback"
+    let insertIdempotentFlowRequest = Sql.load "Accounts/insert-idempotent-flow-request"
+    let loadActiveRequest = Sql.load "Accounts/load-active-request"
+    let lockUser = Sql.load "Accounts/lock-user"
+    let supersedeActiveFlows = Sql.load "Accounts/supersede-active-flows"
+
 /// <summary>Restricted queries and transactional creation for password-reset and email-change
 /// requests. A user-row lock serializes all request creation for that identity; request row,
 /// supersession, deadline, and start callback commit atomically.</summary>
@@ -47,11 +61,7 @@ module AccountFlowRequests =
                     use! transaction = connection.BeginTransactionAsync(ct)
 
                     use lockUser =
-                        new NpgsqlCommand(
-                            "SELECT id FROM fsnix.users WHERE id = @user_id FOR UPDATE",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountFlowRequestSql.lockUser, connection, transaction)
 
                     lockUser.Parameters.AddWithValue("user_id", userId) |> ignore
                     let! foundUser = lockUser.ExecuteScalarAsync(ct)
@@ -61,16 +71,7 @@ module AccountFlowRequests =
                         return Ok AccountFlowRequestResult.UserNotFound
                     else
                         use existing =
-                            new NpgsqlCommand(
-                                """SELECT flow_id, request_hash
-                                   FROM fsnix.account_flow_requests
-                                   WHERE user_id = @user_id
-                                     AND flow_kind = @flow_kind
-                                     AND idempotency_key_hash = @key_hash
-                                   FOR UPDATE""",
-                                connection,
-                                transaction
-                            )
+                            new NpgsqlCommand(AccountFlowRequestSql.findIdempotentRequest, connection, transaction)
 
                         existing.Parameters.AddWithValue("user_id", userId) |> ignore
                         existing.Parameters.AddWithValue("flow_kind", FlowKind.wireName kind) |> ignore
@@ -99,16 +100,7 @@ module AccountFlowRequests =
                             let callbackKey = startCallbackKey flowId
 
                             use supersede =
-                                new NpgsqlCommand(
-                                    """UPDATE fsnix.account_flow_requests
-                                       SET status = 'superseded', superseded_by = @flow_id,
-                                           updated_at = statement_timestamp()
-                                       WHERE user_id = @user_id
-                                         AND flow_kind = @flow_kind
-                                         AND status = 'requested'""",
-                                    connection,
-                                    transaction
-                                )
+                                new NpgsqlCommand(AccountFlowRequestSql.supersedeActiveFlows, connection, transaction)
 
                             supersede.Parameters.AddWithValue("flow_id", flowId) |> ignore
                             supersede.Parameters.AddWithValue("user_id", userId) |> ignore
@@ -117,12 +109,7 @@ module AccountFlowRequests =
 
                             use cancelDeadlines =
                                 new NpgsqlCommand(
-                                    """UPDATE fsnix.flow_deadlines
-                                       SET status = 'cancelled'
-                                       WHERE flow_id IN (
-                                           SELECT flow_id FROM fsnix.account_flow_requests
-                                           WHERE user_id = @user_id AND flow_kind = @flow_kind AND status = 'superseded')
-                                         AND status = 'pending'""",
+                                    AccountFlowRequestSql.cancelSupersededFlowDeadlines,
                                     connection,
                                     transaction
                                 )
@@ -136,11 +123,7 @@ module AccountFlowRequests =
 
                             use insertRequest =
                                 new NpgsqlCommand(
-                                    """INSERT INTO fsnix.account_flow_requests
-                                           (flow_id, flow_kind, user_id, destination_email, status, generation,
-                                            resend_count, expires_at, idempotency_key_hash, request_hash)
-                                       VALUES (@flow_id, @flow_kind, @user_id, @destination, 'requested', 1, 0,
-                                               @expires_at, @key_hash, @request_hash)""",
+                                    AccountFlowRequestSql.insertIdempotentFlowRequest,
                                     connection,
                                     transaction
                                 )
@@ -159,9 +142,7 @@ module AccountFlowRequests =
 
                             use deadline =
                                 new NpgsqlCommand(
-                                    """INSERT INTO fsnix.flow_deadlines
-                                           (flow_id, timer_kind, generation, deadline, gate_callback_key)
-                                       VALUES (@flow_id, 'flow-expiry', 1, @deadline, @callback_key)""",
+                                    AccountFlowRequestSql.insertFirstFlowDeadline,
                                     connection,
                                     transaction
                                 )
@@ -172,12 +153,7 @@ module AccountFlowRequests =
                             let! _ = deadline.ExecuteNonQueryAsync(ct)
 
                             use callback =
-                                new NpgsqlCommand(
-                                    """INSERT INTO fsnix.integration_outbox (callback_key, machine_id, entity_id, event)
-                                       VALUES (@callback_key, @machine_id, @entity_id, @event::jsonb)""",
-                                    connection,
-                                    transaction
-                                )
+                                new NpgsqlCommand(AccountFlowRequestSql.insertFlowCallback, connection, transaction)
 
                             callback.Parameters.AddWithValue("callback_key", callbackKey) |> ignore
                             callback.Parameters.AddWithValue("machine_id", AccountFlow.MachineKey) |> ignore
@@ -200,14 +176,7 @@ module AccountFlowRequests =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT flow_id, flow_kind, user_id, destination_email, generation
-                       FROM fsnix.account_flow_requests
-                       WHERE flow_id = @flow_id AND status = 'requested'
-                         AND expires_at > statement_timestamp()""",
-                    connection
-                )
+            use command = new NpgsqlCommand(AccountFlowRequestSql.loadActiveRequest, connection)
 
             command.Parameters.AddWithValue("flow_id", flowId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -243,14 +212,7 @@ module AccountFlowRequests =
             do! connection.OpenAsync(ct)
 
             use command =
-                new NpgsqlCommand(
-                    """SELECT flow_id FROM fsnix.account_flow_requests
-                       WHERE flow_kind = @flow_kind AND status = 'requested'
-                         AND expires_at > statement_timestamp()
-                         AND lower(trim(destination_email)) = lower(trim(@email))
-                       ORDER BY created_at DESC LIMIT 1""",
-                    connection
-                )
+                new NpgsqlCommand(AccountFlowRequestSql.findActiveFlowByEmail, connection)
 
             command.Parameters.AddWithValue("flow_kind", FlowKind.wireName kind) |> ignore
             command.Parameters.AddWithValue("email", email) |> ignore

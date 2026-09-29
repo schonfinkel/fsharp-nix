@@ -25,6 +25,17 @@ type CatalogFailure =
     | ProductNotFound
     | InsufficientStock
 
+[<RequireQualifiedAccess>]
+module CatalogSql =
+    let adjustStock = Sql.load "Catalog/adjust-stock"
+    let browse = Sql.load "Catalog/browse"
+    let get = Sql.load "Catalog/get"
+    let insertProduct = Sql.load "Catalog/insert-product"
+    let insertStock = Sql.load "Catalog/insert-stock"
+    let retireProduct = Sql.load "Catalog/retire-product"
+    let search = Sql.load "Catalog/search"
+    let updateProduct = Sql.load "Catalog/update-product"
+
 /// <summary>Relational catalog and stock store. Products are not a machine; every operation is
 /// a plain SQL statement or transaction. Raw Npgsql (not SqlHydra) keeps the tsvector search
 /// column and numeric money columns outside the generated-schema surface.</summary>
@@ -62,24 +73,12 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
           Active = reader.GetBoolean 7
           OnHand = reader.GetInt32 8 }
 
-    let selectPrefix =
-        """SELECT p.product_id, p.sku, p.name, p.description, p.price_amount, p.price_currency,
-                  p.price_version, p.active, COALESCE(s.on_hand, 0)
-           FROM fsnix.products p
-           LEFT JOIN fsnix.product_stock s ON s.product_id = p.product_id"""
-
     member _.Browse(activeOnly: bool, ct: CancellationToken) : Task<ProductSnapshot list> =
         task {
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    $"{selectPrefix}
-                      WHERE p.active = @active
-                      ORDER BY p.name",
-                    connection
-                )
+            use command = new NpgsqlCommand(CatalogSql.browse, connection)
 
             command.Parameters.AddWithValue("active", activeOnly) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -102,14 +101,7 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
                 use connection = dataSource.CreateConnection()
                 do! connection.OpenAsync(ct)
 
-                use command =
-                    new NpgsqlCommand(
-                        $"{selectPrefix}
-                          WHERE p.active
-                            AND p.search @@ websearch_to_tsquery('english', @query)
-                          ORDER BY p.name",
-                        connection
-                    )
+                use command = new NpgsqlCommand(CatalogSql.search, connection)
 
                 command.Parameters.AddWithValue("query", query) |> ignore
                 let! reader = command.ExecuteReaderAsync(ct)
@@ -127,12 +119,7 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    $"{selectPrefix}
-                      WHERE p.product_id = @product_id",
-                    connection
-                )
+            use command = new NpgsqlCommand(CatalogSql.get, connection)
 
             command.Parameters.AddWithValue("product_id", productId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -159,14 +146,7 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
             use! transaction = connection.BeginTransactionAsync(ct)
 
             try
-                use product =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.products
-                               (product_id, sku, name, description, price_amount, price_currency, price_version, active)
-                           VALUES (@product_id, @sku, @name, @description, @price_amount, @price_currency, 1, TRUE)""",
-                        connection,
-                        transaction
-                    )
+                use product = new NpgsqlCommand(CatalogSql.insertProduct, connection, transaction)
 
                 product.Parameters.AddWithValue("product_id", productId) |> ignore
                 product.Parameters.AddWithValue("sku", Sku.value sku) |> ignore
@@ -184,13 +164,7 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
 
                 let! _ = product.ExecuteNonQueryAsync(ct)
 
-                use stock =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.product_stock (product_id, on_hand, reserved)
-                           VALUES (@product_id, @on_hand, 0)""",
-                        connection,
-                        transaction
-                    )
+                use stock = new NpgsqlCommand(CatalogSql.insertStock, connection, transaction)
 
                 stock.Parameters.AddWithValue("product_id", productId) |> ignore
                 stock.Parameters.AddWithValue("on_hand", onHand) |> ignore
@@ -210,18 +184,7 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.products
-                       SET name = @name,
-                           description = @description,
-                           price_amount = @price_amount,
-                           price_currency = @price_currency,
-                           price_version = price_version + 1,
-                           updated_at = statement_timestamp()
-                       WHERE product_id = @product_id""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CatalogSql.updateProduct, connection)
 
             command.Parameters.AddWithValue("product_id", productId) |> ignore
             command.Parameters.AddWithValue("name", NonEmptyString.value name) |> ignore
@@ -250,13 +213,7 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.products
-                       SET active = FALSE, updated_at = statement_timestamp()
-                       WHERE product_id = @product_id""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CatalogSql.retireProduct, connection)
 
             command.Parameters.AddWithValue("product_id", productId) |> ignore
             let! affected = command.ExecuteNonQueryAsync(ct)
@@ -273,14 +230,7 @@ type CatalogStore(dataSource: NpgsqlDataSource) =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.product_stock
-                       SET on_hand = on_hand + @delta, updated_at = statement_timestamp()
-                       WHERE product_id = @product_id
-                         AND on_hand + @delta >= 0""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CatalogSql.adjustStock, connection)
 
             command.Parameters.AddWithValue("product_id", productId) |> ignore
             command.Parameters.AddWithValue("delta", delta) |> ignore

@@ -12,6 +12,13 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
 
+[<RequireQualifiedAccess>]
+module ShipmentSql =
+    let allocationExists = Sql.load "Shipments/allocation-exists"
+    let carrierReference = Sql.load "Shipments/carrier-reference"
+    let markDelivered = Sql.load "Shipments/mark-delivered"
+    let setCarrierReference = Sql.load "Shipments/set-carrier-reference"
+
 /// <summary>
 /// Effects for the shipments machine. Label creation crosses the carrier boundary outside any
 /// database transaction; the deterministic sandbox carrier makes redelivery converge by storing
@@ -76,12 +83,7 @@ module ShipmentEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    "SELECT EXISTS (SELECT 1 FROM fsnix.shipments WHERE allocation_id=@allocation)",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(ShipmentSql.allocationExists, connection, tx)
 
             command.Parameters.AddWithValue("allocation", ShipmentAllocationId.value allocationId)
             |> ignore
@@ -97,12 +99,7 @@ module ShipmentEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    "SELECT carrier_reference FROM fsnix.shipments WHERE shipment_id=@shipment",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(ShipmentSql.carrierReference, connection, tx)
 
             command.Parameters.AddWithValue("shipment", ShipmentId.value shipmentId)
             |> ignore
@@ -124,12 +121,7 @@ module ShipmentEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    "UPDATE fsnix.shipments SET carrier_reference=@reference WHERE shipment_id=@shipment AND carrier_reference IS NULL",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(ShipmentSql.setCarrierReference, connection, tx)
 
             command.Parameters.AddWithValue("reference", CarrierReference.value reference)
             |> ignore
@@ -287,12 +279,7 @@ module ShipmentEffects =
                 | Ok _ ->
                     match record.Action with
                     | NotifyOrderDelivered(_, shipmentId, _, deliveredAt) ->
-                        use delivered =
-                            new NpgsqlCommand(
-                                "UPDATE fsnix.shipments SET delivered_at=COALESCE(delivered_at,@delivered) WHERE shipment_id=@shipment",
-                                connection,
-                                tx
-                            )
+                        use delivered = new NpgsqlCommand(ShipmentSql.markDelivered, connection, tx)
 
                         delivered.Parameters.AddWithValue("delivered", deliveredAt) |> ignore
 

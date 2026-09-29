@@ -11,6 +11,13 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
 
+[<RequireQualifiedAccess>]
+module CartSql =
+    let cancelDeadlines = Sql.load "Carts/cancel-deadlines"
+    let cancelOlderDeadlines = Sql.load "Carts/cancel-older-deadlines"
+    let insertAbandonmentDeadline = Sql.load "Carts/insert-abandonment-deadline"
+    let notifyChange = Sql.load "Carts/notify-change"
+
 /// <summary>
 /// The durable work of the cart machine's actions: exactly-once receipts, the abandonment
 /// deadline ledger, the merge snapshot, cross-machine apply/notify callbacks, and capability
@@ -61,8 +68,7 @@ module CartEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand("SELECT pg_notify(@channel, @cart_id)", connection, transaction)
+            use command = new NpgsqlCommand(CartSql.notifyChange, connection, transaction)
 
             command.Parameters.AddWithValue("channel", CartChange.Channel) |> ignore
             command.Parameters.AddWithValue("cart_id", cartId) |> ignore
@@ -94,29 +100,14 @@ module CartEffects =
                     | RecordCartTouch(generation, hasLines) ->
                         if hasLines then
                             use cancelPrior =
-                                new NpgsqlCommand(
-                                    """UPDATE fsnix.cart_deadlines
-                                       SET status = 'cancelled'
-                                       WHERE cart_id = @cart_id
-                                         AND status = 'pending'
-                                         AND generation < @generation""",
-                                    connection,
-                                    transaction
-                                )
+                                new NpgsqlCommand(CartSql.cancelOlderDeadlines, connection, transaction)
 
                             cancelPrior.Parameters.AddWithValue("cart_id", cartId) |> ignore
                             cancelPrior.Parameters.AddWithValue("generation", generation) |> ignore
                             let! _ = cancelPrior.ExecuteNonQueryAsync(ct)
 
                             use deadlineRow =
-                                new NpgsqlCommand(
-                                    """INSERT INTO fsnix.cart_deadlines
-                                           (cart_id, timer_kind, generation, deadline, gate_callback_key)
-                                       VALUES (@cart_id, 'cart-abandonment', @generation, @deadline, @gate)
-                                       ON CONFLICT (cart_id, timer_kind, generation) DO NOTHING""",
-                                    connection,
-                                    transaction
-                                )
+                                new NpgsqlCommand(CartSql.insertAbandonmentDeadline, connection, transaction)
 
                             deadlineRow.Parameters.AddWithValue("cart_id", cartId) |> ignore
                             deadlineRow.Parameters.AddWithValue("generation", generation) |> ignore
@@ -128,14 +119,7 @@ module CartEffects =
                             let! _ = deadlineRow.ExecuteNonQueryAsync(ct)
                             ()
                         else
-                            use cancelAll =
-                                new NpgsqlCommand(
-                                    """UPDATE fsnix.cart_deadlines
-                                       SET status = 'cancelled'
-                                       WHERE cart_id = @cart_id AND status = 'pending'""",
-                                    connection,
-                                    transaction
-                                )
+                            use cancelAll = new NpgsqlCommand(CartSql.cancelDeadlines, connection, transaction)
 
                             cancelAll.Parameters.AddWithValue("cart_id", cartId) |> ignore
                             let! _ = cancelAll.ExecuteNonQueryAsync(ct)

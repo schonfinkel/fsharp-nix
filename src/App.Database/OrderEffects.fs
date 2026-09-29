@@ -18,6 +18,17 @@ open ByzantineSystems.Automata.Storage
 open Npgsql
 
 [<RequireQualifiedAccess>]
+module OrderSql =
+    let authorizationIntentStatus = Sql.load "Orders/authorization-intent-status"
+    let cancelReservationDeadlines = Sql.load "Orders/cancel-reservation-deadlines"
+    let claimAuthorizationIntent = Sql.load "Orders/claim-authorization-intent"
+    let completeAuthorizationIntent = Sql.load "Orders/complete-authorization-intent"
+    let insertReservationDeadline = Sql.load "Orders/insert-reservation-deadline"
+    let insertReturnLine = Sql.load "Orders/insert-return-line"
+    let insertReturnRequest = Sql.load "Orders/insert-return-request"
+    let insertShipment = Sql.load "Orders/insert-shipment"
+
+[<RequireQualifiedAccess>]
 module OrderEffects =
     let actionKind =
         function
@@ -132,12 +143,7 @@ module OrderEffects =
 
                         match result with
                         | Ok _ ->
-                            use deadline =
-                                new NpgsqlCommand(
-                                    "INSERT INTO fsnix.reservation_deadlines(order_id,generation,deadline,gate_callback_key) VALUES(@order,@generation,@deadline,@gate) ON CONFLICT DO NOTHING",
-                                    connection,
-                                    tx
-                                )
+                            use deadline = new NpgsqlCommand(OrderSql.insertReservationDeadline, connection, tx)
 
                             deadline.Parameters.AddWithValue("order", orderEntity) |> ignore
                             deadline.Parameters.AddWithValue("generation", order.Generation) |> ignore
@@ -177,12 +183,7 @@ module OrderEffects =
                     let entity = EntityId.value record.EntityId
                     do! StockReservations.release connection tx entity ct
 
-                    use cancel =
-                        new NpgsqlCommand(
-                            "UPDATE fsnix.reservation_deadlines SET status='cancelled',lease_owner=NULL,lease_until=NULL WHERE order_id=@order AND status='pending'",
-                            connection,
-                            tx
-                        )
+                    use cancel = new NpgsqlCommand(OrderSql.cancelReservationDeadlines, connection, tx)
 
                     cancel.Parameters.AddWithValue("order", entity) |> ignore
                     let! _ = cancel.ExecuteNonQueryAsync ct
@@ -265,28 +266,14 @@ module OrderEffects =
                 | RequestAuthorization(method, attempt, amount) ->
                     let orderEntity = EntityId.value record.EntityId
 
-                    use claim =
-                        new NpgsqlCommand(
-                            """INSERT INTO fsnix.authorization_intents(order_id,amount,currency,status)
-                               SELECT @order,@amount,@currency,'claimed'
-                               WHERE EXISTS (SELECT 1 FROM fsnix.order_reservation_controls WHERE order_id=@order AND status='open')
-                               ON CONFLICT(order_id) DO UPDATE SET status='claimed', updated_at=statement_timestamp()
-                                   WHERE fsnix.authorization_intents.status='pending'""",
-                            connection,
-                            tx
-                        )
+                    use claim = new NpgsqlCommand(OrderSql.claimAuthorizationIntent, connection, tx)
 
                     claim.Parameters.AddWithValue("order", orderEntity) |> ignore
                     claim.Parameters.AddWithValue("amount", Money.amount amount) |> ignore
                     claim.Parameters.AddWithValue("currency", Money.currencyCode amount) |> ignore
                     let! _ = claim.ExecuteNonQueryAsync ct
 
-                    use read =
-                        new NpgsqlCommand(
-                            "SELECT status FROM fsnix.authorization_intents WHERE order_id=@order",
-                            connection,
-                            tx
-                        )
+                    use read = new NpgsqlCommand(OrderSql.authorizationIntentStatus, connection, tx)
 
                     read.Parameters.AddWithValue("order", orderEntity) |> ignore
                     let! status = read.ExecuteScalarAsync ct
@@ -359,22 +346,12 @@ module OrderEffects =
                 | RequestPaymentCancellation reason ->
                     let orderEntity = EntityId.value record.EntityId
 
-                    use fence =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.order_reservation_controls(order_id,generation,status) VALUES(@order,1,'cancelled') ON CONFLICT(order_id) DO UPDATE SET status='cancelled',updated_at=statement_timestamp()",
-                            connection,
-                            tx
-                        )
+                    use fence = new NpgsqlCommand(StockSql.cancelReservationControl, connection, tx)
 
                     fence.Parameters.AddWithValue("order", orderEntity) |> ignore
                     let! _ = fence.ExecuteNonQueryAsync ct
 
-                    use intent =
-                        new NpgsqlCommand(
-                            "UPDATE fsnix.authorization_intents SET status='cancelled' WHERE order_id=@order AND status IN ('pending','claimed')",
-                            connection,
-                            tx
-                        )
+                    use intent = new NpgsqlCommand(StockSql.cancelAuthorizationIntent, connection, tx)
 
                     intent.Parameters.AddWithValue("order", orderEntity) |> ignore
                     let! _ = intent.ExecuteNonQueryAsync ct
@@ -425,11 +402,7 @@ module OrderEffects =
                     let! committed = StockReservations.commit connection tx entity ct
 
                     use cancelDeadline =
-                        new NpgsqlCommand(
-                            "UPDATE fsnix.reservation_deadlines SET status='cancelled',lease_owner=NULL,lease_until=NULL WHERE order_id=@order AND status='pending'",
-                            connection,
-                            tx
-                        )
+                        new NpgsqlCommand(OrderSql.cancelReservationDeadlines, connection, tx)
 
                     cancelDeadline.Parameters.AddWithValue("order", entity) |> ignore
                     let! _ = cancelDeadline.ExecuteNonQueryAsync ct
@@ -447,11 +420,7 @@ module OrderEffects =
                     | Ok eventJson ->
                         if committed > 0 then
                             use complete =
-                                new NpgsqlCommand(
-                                    "UPDATE fsnix.authorization_intents SET status='completed' WHERE order_id=@order AND status='claimed'",
-                                    connection,
-                                    tx
-                                )
+                                new NpgsqlCommand(OrderSql.completeAuthorizationIntent, connection, tx)
 
                             complete.Parameters.AddWithValue("order", entity) |> ignore
                             let! _ = complete.ExecuteNonQueryAsync ct
@@ -495,12 +464,7 @@ module OrderEffects =
                 | CreateShipment(shipment, addressSnapshotId) ->
                     let orderEntity = EntityId.value record.EntityId
 
-                    use insert =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.shipments(shipment_id,allocation_id,order_id) VALUES(@shipment,@allocation,@order) ON CONFLICT(shipment_id) DO NOTHING",
-                            connection,
-                            tx
-                        )
+                    use insert = new NpgsqlCommand(OrderSql.insertShipment, connection, tx)
 
                     insert.Parameters.AddWithValue("shipment", ShipmentId.value shipment.ShipmentId)
                     |> ignore
@@ -671,12 +635,7 @@ module OrderEffects =
             | Ok _ ->
                 match record.Action with
                 | StartReturn request when request.OrderId = EntityId.value record.EntityId ->
-                    use insert =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.return_requests(return_id,authorization_id,order_id,window_ends_at) VALUES(@id,@auth,@order,@deadline) ON CONFLICT(return_id) DO NOTHING",
-                            connection,
-                            tx
-                        )
+                    use insert = new NpgsqlCommand(OrderSql.insertReturnRequest, connection, tx)
 
                     insert.Parameters.AddWithValue("id", ReturnId.value request.ReturnId) |> ignore
 
@@ -688,12 +647,7 @@ module OrderEffects =
                     let! _ = insert.ExecuteNonQueryAsync ct
 
                     for line in request.Lines do
-                        use row =
-                            new NpgsqlCommand(
-                                "INSERT INTO fsnix.return_lines(return_id,order_line_id,quantity,refunded_amount,currency) VALUES(@return,@line,@quantity,@amount,@currency) ON CONFLICT(return_id,order_line_id) DO NOTHING",
-                                connection,
-                                tx
-                            )
+                        use row = new NpgsqlCommand(OrderSql.insertReturnLine, connection, tx)
 
                         row.Parameters.AddWithValue("return", ReturnId.value request.ReturnId) |> ignore
 

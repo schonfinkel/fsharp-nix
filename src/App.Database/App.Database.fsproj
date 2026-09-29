@@ -32,11 +32,11 @@
     <Compile Include="Database.Generated.fs">
       <Visible>False</Visible>
     </Compile>
+    <Compile Include="Sql.fs" />
+    <Compile Include="Execution.fs" />
     <Compile Include="FeatureFlagStore.fs" />
     <Compile Include="FeatureChangeSource.fs" />
     <Compile Include="AutomataStore.fs" />
-    <Compile Include="Execution.fs" />
-    <Compile Include="Sql.fs" />
     <Compile Include="LeasedLedger.fs" />
     <Compile Include="CodecSupport.fs" />
     <Compile Include="WorkflowEffects.fs" />

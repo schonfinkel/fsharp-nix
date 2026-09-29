@@ -100,6 +100,14 @@ module AccountEmail =
         with error ->
             Error $"the payload did not decode: {error.GetType().Name}"
 
+[<RequireQualifiedAccess>]
+module AccountFlowEffectSql =
+    let advanceFlowGeneration = Sql.load "Accounts/advance-flow-generation"
+    let cancelOlderDeadlines = Sql.load "Accounts/cancel-older-deadlines"
+    let insertEmailOutbox = Sql.load "Accounts/insert-email-outbox"
+    let insertGenerationDeadline = Sql.load "Accounts/insert-generation-deadline"
+    let loadRequestedFlow = Sql.load "Accounts/load-requested-flow"
+
 /// <summary>The durable work of the <c>SendNotification</c> action: an idempotent receipt, the
 /// protected email row, and the sanitized notification callback.</summary>
 [<RequireQualifiedAccess>]
@@ -114,13 +122,7 @@ module AccountFlowEffects =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT flow_id, flow_kind, user_id, destination_email, generation
-                       FROM fsnix.account_flow_requests
-                       WHERE flow_id = @flow_id AND status = 'requested'""",
-                    connection
-                )
+            use command = new NpgsqlCommand(AccountFlowEffectSql.loadRequestedFlow, connection)
 
             command.Parameters.AddWithValue("flow_id", flowId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -193,16 +195,7 @@ module AccountFlowEffects =
                     return Ok()
                 | Ok ReceiptStatus.FirstRun ->
                     use advance =
-                        new NpgsqlCommand(
-                            """UPDATE fsnix.account_flow_requests
-                               SET generation = @generation,
-                                   resend_count = @generation - 1,
-                                   expires_at = @expires_at,
-                                   updated_at = statement_timestamp()
-                               WHERE flow_id = @flow_id AND status = 'requested'""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountFlowEffectSql.advanceFlowGeneration, connection, transaction)
 
                     advance.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                     advance.Parameters.AddWithValue("generation", generation) |> ignore
@@ -210,15 +203,7 @@ module AccountFlowEffects =
                     let! _ = advance.ExecuteNonQueryAsync(ct)
 
                     use cancelSuperseded =
-                        new NpgsqlCommand(
-                            """UPDATE fsnix.flow_deadlines
-                               SET status = 'cancelled'
-                               WHERE flow_id = @flow_id
-                                 AND status = 'pending'
-                                 AND generation < @generation""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountFlowEffectSql.cancelOlderDeadlines, connection, transaction)
 
                     cancelSuperseded.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                     cancelSuperseded.Parameters.AddWithValue("generation", generation) |> ignore
@@ -227,13 +212,7 @@ module AccountFlowEffects =
                     match protectedPayload with
                     | Some payload ->
                         use email =
-                            new NpgsqlCommand(
-                                """INSERT INTO fsnix.account_email_outbox (flow_id, generation, protected_payload, encryption_version)
-                                   VALUES (@flow_id, @generation, @protected_payload, @encryption_version)
-                                   ON CONFLICT (flow_id, generation) DO NOTHING""",
-                                connection,
-                                transaction
-                            )
+                            new NpgsqlCommand(AccountFlowEffectSql.insertEmailOutbox, connection, transaction)
 
                         email.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                         email.Parameters.AddWithValue("generation", generation) |> ignore
@@ -247,13 +226,7 @@ module AccountFlowEffects =
                     | None -> ()
 
                     use deadline =
-                        new NpgsqlCommand(
-                            """INSERT INTO fsnix.flow_deadlines (flow_id, timer_kind, generation, deadline, gate_callback_key)
-                               VALUES (@flow_id, 'flow-expiry', @generation, @deadline, @gate)
-                               ON CONFLICT (flow_id, timer_kind, generation) DO NOTHING""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountFlowEffectSql.insertGenerationDeadline, connection, transaction)
 
                     deadline.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                     deadline.Parameters.AddWithValue("generation", generation) |> ignore

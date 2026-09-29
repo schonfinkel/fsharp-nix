@@ -12,6 +12,13 @@ type CartMergeSnapshotRow =
       LinesJson: string
       Status: string }
 
+[<RequireQualifiedAccess>]
+module CartMergeSql =
+    let insertMergeSnapshot = Sql.load "Carts/insert-merge-snapshot"
+    let loadMergeSnapshot = Sql.load "Carts/load-merge-snapshot"
+    let markMergeApplied = Sql.load "Carts/mark-merge-applied"
+    let pendingMergeSnapshots = Sql.load "Carts/pending-merge-snapshots"
+
 /// <summary>Immutable merge-snapshot store. Captures are insert-once keyed by MergeId; the
 /// reconciler lists captured-but-unapplied snapshots to resume a lost handoff.</summary>
 [<RequireQualifiedAccess>]
@@ -33,15 +40,7 @@ module CartMerge =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.cart_merge_snapshots
-                           (merge_id, source_cart_id, target_customer_id, lines, status)
-                       VALUES (@merge_id, @source_cart_id, @target_customer_id, @lines::jsonb, 'captured')
-                       ON CONFLICT (merge_id) DO NOTHING
-                       RETURNING merge_id""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CartMergeSql.insertMergeSnapshot, connection)
 
             command.Parameters.AddWithValue("merge_id", mergeId) |> ignore
             command.Parameters.AddWithValue("source_cart_id", sourceCartId) |> ignore
@@ -68,13 +67,7 @@ module CartMerge =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT merge_id, source_cart_id, target_customer_id, lines::text, status
-                       FROM fsnix.cart_merge_snapshots
-                       WHERE merge_id = @merge_id""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CartMergeSql.loadMergeSnapshot, connection)
 
             command.Parameters.AddWithValue("merge_id", mergeId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -100,13 +93,7 @@ module CartMerge =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.cart_merge_snapshots
-                       SET status = 'applied', applied_at = statement_timestamp()
-                       WHERE merge_id = @merge_id AND status = 'captured'""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CartMergeSql.markMergeApplied, connection)
 
             command.Parameters.AddWithValue("merge_id", mergeId) |> ignore
             let! _ = command.ExecuteNonQueryAsync(ct)
@@ -118,14 +105,7 @@ module CartMerge =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT merge_id, source_cart_id, target_customer_id, lines::text, status
-                       FROM fsnix.cart_merge_snapshots
-                       WHERE status = 'captured'
-                       ORDER BY captured_at, merge_id""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CartMergeSql.pendingMergeSnapshots, connection)
 
             let! reader = command.ExecuteReaderAsync(ct)
             let rows = ResizeArray<CartMergeSnapshotRow>()

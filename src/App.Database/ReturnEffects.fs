@@ -12,6 +12,12 @@ open ByzantineSystems.Automata.Storage
 open Npgsql
 
 [<RequireQualifiedAccess>]
+module ReturnSql =
+    let insertRestock = Sql.load "Returns/insert-restock"
+    let requestAuthorized = Sql.load "Returns/request-authorized"
+    let restockProduct = Sql.load "Returns/restock-product"
+
+[<RequireQualifiedAccess>]
 module ReturnEffects =
     let private labelFailed = ReasonCode.ofLiteral "label-failed"
 
@@ -115,12 +121,7 @@ module ReturnEffects =
                     task {
                         match record.Action with
                         | VerifyAuthorization request ->
-                            use query =
-                                new NpgsqlCommand(
-                                    "SELECT EXISTS(SELECT 1 FROM fsnix.return_requests WHERE return_id=@id AND authorization_id=@auth AND order_id=@order AND status='pending' AND window_ends_at > statement_timestamp())",
-                                    connection,
-                                    tx
-                                )
+                            use query = new NpgsqlCommand(ReturnSql.requestAuthorized, connection, tx)
 
                             query.Parameters.AddWithValue("id", ReturnId.value request.ReturnId) |> ignore
 
@@ -153,12 +154,7 @@ module ReturnEffects =
                         | RestockItems(request, quantities) ->
                             if first then
                                 for (lineId, quantity) in quantities do
-                                    use insert =
-                                        new NpgsqlCommand(
-                                            "INSERT INTO fsnix.return_restock(return_id,order_line_id,quantity,source_command_id) SELECT @return,@line,@quantity,@command WHERE EXISTS(SELECT 1 FROM fsnix.return_lines WHERE return_id=@return AND order_line_id=@line AND quantity>=@quantity) ON CONFLICT DO NOTHING RETURNING quantity",
-                                            connection,
-                                            tx
-                                        )
+                                    use insert = new NpgsqlCommand(ReturnSql.insertRestock, connection, tx)
 
                                     insert.Parameters.AddWithValue("return", ReturnId.value request.ReturnId)
                                     |> ignore
@@ -174,12 +170,7 @@ module ReturnEffects =
                                     if isNull inserted then
                                         invalidOp "Duplicate or invalid restock allocation."
 
-                                    use stock =
-                                        new NpgsqlCommand(
-                                            "UPDATE fsnix.product_stock SET on_hand=on_hand+@quantity FROM fsnix.stock_reservations r WHERE r.order_line_id=@line AND r.product_id=fsnix.product_stock.product_id AND r.status='committed'",
-                                            connection,
-                                            tx
-                                        )
+                                    use stock = new NpgsqlCommand(ReturnSql.restockProduct, connection, tx)
 
                                     stock.Parameters.AddWithValue("line", OrderLineId.value lineId) |> ignore
                                     stock.Parameters.AddWithValue("quantity", quantity) |> ignore

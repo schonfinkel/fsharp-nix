@@ -20,6 +20,11 @@ type ProbeEffectHandler(dataSource: NpgsqlDataSource) =
             ProbeEffects.apply dataSource action.Work ct
 
 [<RequireQualifiedAccess>]
+module ProbeAdminSql =
+    let latestOutboxStatus = Sql.load "Probe/latest-outbox-status"
+    let receiptCount = Sql.load "Probe/receipt-count"
+
+[<RequireQualifiedAccess>]
 module ProbeAdmin =
 
     let private entity = entityId "probe-p0"
@@ -29,11 +34,7 @@ module ProbeAdmin =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    "SELECT status FROM fsnix.integration_outbox ORDER BY outbox_id DESC LIMIT 1",
-                    connection
-                )
+            use command = new NpgsqlCommand(ProbeAdminSql.latestOutboxStatus, connection)
 
             let! status = command.ExecuteScalarAsync(ct)
             return status |> Option.ofObj |> Option.map string |> Option.defaultValue "empty"
@@ -44,11 +45,7 @@ module ProbeAdmin =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    "SELECT count(*) FROM fsnix.action_receipts WHERE machine_id = @machine_id",
-                    connection
-                )
+            use command = new NpgsqlCommand(ProbeAdminSql.receiptCount, connection)
 
             command.Parameters.AddWithValue("machine_id", Probe.MachineKey) |> ignore
             let! count = command.ExecuteScalarAsync(ct)
