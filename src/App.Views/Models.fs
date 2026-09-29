@@ -96,12 +96,19 @@ type DeadlineHealthModel =
       Leased: int64
       EarliestPendingDeadline: DateTimeOffset option }
 
+type ReconciliationHealthModel =
+    { Unknown: int64
+      Due: int64
+      Parked: int64
+      MaximumChecks: int option }
+
 type OperationalHealthModel =
     { CapturedAt: DateTimeOffset
       Runtime: RuntimeHealthModel list
       Outboxes: OutboxHealthModel list
       FlowRequests: FlowRequestHealthModel list
-      Deadlines: DeadlineHealthModel list }
+      Deadlines: DeadlineHealthModel list
+      Reconciliation: ReconciliationHealthModel }
 
 type CatalogProductModel =
     { ProductId: string

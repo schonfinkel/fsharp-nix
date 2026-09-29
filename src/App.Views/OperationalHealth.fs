@@ -133,6 +133,33 @@ module OperationalHealthViews =
                             }
                     }
                 }
+
+                h2 () { "Gateway reconciliation" }
+
+                table () {
+                    thead () {
+                        tr () {
+                            th () { "Unknown outcomes" }
+                            th () { "Due for a check" }
+                            th () { "Parked for review" }
+                            th () { "Most checks" }
+                        }
+                    }
+
+                    tbody () {
+                        tr () {
+                            td () { string model.Reconciliation.Unknown }
+                            td () { string model.Reconciliation.Due }
+                            td () { string model.Reconciliation.Parked }
+
+                            td () {
+                                model.Reconciliation.MaximumChecks
+                                |> Option.map string
+                                |> Option.defaultValue "-"
+                            }
+                        }
+                    }
+                }
             }
 
         SharedViews.layout context "Operations" content

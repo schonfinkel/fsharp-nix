@@ -53,22 +53,104 @@ ORDER BY
     flow_kind,
     status;
 
+-- Every scanner-owned due-work ledger, grouped by kind and status.
+WITH ledgers (
+    kind,
+    status,
+    due_at,
+    lease_until,
+    fired_at
+) AS (
+    SELECT
+        timer_kind,
+        status,
+        deadline,
+        lease_until,
+        fired_at
+    FROM
+        fsnix.flow_deadlines
+    UNION ALL
+    SELECT
+        timer_kind,
+        status,
+        deadline,
+        lease_until,
+        fired_at
+    FROM
+        fsnix.cart_deadlines
+    UNION ALL
+    SELECT
+        'reservation-expiry',
+        status,
+        deadline,
+        lease_until,
+        fired_at
+    FROM
+        fsnix.reservation_deadlines
+    UNION ALL
+    SELECT
+        'authorization-expiry',
+        status,
+        deadline,
+        lease_until,
+        fired_at
+    FROM
+        fsnix.payment_deadlines
+    UNION ALL
+    SELECT
+        'return-window',
+        status,
+        window_ends_at,
+        lease_until,
+        NULL::timestamptz
+    FROM
+        fsnix.return_requests
+    UNION ALL
+    SELECT
+        'invoice-render',
+        status,
+        due_at,
+        lease_until,
+        NULL::timestamptz
+    FROM
+        fsnix.invoice_render_checks
+    UNION ALL
+    SELECT
+        'shipment-lost',
+        status,
+        lost_due_at,
+        lease_until,
+        fired_at
+    FROM
+        fsnix.shipment_tracking
+)
 SELECT
-    timer_kind,
+    kind,
     status,
     COUNT(*)::bigint,
     COUNT(*) FILTER (WHERE status = 'pending'
-        AND deadline <= STATEMENT_TIMESTAMP())::bigint,
+        AND due_at <= STATEMENT_TIMESTAMP())::bigint,
     COUNT(*) FILTER (WHERE status = 'pending'
         AND lease_until >= STATEMENT_TIMESTAMP())::bigint,
-    MIN(deadline) FILTER (WHERE status = 'pending'),
-    MAX(fired_at) FILTER (WHERE status = 'fired')
+    MIN(due_at) FILTER (WHERE status = 'pending'),
+    MAX(fired_at)
 FROM
-    fsnix.flow_deadlines
+    ledgers
 GROUP BY
-    timer_kind,
+    kind,
     status
 ORDER BY
-    timer_kind,
+    kind,
     status;
+
+-- Provider calls whose outcome is still unknown: due for a check, or parked after the checks ran out.
+SELECT
+    COUNT(*)::bigint,
+    COUNT(*) FILTER (WHERE next_check_at <= STATEMENT_TIMESTAMP())::bigint,
+    COUNT(*) FILTER (WHERE next_check_at IS NULL)::bigint,
+    MAX(checks)
+FROM
+    fsnix.payment_operations
+WHERE
+    status = 'unknown';
 

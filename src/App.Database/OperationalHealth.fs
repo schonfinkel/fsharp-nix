@@ -34,12 +34,21 @@ type DeadlineHealthSnapshot =
       EarliestPendingDeadline: DateTimeOffset option
       LatestFiredAt: DateTimeOffset option }
 
+/// <summary>Provider calls with an unknown outcome: due for a gateway check, or parked for
+/// manual review after the checks ran out.</summary>
+type ReconciliationHealthSnapshot =
+    { Unknown: int64
+      Due: int64
+      Parked: int64
+      MaximumChecks: int option }
+
 type OperationalHealthSnapshot =
     { CapturedAt: DateTimeOffset
       IntegrationOutbox: OutboxHealthSnapshot
       EmailOutbox: OutboxHealthSnapshot
       FlowRequests: FlowRequestHealthSnapshot list
-      Deadlines: DeadlineHealthSnapshot list }
+      Deadlines: DeadlineHealthSnapshot list
+      Reconciliation: ReconciliationHealthSnapshot }
 
 [<RequireQualifiedAccess>]
 module OperationalHealthSql =
@@ -124,10 +133,23 @@ module OperationalHealth =
                       EarliestPendingDeadline = optionalTime reader 5
                       LatestFiredAt = optionalTime reader 6 }
 
+            let! hasReconciliation = reader.NextResultAsync(ct)
+            let! reconciliationRow = reader.ReadAsync(ct)
+
+            if not hasReconciliation || not reconciliationRow then
+                invalidOp "operational health capture returned no reconciliation row"
+
+            let reconciliation =
+                { Unknown = reader.GetInt64 0
+                  Due = reader.GetInt64 1
+                  Parked = reader.GetInt64 2
+                  MaximumChecks = optionalInt reader 3 }
+
             return
                 { CapturedAt = capturedAt
                   IntegrationOutbox = integration
                   EmailOutbox = email
                   FlowRequests = List.ofSeq flowRequests
-                  Deadlines = List.ofSeq deadlines }
+                  Deadlines = List.ofSeq deadlines
+                  Reconciliation = reconciliation }
         }
