@@ -17,7 +17,9 @@ module ShipmentSql =
     let allocationExists = Sql.load "Shipments/allocation-exists"
     let carrierReference = Sql.load "Shipments/carrier-reference"
     let markDelivered = Sql.load "Shipments/mark-delivered"
+    let recordTrackingCheckpoint = Sql.load "Shipments/record-tracking-checkpoint"
     let setCarrierReference = Sql.load "Shipments/set-carrier-reference"
+    let stopTrackingCheck = Sql.load "Shipments/stop-tracking-check"
 
 /// <summary>
 /// Effects for the shipments machine. Label creation crosses the carrier boundary outside any
@@ -35,6 +37,8 @@ module ShipmentEffects =
         | NotifyOrderDispatched _ -> "notify-order-dispatched"
         | NotifyOrderDelivered _ -> "notify-order-delivered"
         | RequestDeliveryRetry _ -> "request-delivery-retry"
+        | RecordTrackingCheckpoint _ -> "record-tracking-checkpoint"
+        | StopTrackingCheck _ -> "stop-tracking-check"
 
     let private key (record: ActionRecord<ShipmentEntityId, ShipmentAction>) purpose =
         $"xmsg:v1:{MachineId.value record.MachineId}:{CommandId.value record.CommandId}:{record.Ordinal}:{purpose}"
@@ -321,3 +325,64 @@ module ShipmentEffects =
                     return Ok()
             | _ -> return Error ShipmentActionError.InvalidAction
         }
+
+    /// <summary>Keeps the lost-shipment ledger in step with the carrier scans the machine
+    /// accepted. Local only (receipt plus one ledger write); the scanner is the only reader.</summary>
+    let applyTrackingCheck
+        (dataSource: NpgsqlDataSource)
+        (lostAfter: TimeSpan)
+        (record: ActionRecord<ShipmentEntityId, ShipmentAction>)
+        (ct: CancellationToken)
+        : Task<Result<unit, ShipmentActionError>> =
+        let receiptOf connection tx token =
+            task {
+                let! receipt = WorkflowEffects.receiptFor ShipmentCodec.action actionKind connection tx record token
+
+                return
+                    receipt
+                    |> Result.mapError (function
+                        | ReceiptFailure.EncodingFailed -> ShipmentActionError.CallbackEncodingFailed
+                        | ReceiptFailure.Mismatch -> ShipmentActionError.ActionReceiptMismatch)
+            }
+
+        let write (sql: string) (bind: NpgsqlCommand -> unit) =
+            WorkflowEffects.runLocalEffect
+                dataSource
+                receiptOf
+                (fun connection tx token ->
+                    task {
+                        use command = new NpgsqlCommand(sql, connection, tx)
+                        bind command
+                        let! _ = command.ExecuteNonQueryAsync token
+                        return Ok()
+                    })
+                ct
+
+        match record.Action with
+        | RecordTrackingCheckpoint(shipmentId, generation, lastScanAt, observedAt) when
+            Shipments.shipmentEntityId shipmentId = record.EntityId
+            ->
+            write ShipmentSql.recordTrackingCheckpoint (fun command ->
+                command.Parameters.AddWithValue("shipment", ShipmentId.value shipmentId)
+                |> ignore
+
+                command.Parameters.AddWithValue("generation", generation) |> ignore
+
+                command.Parameters.Add(
+                    NpgsqlParameter(
+                        "last_scan",
+                        NpgsqlTypes.NpgsqlDbType.TimestampTz,
+                        Value = (lastScanAt |> Option.map box |> Option.defaultValue DBNull.Value)
+                    )
+                )
+                |> ignore
+
+                command.Parameters.AddWithValue("observed", observedAt) |> ignore
+
+                command.Parameters.AddWithValue("lost_after_seconds", int64 lostAfter.TotalSeconds)
+                |> ignore)
+        | StopTrackingCheck shipmentId when Shipments.shipmentEntityId shipmentId = record.EntityId ->
+            write ShipmentSql.stopTrackingCheck (fun command ->
+                command.Parameters.AddWithValue("shipment", ShipmentId.value shipmentId)
+                |> ignore)
+        | _ -> Task.FromResult(Error ShipmentActionError.InvalidAction)

@@ -14,6 +14,8 @@ module LedgerSql =
     let gatewayUnknownSettle = Sql.load "Ledgers/gateway-unknown-settle"
     let invoiceRendersClaim = Sql.load "Ledgers/invoice-renders-claim"
     let invoiceRendersSettle = Sql.load "Ledgers/invoice-renders-settle"
+    let lostShipmentsClaim = Sql.load "Ledgers/lost-shipments-claim"
+    let lostShipmentsSettle = Sql.load "Ledgers/lost-shipments-settle"
     let paymentDeadlinesClaim = Sql.load "Ledgers/payment-deadlines-claim"
     let paymentDeadlinesSettle = Sql.load "Ledgers/payment-deadlines-settle"
     let flowDeadlinesSettle = Sql.load "Ledgers/flow-deadlines-settle"
@@ -332,3 +334,22 @@ module Ledgers =
         { InvoiceId = reader.GetGuid 0
           Checks = reader.GetInt32 1
           HasDocument = reader.GetBoolean 2 }
+
+    /// <summary>Shipments with no carrier scan inside the lost window.</summary>
+    let lostShipments =
+        { Claim = LedgerSql.lostShipmentsClaim
+          Settle = LedgerSql.lostShipmentsSettle }
+
+    type LostShipmentCheck =
+        { ShipmentId: Guid
+          TrackingGeneration: int64
+          LastScanAt: DateTimeOffset option }
+
+    let readLostShipmentCheck (reader: NpgsqlDataReader) =
+        { ShipmentId = reader.GetGuid 0
+          TrackingGeneration = reader.GetInt64 1
+          LastScanAt =
+            if reader.IsDBNull 2 then
+                None
+            else
+                Some(reader.GetFieldValue<DateTimeOffset> 2) }

@@ -12,6 +12,7 @@ open App.Payments
 open App.Refunds
 open App.Auth
 open App.Returns
+open App.Shipments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
@@ -297,6 +298,59 @@ type InvoiceRenderScanner
                         }
 
                 do! LeasedLedger.settle dataSource Ledgers.invoiceRenders options row.InvoiceId settlement ct
+        }
+
+/// <summary>
+/// Marks shipments lost when the carrier has not scanned them within the policy window. The
+/// event carries the generation and last scan the ledger saw; the shipment machine accepts it
+/// only if nothing newer arrived, so a scan racing this pass wins.
+/// </summary>
+type ShipmentLostScanner
+    (
+        dataSource: NpgsqlDataSource,
+        shipments: ShipmentMachineClient,
+        timeProvider: TimeProvider,
+        logger: ILogger<ShipmentLostScanner>,
+        health
+    ) =
+    inherit PeriodicWorker(RuntimeComponent.ShipmentLostScanner, TimeSpan.FromSeconds 5., logger, health)
+
+    let options = LeaseOptions.defaults (ScannerOwner.create "shipment-lost")
+
+    override _.RunPass ct =
+        task {
+            let! claimed = LeasedLedger.claim dataSource Ledgers.lostShipments options Ledgers.readLostShipmentCheck ct
+
+            for row in claimed do
+                let! settlement =
+                    match ShipmentId.create row.ShipmentId with
+                    | Error _ -> Task.FromResult Settlement.Cancelled
+                    | Ok shipmentId ->
+                        task {
+                            let entity = Shipments.shipmentEntityId shipmentId
+
+                            let lastScan =
+                                row.LastScanAt
+                                |> Option.map _.ToUnixTimeMilliseconds()
+                                |> Option.defaultValue 0L
+
+                            let key =
+                                TimerKey.create
+                                    Shipments.MachineKey
+                                    (EntityId.value entity)
+                                    $"lost:{row.TrackingGeneration}"
+                                    lastScan
+
+                            let event =
+                                MarkLost(row.TrackingGeneration, row.LastScanAt, timeProvider.GetUtcNow())
+
+                            let! outcome =
+                                Machine.enqueue shipments.Shipments entity (EventEnvelope.create key event) ct
+
+                            return Enqueued.settlement outcome
+                        }
+
+                do! LeasedLedger.settle dataSource Ledgers.lostShipments options row.ShipmentId settlement ct
         }
 
 /// <summary>Fires due return-window deadlines into the return machine.</summary>

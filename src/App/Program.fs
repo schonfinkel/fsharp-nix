@@ -245,6 +245,9 @@ module Application =
         builder.Services.AddSingleton(InvoiceRenderPolicyConfig.load builder.Configuration)
         |> ignore
 
+        builder.Services.AddSingleton(ShipmentTrackingPolicy.load builder.Configuration)
+        |> ignore
+
         builder.Services.AddSingleton<ICartChangeSource, PostgresCartChangeSource>()
         |> ignore
 
@@ -439,6 +442,7 @@ module Application =
             .AddHostedService<GatewayReconciliationScanner>()
             .AddHostedService<AuthorizationExpiryScanner>()
             .AddHostedService<InvoiceRenderScanner>()
+            .AddHostedService<ShipmentLostScanner>()
             .AddAutomata(worker Probe.MachineKey "probes" Probe.buildWorker)
             .AddAutomata(worker AccountFlow.MachineKey "flows" AccountFlowCodec.buildWorker)
             .AddAutomata(worker Cart.MachineKey "carts" CartCodec.buildWorker)

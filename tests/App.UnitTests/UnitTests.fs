@@ -496,6 +496,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.GatewayReconciliationScanner
         health.Succeeded RuntimeComponent.AuthorizationExpiryScanner
         health.Succeeded RuntimeComponent.InvoiceRenderScanner
+        health.Succeeded RuntimeComponent.ShipmentLostScanner
         let snapshot = health.Snapshot()
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) snapshot)
 
@@ -1364,11 +1365,14 @@ module UnitTests =
         | other -> Assert.Fail $"Expected in-transit, got %A{other}."
 
         match dispatched.Actions with
-        | [ NotifyOrderDispatched(orderId, shipmentId, allocationId, _) ] ->
+        | [ NotifyOrderDispatched(orderId, shipmentId, allocationId, dispatchedAt)
+            RecordTrackingCheckpoint(checkedId, 1L, None, observedAt) ] ->
             Assert.Equal(request.OrderId, orderId)
             Assert.Equal(request.ShipmentId, shipmentId)
             Assert.Equal(request.AllocationId, allocationId)
-        | other -> Assert.Fail $"Expected notify-order-dispatched, got %A{other}."
+            Assert.Equal(request.ShipmentId, checkedId)
+            Assert.Equal(dispatchedAt, observedAt)
+        | other -> Assert.Fail $"Expected dispatch notification and tracking checkpoint, got %A{other}."
 
         let trackingId = TrackingEventId.create "scan-1" |> Result.defaultWith Assert.Fail
 
@@ -1386,8 +1390,51 @@ module UnitTests =
         | other -> Assert.Fail $"Expected delivered, got %A{other}."
 
         match delivered.Actions with
-        | [ NotifyOrderDelivered(orderId, _, _, _) ] -> Assert.Equal(request.OrderId, orderId)
-        | other -> Assert.Fail $"Expected notify-order-delivered, got %A{other}."
+        | [ NotifyOrderDelivered(orderId, _, _, _); StopTrackingCheck stopped ] ->
+            Assert.Equal(request.OrderId, orderId)
+            Assert.Equal(request.ShipmentId, stopped)
+        | other -> Assert.Fail $"Expected delivery notification and stopped tracking, got %A{other}."
+
+        let scanAt =
+            DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+
+        let scanned =
+            expectShipmentResolution
+                dispatched.Next
+                (CarrierTrackingReceived
+                    { EventId = TrackingEventId.create "scan-2" |> Result.defaultWith Assert.Fail
+                      Generation = 1L
+                      OccurredAt = scanAt
+                      Status = CarrierTrackingStatus.InTransit })
+
+        Assert.Equal([ RecordTrackingCheckpoint(request.ShipmentId, 1L, Some scanAt, scanAt) ], scanned.Actions)
+
+        // A lost check computed before the newer scan is stale and absorbed.
+        let stale =
+            expectShipmentResolution scanned.Next (MarkLost(1L, None, DateTimeOffset.UtcNow))
+
+        Assert.Equal(scanned.Next, stale.Next)
+
+        let lost =
+            expectShipmentResolution scanned.Next (MarkLost(1L, Some scanAt, DateTimeOffset.UtcNow))
+
+        match lost.Next with
+        | ShipmentState.Lost _ -> ()
+        | other -> Assert.Fail $"Expected lost, got %A{other}."
+
+        for action in
+            [ RecordTrackingCheckpoint(request.ShipmentId, 2L, Some scanAt, scanAt)
+              RecordTrackingCheckpoint(request.ShipmentId, 1L, None, scanAt)
+              StopTrackingCheck request.ShipmentId ] do
+            let json =
+                ShipmentCodec.action.Encode action
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                action,
+                ShipmentCodec.action.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
 
     let ``order fulfilment requests capture on dispatch and completes on delivery`` () =
         let reserved = reservedOrder ()

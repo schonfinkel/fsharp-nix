@@ -464,7 +464,21 @@ module ShipmentCodec =
                         "ShipmentAction"
                         { empty "request-delivery-retry-v1" with
                             CarrierReference = CarrierReference.value reference
-                            Attempt = attempt })
+                            Attempt = attempt }
+                | RecordTrackingCheckpoint(shipmentId, generation, lastScanAt, observedAt) ->
+                    encode
+                        "ShipmentAction"
+                        { empty "record-tracking-checkpoint-v1" with
+                            ShipmentId = ShipmentId.wireString shipmentId
+                            TrackingGeneration = generation
+                            LastCheckpointAt =
+                                lastScanAt |> Option.map _.ToUnixTimeMilliseconds() |> Option.defaultValue 0L
+                            OccurredAt = observedAt.ToUnixTimeMilliseconds() }
+                | StopTrackingCheck shipmentId ->
+                    encode
+                        "ShipmentAction"
+                        { empty "stop-tracking-check-v1" with
+                            ShipmentId = ShipmentId.wireString shipmentId })
             (fun json ->
                 decode "ShipmentAction" json
                 |> Result.bind (fun dto ->
@@ -500,6 +514,21 @@ module ShipmentCodec =
                     | "request-delivery-retry-v1" ->
                         idValue CarrierReference.tryParse "ShipmentAction" dto.CarrierReference
                         |> Result.map (fun reference -> RequestDeliveryRetry(reference, dto.Attempt))
+                    | "record-tracking-checkpoint-v1" when dto.TrackingGeneration >= 1L ->
+                        idValue ShipmentId.tryParse "ShipmentAction" dto.ShipmentId
+                        |> Result.map (fun shipmentId ->
+                            RecordTrackingCheckpoint(
+                                shipmentId,
+                                dto.TrackingGeneration,
+                                (if dto.LastCheckpointAt = 0L then
+                                     None
+                                 else
+                                     Some(DateTimeOffset.FromUnixTimeMilliseconds dto.LastCheckpointAt)),
+                                DateTimeOffset.FromUnixTimeMilliseconds dto.OccurredAt
+                            ))
+                    | "stop-tracking-check-v1" ->
+                        idValue ShipmentId.tryParse "ShipmentAction" dto.ShipmentId
+                        |> Result.map StopTrackingCheck
                     | tag -> Error(codecError "ShipmentAction" $"Unknown tag '{tag}'.")))
 
     let error: Codec<ShipmentActionError> =
