@@ -111,7 +111,18 @@ let private tests =
           testList
               "shipment operations"
               [ DatabaseTest.isolated false "shipment confirms allocation and labels" (fun fixture ->
-                    ShipmentOperationTests.``shipment confirms allocation and creates a carrier label`` fixture) ] ]
+                    ShipmentOperationTests.``shipment confirms allocation and creates a carrier label`` fixture) ]
+          testList
+              "invoice issuance"
+              [ DatabaseTest.isolated false "gapless numbers and redelivery idempotency" (fun fixture ->
+                    InvoiceIssuanceTests.``issuance allocates gapless numbers and is idempotent under redelivery``
+                        fixture)
+                DatabaseTest.isolated false "failed issuance never consumes a number" (fun fixture ->
+                    InvoiceIssuanceTests.``failed issuance never consumes a number`` fixture)
+                DatabaseTest.isolated false "concurrent issuers share one sequence" (fun fixture ->
+                    InvoiceIssuanceTests.``concurrent issuers share one gapless sequence`` fixture)
+                DatabaseTest.isolated false "invoice rows are insert-only" (fun fixture ->
+                    InvoiceIssuanceTests.``invoice rows are insert-only and numbers must be allocated`` fixture) ] ]
     |> testSequenced
 
 [<EntryPoint>]

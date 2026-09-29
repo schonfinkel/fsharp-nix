@@ -483,6 +483,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.ShipmentMachine
         health.Succeeded RuntimeComponent.RefundMachine
         health.Succeeded RuntimeComponent.ReturnMachine
+        health.Succeeded RuntimeComponent.InvoiceMachine
         Assert.True(health.Snapshot() |> RuntimeHealth.startupReady)
 
         health.Succeeded RuntimeComponent.IntegrationOutboxRelay
@@ -772,7 +773,7 @@ module UnitTests =
             resolution.Next
         )
 
-        Assert.Empty(resolution.Actions)
+        Assert.Equal([ RequestInvoice reserved.Pending.SnapshotId ], resolution.Actions)
 
     let ``cancellation waits for both reservations and payment to settle`` () =
         let reserved = reservedOrder ()
@@ -1720,6 +1721,165 @@ module UnitTests =
         | Captured payment -> Assert.True(payment.Refunds.Head.Status = "settled")
         | other -> Assert.Fail $"Expected captured, got %A{other}."
 
+    let ``reservation failures keep distinct reason codes`` () =
+        let codes =
+            [ ReservationFailure.InsufficientStock
+              ReservationFailure.ProductInactive
+              ReservationFailure.PriceVersionMismatch
+              ReservationFailure.InvalidReservation ]
+            |> List.map (ReservationFailure.code >> ReasonCode.value)
+
+        Assert.Equal<string list>(
+            [ "insufficient-stock"
+              "product-inactive"
+              "price-version-mismatch"
+              "invalid-reservation" ],
+            codes
+        )
+
+    let private invoiceRequest () =
+        OrderSnapshotId.create (Guid.NewGuid())
+        |> Result.defaultWith Assert.Fail
+        |> InvoiceRequest.forOrder
+
+    let private invoiceNumber sequence =
+        InvoiceNumber.create "FSNIX" "INV" "2026" sequence
+        |> Result.defaultWith Assert.Fail
+
+    let private expectInvoiceResolution state event =
+        match Chart.resolve App.Invoices.Invoices.chartValue state event with
+        | Ok resolution -> resolution
+        | Error error -> Assert.Fail $"Expected the invoice event to resolve, got %A{error}."
+
+    let ``invoice numbers validate scope and format for display`` () =
+        Assert.Equal("INV-2026-000042", InvoiceNumber.display (invoiceNumber 42L))
+        Assert.True(Result.isError (InvoiceNumber.create "fsnix" "INV" "2026" 1L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "-INV" "2026" 1L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" "2026" 0L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" (String('A', 17)) "2026" 1L))
+
+        let request = invoiceRequest ()
+        Assert.True(Result.isOk (InvoiceRequest.validate request))
+
+        Assert.True(
+            Result.isError (
+                InvoiceRequest.validate
+                    { request with
+                        OrderId = "order:" + Guid.NewGuid().ToString("D") }
+            )
+        )
+
+    let ``invoice chart issues once and parks failures for operator retry`` () =
+        let request = invoiceRequest ()
+        let number = invoiceNumber 7L
+
+        let requested =
+            expectInvoiceResolution App.Invoices.Invoices.initialState (App.Invoices.InvoiceRequested request)
+
+        Assert.Equal(App.Invoices.SnapshotPending request, requested.Next)
+        Assert.Equal([ App.Invoices.IssueSnapshot request ], requested.Actions)
+
+        let duplicate =
+            expectInvoiceResolution requested.Next (App.Invoices.InvoiceRequested request)
+
+        Assert.Equal(requested.Next, duplicate.Next)
+        Assert.Empty(duplicate.Actions)
+
+        let other = invoiceRequest ()
+
+        let stale =
+            expectInvoiceResolution requested.Next (App.Invoices.SnapshotIssued(other.InvoiceId, number))
+
+        Assert.Equal(requested.Next, stale.Next)
+
+        let issued =
+            expectInvoiceResolution requested.Next (App.Invoices.SnapshotIssued(request.InvoiceId, number))
+
+        Assert.Equal(App.Invoices.Issued { Request = request; Number = number }, issued.Next)
+
+        Assert.Empty(issued.Actions)
+
+        let late =
+            expectInvoiceResolution issued.Next (App.Invoices.SnapshotIssued(request.InvoiceId, invoiceNumber 8L))
+
+        Assert.Equal(issued.Next, late.Next)
+
+        let reason = ReasonCode.ofLiteral "snapshot-missing"
+
+        let failed =
+            expectInvoiceResolution requested.Next (App.Invoices.IssuanceFailed(request.InvoiceId, reason))
+
+        Assert.Equal(App.Invoices.ManualReview(request, reason), failed.Next)
+
+        let retried =
+            expectInvoiceResolution failed.Next App.Invoices.IssuanceRetryRequested
+
+        Assert.Equal(App.Invoices.SnapshotPending request, retried.Next)
+        Assert.Equal([ App.Invoices.IssueSnapshot request ], retried.Actions)
+
+        match
+            Chart.resolve
+                App.Invoices.Invoices.chartValue
+                App.Invoices.Invoices.initialState
+                App.Invoices.CloseRequested
+        with
+        | Ok _ -> Assert.Fail "Closing an unissued invoice must be rejected."
+        | Error _ -> ()
+
+    let ``invoice codecs round trip every case and reject unknown tags`` () =
+        let request = invoiceRequest ()
+        let number = invoiceNumber 3L
+        let reason = ReasonCode.ofLiteral "snapshot-missing"
+
+        let issued: App.Invoices.IssuedInvoice = { Request = request; Number = number }
+
+        let roundTrip (codec: Codec<'T>) (value: 'T) =
+            let json = codec.Encode value |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            Assert.DoesNotContain("@", json)
+            Assert.Equal(value, codec.Decode json |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}"))
+
+        [ App.Invoices.Initial
+          App.Invoices.SnapshotPending request
+          App.Invoices.Issued issued
+          App.Invoices.ManualReview(request, reason)
+          App.Invoices.Closed issued ]
+        |> List.iter (roundTrip InvoiceCodec.state)
+
+        [ App.Invoices.InvoiceRequested request
+          App.Invoices.SnapshotIssued(request.InvoiceId, number)
+          App.Invoices.IssuanceFailed(request.InvoiceId, reason)
+          App.Invoices.IssuanceRetryRequested
+          App.Invoices.CloseRequested ]
+        |> List.iter (roundTrip InvoiceCodec.event)
+
+        roundTrip InvoiceCodec.action (App.Invoices.IssueSnapshot request)
+
+        [ App.Invoices.InvoiceActionError.CallbackEncodingFailed
+          App.Invoices.InvoiceActionError.ActionReceiptMismatch
+          App.Invoices.InvoiceActionError.InvalidAction ]
+        |> List.iter (roundTrip InvoiceCodec.actionError)
+
+        roundTrip OrderCodec.action (RequestInvoice request.SnapshotId)
+
+        let encoded =
+            InvoiceCodec.event.Encode(App.Invoices.SnapshotIssued(request.InvoiceId, number))
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+        Assert.Contains("\"tag\":\"snapshot-issued-v1\"", encoded)
+
+        Assert.True(
+            Result.isError (InvoiceCodec.event.Decode(encoded.Replace("snapshot-issued-v1", "snapshot-issued-v9")))
+        )
+
+        Assert.True(Result.isError (InvoiceCodec.event.Decode(encoded.Replace("\"sequence\":3", "\"sequence\":0"))))
+
+        let mismatched =
+            InvoiceCodec.action.Encode(App.Invoices.IssueSnapshot request)
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            |> fun json -> json.Replace(request.OrderId, "order:" + Guid.NewGuid().ToString("D"))
+
+        Assert.True(Result.isError (InvoiceCodec.action.Decode mismatched))
+
     let tests =
         testList
             "unit"
@@ -1829,4 +1989,12 @@ module UnitTests =
                   "payment reserves and settles refund allocations"
                   ``payment reserves and settles a refund allocation``
               testCase "cart codecs contain no secret fields" ``cart codecs cover every case without secret fields``
-              testCase "cart codecs round trip an active cart" ``cart codecs round trip an active cart`` ]
+              testCase "cart codecs round trip an active cart" ``cart codecs round trip an active cart``
+              testCase "reservation failures keep distinct codes" ``reservation failures keep distinct reason codes``
+              testCase "invoice numbers validate and display" ``invoice numbers validate scope and format for display``
+              testCase
+                  "invoice chart issues once and parks failures"
+                  ``invoice chart issues once and parks failures for operator retry``
+              testCase
+                  "invoice codecs round trip and reject unknown tags"
+                  ``invoice codecs round trip every case and reject unknown tags`` ]

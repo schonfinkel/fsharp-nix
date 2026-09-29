@@ -11,6 +11,7 @@ open App.Domain
 open App.Orders
 open App.Payments
 open App.Refunds
+open App.Invoices
 open App.Returns
 open App.Shipments
 open ByzantineSystems.Automata.Core
@@ -235,6 +236,9 @@ module Application =
         builder.Services.AddSingleton(CheckoutPricing.load builder.Configuration)
         |> ignore
 
+        builder.Services.AddSingleton(InvoiceIssuerConfig.load builder.Configuration)
+        |> ignore
+
         builder.Services.AddSingleton<ICartChangeSource, PostgresCartChangeSource>()
         |> ignore
 
@@ -351,6 +355,7 @@ module Application =
             .AddScoped<IActionHandler<ShipmentEntityId, ShipmentAction, ShipmentActionError>, ShipmentEffectHandler>()
             .AddScoped<IActionHandler<RefundEntityId, RefundAction, RefundActionError>, RefundEffectHandler>()
             .AddScoped<IActionHandler<ReturnEntityId, ReturnAction, ReturnActionError>, ReturnEffectHandler>()
+            .AddScoped<IActionHandler<InvoiceEntityId, InvoiceAction, InvoiceActionError>, InvoiceEffectHandler>()
             .AddSingleton<SimulatedPaymentGateway>()
             .AddSingleton<IPaymentGateway>(fun provider ->
                 provider.GetRequiredService<SimulatedPaymentGateway>() :> IPaymentGateway)
@@ -372,6 +377,8 @@ module Application =
             .AddHostedService(fun provider -> provider.GetRequiredService<RefundMachineClient>())
             .AddSingleton<ReturnMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<ReturnMachineClient>())
+            .AddSingleton<InvoiceMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<InvoiceMachineClient>())
             .AddHostedService<ReservationExpiryScanner>()
             .AddSingleton<OutboxDestination list>(fun provider ->
                 let probeClient = provider.GetRequiredService<ProbeMachineClient>()
@@ -382,6 +389,7 @@ module Application =
                 let shipmentsClient = provider.GetRequiredService<ShipmentMachineClient>()
                 let refundsClient = provider.GetRequiredService<RefundMachineClient>()
                 let returnsClient = provider.GetRequiredService<ReturnMachineClient>()
+                let invoicesClient = provider.GetRequiredService<InvoiceMachineClient>()
 
                 [ OutboxDestination.forMachineProvider
                       Probe.MachineKey
@@ -410,7 +418,12 @@ module Application =
                   OutboxDestination.forMachineProvider Refunds.MachineKey EntityId.create RefundCodec.event (fun () ->
                       refundsClient.Refunds)
                   OutboxDestination.forMachineProvider Returns.MachineKey EntityId.create ReturnCodec.event (fun () ->
-                      returnsClient.Returns) ])
+                      returnsClient.Returns)
+                  OutboxDestination.forMachineProvider
+                      Invoices.MachineKey
+                      EntityId.create
+                      InvoiceCodec.event
+                      (fun () -> invoicesClient.Invoices) ])
             .AddHostedService<IntegrationOutboxRelay>()
             .AddHostedService<EmailDeliveryRelay>()
             .AddHostedService<FlowDeadlineScanner>()
@@ -425,6 +438,7 @@ module Application =
             .AddAutomata(worker Shipments.MachineKey "shipments" ShipmentCodec.buildWorker)
             .AddAutomata(worker Refunds.MachineKey "refunds" RefundCodec.buildWorker)
             .AddAutomata(worker Returns.MachineKey "returns" ReturnCodec.buildWorker)
+            .AddAutomata(worker Invoices.MachineKey "invoices" InvoiceCodec.buildWorker)
             .AddAutomataMaintenance(
                 { MaintenanceOptions.defaults (fun provider ->
                       PostgresMaintenance(provider.GetRequiredService<PostgresContext>())) with

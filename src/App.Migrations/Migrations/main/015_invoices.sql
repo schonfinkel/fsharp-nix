@@ -1,0 +1,121 @@
+-- Gapless scoped invoice numbering and the immutable invoice snapshot (P7).
+CREATE TABLE fsnix.invoice_counters (
+    legal_entity text NOT NULL,
+    series text NOT NULL,
+    fiscal_period text NOT NULL,
+    last_number bigint NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    PRIMARY KEY (legal_entity, series, fiscal_period),
+    CONSTRAINT ck_invoice_counters_last_number CHECK (last_number >= 0),
+    CONSTRAINT ck_invoice_counters_scope CHECK (legal_entity ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$' AND series ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$' AND fiscal_period ~ '^[A-Z0-9]([A-Z0-9-]{0,14}[A-Z0-9])?$')
+);
+
+COMMENT ON TABLE fsnix.invoice_counters IS 'One row per numbering scope. A number is allocated only by incrementing this row inside the issuance transaction, so a rolled-back issuance never consumes a number. Never use MAX(number)+1 or a sequence.';
+
+CREATE TABLE fsnix.invoices (
+    invoice_id uuid PRIMARY KEY,
+    order_id text NOT NULL,
+    snapshot_id uuid NOT NULL REFERENCES fsnix.order_snapshots (snapshot_id),
+    legal_entity text NOT NULL,
+    series text NOT NULL,
+    fiscal_period text NOT NULL,
+    number bigint NOT NULL,
+    issued_at timestamptz NOT NULL,
+    seller jsonb NOT NULL,
+    buyer jsonb NOT NULL,
+    billing_address jsonb NOT NULL,
+    subtotal_amount numeric(20, 8) NOT NULL,
+    shipping_amount numeric(20, 8) NOT NULL,
+    tax_amount numeric(20, 8) NOT NULL,
+    total_amount numeric(20, 8) NOT NULL,
+    currency text NOT NULL,
+    source_machine_id text NOT NULL,
+    source_command_id bigint NOT NULL,
+    source_ordinal integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    CONSTRAINT uq_invoices_order UNIQUE (order_id),
+    CONSTRAINT uq_invoices_number UNIQUE (legal_entity, series, fiscal_period, number),
+    CONSTRAINT fk_invoices_counter FOREIGN KEY (legal_entity, series, fiscal_period) REFERENCES fsnix.invoice_counters (legal_entity, series, fiscal_period),
+    CONSTRAINT ck_invoices_number CHECK (number > 0),
+    CONSTRAINT ck_invoices_amounts CHECK (subtotal_amount >= 0 AND shipping_amount >= 0 AND tax_amount >= 0 AND total_amount = subtotal_amount + shipping_amount + tax_amount),
+    CONSTRAINT ck_invoices_currency CHECK (currency ~ '^[A-Z]{3}$')
+);
+
+COMMENT ON TABLE fsnix.invoices IS 'Insert-only legal invoice header. Seller, buyer and billing address are snapshotted at issuance; corrections are separate adjustment documents, never edits.';
+
+CREATE TABLE fsnix.invoice_lines (
+    invoice_id uuid NOT NULL REFERENCES fsnix.invoices (invoice_id),
+    line_number integer NOT NULL,
+    order_line_id uuid NOT NULL,
+    product_id uuid NOT NULL,
+    sku text NOT NULL,
+    description text NOT NULL,
+    unit_price numeric(20, 8) NOT NULL,
+    quantity integer NOT NULL,
+    line_amount numeric(20, 8) NOT NULL,
+    currency text NOT NULL,
+    PRIMARY KEY (invoice_id, line_number),
+    CONSTRAINT uq_invoice_lines_order_line UNIQUE (invoice_id, order_line_id),
+    CONSTRAINT ck_invoice_lines_line_number CHECK (line_number > 0),
+    CONSTRAINT ck_invoice_lines_amounts CHECK (unit_price >= 0 AND quantity > 0 AND line_amount = unit_price * quantity),
+    CONSTRAINT ck_invoice_lines_currency CHECK (currency ~ '^[A-Z]{3}$')
+);
+
+-- An invoice may only take the number its scope counter currently holds. Issuance increments
+-- the counter and inserts in one transaction, so this rejects any number not allocated there
+-- (a hand-picked, reused or MAX+1 number).
+CREATE FUNCTION fsnix.check_invoice_number_allocated ()
+    RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT
+            1
+        FROM
+            fsnix.invoice_counters
+        WHERE
+            legal_entity = NEW.legal_entity
+            AND series = NEW.series
+            AND fiscal_period = NEW.fiscal_period
+            AND last_number = NEW.number) THEN
+    RAISE EXCEPTION 'invoice number % was not allocated by its scope counter', NEW.number;
+END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER tr_invoices_number_allocated
+    BEFORE INSERT ON fsnix.invoices
+    FOR EACH ROW
+    EXECUTE FUNCTION fsnix.check_invoice_number_allocated ();
+
+CREATE FUNCTION fsnix.reject_invoice_mutation ()
+    RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RAISE EXCEPTION '% is insert-only', TG_TABLE_NAME;
+END;
+$$;
+
+CREATE TRIGGER tr_invoices_immutable
+    BEFORE UPDATE OR DELETE ON fsnix.invoices
+    FOR EACH ROW
+    EXECUTE FUNCTION fsnix.reject_invoice_mutation ();
+
+CREATE TRIGGER tr_invoices_no_truncate
+    BEFORE TRUNCATE ON fsnix.invoices
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION fsnix.reject_invoice_mutation ();
+
+CREATE TRIGGER tr_invoice_lines_immutable
+    BEFORE UPDATE OR DELETE ON fsnix.invoice_lines
+    FOR EACH ROW
+    EXECUTE FUNCTION fsnix.reject_invoice_mutation ();
+
+CREATE TRIGGER tr_invoice_lines_no_truncate
+    BEFORE TRUNCATE ON fsnix.invoice_lines
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION fsnix.reject_invoice_mutation ();
+

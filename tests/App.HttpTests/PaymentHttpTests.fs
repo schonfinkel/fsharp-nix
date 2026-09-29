@@ -11,6 +11,7 @@ open App
 open App.Cart
 open App.Database
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open ByzantineSystems.Automata.Core
@@ -118,6 +119,32 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
                 |> Option.defaultWith (fun () -> Assert.Fail $"Payment {paymentId:D} did not reach the expected state.")
         }
 
+    let waitForInvoice (factory: AppFactory) orderId =
+        task {
+            let invoices = factory.Services.GetRequiredService<InvoiceMachineClient>()
+
+            let entity =
+                OrderSnapshotId.create orderId
+                |> Result.defaultWith Assert.Fail
+                |> InvoiceId.ofSnapshot
+                |> Invoices.invoiceEntityId
+
+            let deadline = DateTimeOffset.UtcNow.AddSeconds 20.
+            let mutable found = None
+
+            while DateTimeOffset.UtcNow < deadline && found.IsNone do
+                match! Machine.state invoices.Invoices entity CancellationToken.None with
+                | Ok(Some snapshot) ->
+                    match snapshot.State with
+                    | Issued issued -> found <- Some issued
+                    | _ -> do! Task.Delay 100
+                | _ -> do! Task.Delay 100
+
+            return
+                found
+                |> Option.defaultWith (fun () -> Assert.Fail $"Order {orderId:D} was not invoiced.")
+        }
+
     let authorize (client: HttpClient) orderId method =
         task {
             let! html = client.GetStringAsync $"/orders/{orderId:D}"
@@ -198,6 +225,17 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
             let! html = client.GetStringAsync $"/orders/{orderId:D}"
             Assert.Contains("Order placed", html)
             Assert.Contains("can no longer be cancelled", html)
+
+            let! invoice = waitForInvoice factory orderId
+            Assert.Equal($"order:{orderId:D}", invoice.Request.OrderId)
+            Assert.Equal(1L, invoice.Number.Sequence)
+
+            let! invoicedTotal =
+                scalar
+                    string
+                    $"SELECT i.total_amount = s.total_amount AND i.number = 1 FROM fsnix.invoices i JOIN fsnix.order_snapshots s USING (snapshot_id) WHERE i.order_id='order:{orderId:D}'"
+
+            Assert.Equal("True", invoicedTotal)
 
             let! onHand =
                 scalar Convert.ToInt32 $"SELECT on_hand FROM fsnix.product_stock WHERE product_id='{productId:D}'"

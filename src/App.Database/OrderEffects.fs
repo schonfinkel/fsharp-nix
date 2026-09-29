@@ -7,6 +7,7 @@ open System.Threading
 open System.Threading.Tasks
 open App.Cart
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open App.Refunds
@@ -30,6 +31,7 @@ module OrderEffects =
         | RequestCapture _ -> "request-capture"
         | StartReturn _ -> "start-return"
         | StartRefund _ -> "start-refund"
+        | RequestInvoice _ -> "request-invoice"
 
     let private key (record: ActionRecord<OrderId, OrderAction>) purpose =
         $"xmsg:v1:{MachineId.value record.MachineId}:{CommandId.value record.CommandId}:{record.Ordinal}:{purpose}"
@@ -796,3 +798,46 @@ module OrderEffects =
                     do! tx.RollbackAsync ct
                     return Error OrderActionError.InvalidAction
         }
+
+    let private orderError (result: Task<Result<'T, ReceiptFailure>>) =
+        task {
+            let! value = result
+
+            return
+                value
+                |> Result.mapError (function
+                    | ReceiptFailure.EncodingFailed -> OrderActionError.CallbackEncodingFailed
+                    | ReceiptFailure.Mismatch -> OrderActionError.ActionReceiptMismatch)
+        }
+
+    /// <summary>Hands the placed order to the invoice machine. The invoice entity and request
+    /// derive from the order's own snapshot, so a redelivered or repeated request lands on the
+    /// same invoice.</summary>
+    let applyRequestInvoice
+        (dataSource: NpgsqlDataSource)
+        (record: ActionRecord<OrderId, OrderAction>)
+        (ct: CancellationToken)
+        : Task<Result<unit, OrderActionError>> =
+        match record.Action with
+        | RequestInvoice snapshotId when (InvoiceRequest.forOrder snapshotId).OrderId = EntityId.value record.EntityId ->
+            let request = InvoiceRequest.forOrder snapshotId
+
+            WorkflowEffects.runLocalEffect
+                dataSource
+                (fun connection tx token ->
+                    WorkflowEffects.receiptFor OrderCodec.action actionKind connection tx record token
+                    |> orderError)
+                (fun connection tx token ->
+                    WorkflowEffects.deliver
+                        connection
+                        tx
+                        record
+                        "invoice-request"
+                        Invoices.MachineKey
+                        (EntityId.value (Invoices.invoiceEntityId request.InvoiceId))
+                        InvoiceCodec.event
+                        (InvoiceRequested request)
+                        token
+                    |> orderError)
+                ct
+        | _ -> Task.FromResult(Error OrderActionError.InvalidAction)

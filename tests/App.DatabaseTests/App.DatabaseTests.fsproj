@@ -19,6 +19,7 @@
     <Compile Include="OrderReservationTests.fs" />
     <Compile Include="PaymentOperationTests.fs" />
     <Compile Include="ShipmentOperationTests.fs" />
+    <Compile Include="InvoiceIssuanceTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -31,6 +32,7 @@
     <ProjectReference Include="..\..\src\App\App.fsproj" />
     <ProjectReference Include="..\..\src\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\..\src\App.Domain\App.Domain.fsproj" />
+    <ProjectReference Include="..\..\src\App.Invoices\App.Invoices.fsproj" />
     <ProjectReference Include="..\..\src\App.Migrations\App.Migrations.fsproj" />
     <ProjectReference Include="..\App.Testing\App.Testing.fsproj" />
   </ItemGroup>

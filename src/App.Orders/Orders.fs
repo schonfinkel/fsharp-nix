@@ -113,10 +113,10 @@ type ReservationFailure =
 module ReservationFailure =
     let code =
         function
-        | InsufficientStock -> ReasonCode.ofLiteral "insufficient-stock"
-        | ProductInactive -> ReasonCode.ofLiteral "product-inactive"
-        | PriceVersionMismatch -> ReasonCode.ofLiteral "price-version-mismatch"
-        | InvalidReservation -> ReasonCode.ofLiteral "invalid-reservation"
+        | ReservationFailure.InsufficientStock -> ReasonCode.ofLiteral "insufficient-stock"
+        | ReservationFailure.ProductInactive -> ReasonCode.ofLiteral "product-inactive"
+        | ReservationFailure.PriceVersionMismatch -> ReasonCode.ofLiteral "price-version-mismatch"
+        | ReservationFailure.InvalidReservation -> ReasonCode.ofLiteral "invalid-reservation"
 
 type OrderEvent =
     | OrderSubmitted of ReservationPendingOrder
@@ -163,6 +163,9 @@ type OrderAction =
         providerReference: string
     | StartReturn of ReturnRequest
     | StartRefund of RefundRequest
+    /// <summary>Asks the invoice machine to issue this order's invoice from its immutable
+    /// snapshot. Emitted once, on placement.</summary>
+    | RequestInvoice of OrderSnapshotId
 
 [<RequireQualifiedAccess>]
 type OrderActionError =
@@ -844,7 +847,7 @@ module Orders =
                 on stockCommitSettled (fun state event ->
                     match state, event with
                     | StockCommitPending pending, StockCommitted ->
-                        [],
+                        [ RequestInvoice pending.Reserved.Pending.SnapshotId ],
                         Placed
                             { Reserved = pending.Reserved
                               ProviderReference = pending.ProviderReference }

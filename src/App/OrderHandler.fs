@@ -29,3 +29,4 @@ type OrderEffectHandler(dataSource: NpgsqlDataSource, timeProvider: TimeProvider
             | RequestCapture _ -> OrderEffects.applyRequestCapture dataSource record ct
             | StartReturn _ -> OrderEffects.applyStartReturn dataSource record ct
             | StartRefund _ -> OrderEffects.applyStartRefund dataSource record ct
+            | RequestInvoice _ -> OrderEffects.applyRequestInvoice dataSource record ct

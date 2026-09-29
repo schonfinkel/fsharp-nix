@@ -929,7 +929,12 @@ module OrderCodec =
                     encode
                         "OrderAction"
                         { empty "start-refund-v1" with
-                            Refund = PaymentCodec.refundDto request })
+                            Refund = PaymentCodec.refundDto request }
+                | RequestInvoice snapshotId ->
+                    encode
+                        "OrderAction"
+                        { empty "request-invoice-v1" with
+                            SnapshotId = OrderSnapshotId.wireString snapshotId })
             (fun json ->
                 decode "OrderAction" json
                 |> Result.bind (fun dto ->
@@ -1002,6 +1007,13 @@ module OrderCodec =
                         returnOfDto "OrderAction" dto.Returns[0]
                         |> Result.map (fun entry -> StartReturn entry.Request)
                     | "start-refund-v1" -> PaymentCodec.refundOfDto "OrderAction" dto.Refund |> Result.map StartRefund
+                    | "request-invoice-v1" ->
+                        guid "OrderAction" dto.SnapshotId
+                        |> Result.bind (
+                            OrderSnapshotId.create
+                            >> Result.mapError (fun message -> codecError "OrderAction" message)
+                        )
+                        |> Result.map RequestInvoice
                     | tag -> Error(codecError "OrderAction" $"Unknown tag '{tag}'.")))
 
     let error: Codec<OrderActionError> =

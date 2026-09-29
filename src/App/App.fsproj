@@ -24,6 +24,7 @@
     <ProjectReference Include="..\App.Refunds\App.Refunds.fsproj" />
     <ProjectReference Include="..\App.Returns\App.Returns.fsproj" />
     <ProjectReference Include="..\App.Shipments\App.Shipments.fsproj" />
+    <ProjectReference Include="..\App.Invoices\App.Invoices.fsproj" />
     <ProjectReference Include="..\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\App.Migrations\App.Migrations.fsproj" />
     <ProjectReference Include="..\App.Views\App.Views.fsproj" />
@@ -57,6 +58,7 @@
     <Compile Include="ShipmentHandler.fs" />
     <Compile Include="RefundHandler.fs" />
     <Compile Include="ReturnHandler.fs" />
+    <Compile Include="InvoiceHandler.fs" />
     <Compile Include="OrderEndpoints.fs" />
     <Compile Include="ReturnEndpoints.fs" />
     <Compile Include="CatalogEndpoints.fs" />

@@ -104,6 +104,7 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                       "App.Migrations.Migrations.main.012_payments.sql"
                       "App.Migrations.Migrations.main.013_shipments.sql"
                       "App.Migrations.Migrations.main.014_refunds_returns.sql"
+                      "App.Migrations.Migrations.main.015_invoices.sql"
                       "App.Migrations.Migrations.test.001_development_marker.sql"
                       "App.Migrations.Migrations.test.002_development_catalog_seed.sql" ],
                     journal
@@ -169,7 +170,8 @@ type PostgresTests(fixture: PostgreSqlFixture) =
                   "App.Migrations.Migrations.main.011_orders.sql"
                   "App.Migrations.Migrations.main.012_payments.sql"
                   "App.Migrations.Migrations.main.013_shipments.sql"
-                  "App.Migrations.Migrations.main.014_refunds_returns.sql" ],
+                  "App.Migrations.Migrations.main.014_refunds_returns.sql"
+                  "App.Migrations.Migrations.main.015_invoices.sql" ],
                 journal
             )
 

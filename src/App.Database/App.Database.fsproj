@@ -21,6 +21,7 @@
     <ProjectReference Include="..\App.Refunds\App.Refunds.fsproj" />
     <ProjectReference Include="..\App.Returns\App.Returns.fsproj" />
     <ProjectReference Include="..\App.Shipments\App.Shipments.fsproj" />
+    <ProjectReference Include="..\App.Invoices\App.Invoices.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="SchemaTypeMappings.fs" />
@@ -52,6 +53,7 @@
     <Compile Include="RefundCodec.fs" />
     <Compile Include="OrderCodec.fs" />
     <Compile Include="ReturnCodec.fs" />
+    <Compile Include="InvoiceCodec.fs" />
     <Compile Include="WorkflowEffects.fs" />
     <Compile Include="OrderSnapshots.fs" />
     <Compile Include="StockReservations.fs" />
@@ -63,6 +65,7 @@
     <Compile Include="RefundEffects.fs" />
     <Compile Include="ReturnEffects.fs" />
     <Compile Include="ShipmentEffects.fs" />
+    <Compile Include="InvoiceEffects.fs" />
     <Compile Include="Services.fs" />
   </ItemGroup>
 </Project>

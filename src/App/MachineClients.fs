@@ -7,6 +7,7 @@ open App.Auth
 open App.Cart
 open App.Database
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open App.Shipments
@@ -187,3 +188,16 @@ type ReturnMachineClient(context, loggerFactory, health) =
         )
 
     member this.Returns = this.Machine
+
+type InvoiceMachineClient(context, loggerFactory, health) =
+    inherit
+        MachineClient<InvoiceEntityId, InvoiceState, InvoiceEvent, InvoiceAction, InvoiceActionError>(
+            RuntimeComponent.InvoiceMachine,
+            "invoice",
+            InvoiceCodec.buildClient,
+            context,
+            loggerFactory,
+            health
+        )
+
+    member this.Invoices = this.Machine

@@ -15,6 +15,7 @@ type RuntimeComponent =
     | ShipmentMachine
     | RefundMachine
     | ReturnMachine
+    | InvoiceMachine
     | ReturnWindowScanner
     | IntegrationOutboxRelay
     | EmailDeliveryRelay
@@ -36,6 +37,7 @@ module RuntimeComponent =
         | RuntimeComponent.ShipmentMachine -> "shipment-machine"
         | RuntimeComponent.RefundMachine -> "refund-machine"
         | RuntimeComponent.ReturnMachine -> "return-machine"
+        | RuntimeComponent.InvoiceMachine -> "invoice-machine"
         | RuntimeComponent.ReturnWindowScanner -> "return-window-scanner"
         | RuntimeComponent.IntegrationOutboxRelay -> "integration-outbox-relay"
         | RuntimeComponent.EmailDeliveryRelay -> "email-delivery-relay"
@@ -69,7 +71,8 @@ module RuntimeComponent =
         | RuntimeComponent.PaymentMachine
         | RuntimeComponent.ShipmentMachine
         | RuntimeComponent.RefundMachine
-        | RuntimeComponent.ReturnMachine -> Kind.Startup
+        | RuntimeComponent.ReturnMachine
+        | RuntimeComponent.InvoiceMachine -> Kind.Startup
         | RuntimeComponent.ReturnWindowScanner
         | RuntimeComponent.IntegrationOutboxRelay
         | RuntimeComponent.EmailDeliveryRelay
