@@ -153,9 +153,6 @@ module AccountFlowEffects =
 
     let private actionKind (action: FlowAction) = string action
 
-    let private payloadHash (action: FlowAction) : byte[] =
-        SHA256.HashData(Encoding.UTF8.GetBytes(actionKind action))
-
     let private callbackKey (record: ActionRecord<FlowId, FlowAction>) : string =
         $"xmsg:v1:%s{MachineId.value record.MachineId}:%d{CommandId.value record.CommandId}:%d{record.Ordinal}:flow-effect"
 
@@ -182,34 +179,19 @@ module AccountFlowEffects =
                 do! connection.OpenAsync(ct)
                 use! transaction = connection.BeginTransactionAsync(ct)
 
-                use insert =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.action_receipts (machine_id, command_id, ordinal, action_kind, payload_hash)
-                           VALUES (@machine_id, @command_id, @ordinal, @action_kind, @payload_hash)
-                           ON CONFLICT (machine_id, command_id, ordinal) DO NOTHING
-                           RETURNING command_id""",
-                        connection,
-                        transaction
-                    )
+                // The receipt payload is the action kind (a generation-free digest), unchanged
+                // from the original account-flow protocol.
+                let kind = actionKind record.Action
 
-                insert.Parameters.AddWithValue("machine_id", MachineId.value record.MachineId)
-                |> ignore
-
-                insert.Parameters.AddWithValue("command_id", CommandId.value record.CommandId)
-                |> ignore
-
-                insert.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-
-                insert.Parameters.AddWithValue("action_kind", actionKind record.Action)
-                |> ignore
-
-                insert.Parameters.AddWithValue("payload_hash", payloadHash record.Action)
-                |> ignore
-
-                let! inserted = insert.ExecuteScalarAsync(ct)
-                let isFirstDelivery = inserted |> Option.ofObj |> Option.isSome
-
-                if isFirstDelivery then
+                match! WorkflowEffects.receipt connection transaction record kind kind ct with
+                | Error ReceiptFailure.EncodingFailed -> return Error FlowActionError.CallbackEncodingFailed
+                | Error ReceiptFailure.Mismatch ->
+                    do! transaction.CommitAsync(ct)
+                    return Error FlowActionError.ActionReceiptMismatch
+                | Ok ReceiptStatus.Duplicate ->
+                    do! transaction.CommitAsync(ct)
+                    return Ok()
+                | Ok ReceiptStatus.FirstRun ->
                     use advance =
                         new NpgsqlCommand(
                             """UPDATE fsnix.account_flow_requests
@@ -279,69 +261,16 @@ module AccountFlowEffects =
                     deadline.Parameters.AddWithValue("gate", callback) |> ignore
                     let! _ = deadline.ExecuteNonQueryAsync(ct)
 
-                    use outbox =
-                        new NpgsqlCommand(
-                            """INSERT INTO fsnix.integration_outbox (callback_key, machine_id, entity_id, event)
-                               VALUES (@callback_key, @machine_id, @entity_id, @event::jsonb)
-                               ON CONFLICT (callback_key) DO NOTHING""",
-                            connection,
+                    do!
+                        WorkflowEffects.callback
+                            connection
                             transaction
-                        )
-
-                    outbox.Parameters.AddWithValue("callback_key", callback) |> ignore
-                    outbox.Parameters.AddWithValue("machine_id", AccountFlow.MachineKey) |> ignore
-
-                    outbox.Parameters.AddWithValue("entity_id", EntityId.value record.EntityId)
-                    |> ignore
-
-                    outbox.Parameters.AddWithValue("event", eventJson) |> ignore
-                    let! _ = outbox.ExecuteNonQueryAsync(ct)
+                            callback
+                            AccountFlow.MachineKey
+                            (EntityId.value record.EntityId)
+                            eventJson
+                            ct
 
                     do! transaction.CommitAsync(ct)
                     return Ok()
-                else
-                    use verify =
-                        new NpgsqlCommand(
-                            """SELECT action_kind, payload_hash
-                               FROM fsnix.action_receipts
-                               WHERE machine_id = @machine_id
-                                 AND command_id = @command_id
-                                 AND ordinal = @ordinal""",
-                            connection,
-                            transaction
-                        )
-
-                    verify.Parameters.AddWithValue("machine_id", MachineId.value record.MachineId)
-                    |> ignore
-
-                    verify.Parameters.AddWithValue("command_id", CommandId.value record.CommandId)
-                    |> ignore
-
-                    verify.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-
-                    let! reader = verify.ExecuteReaderAsync(ct)
-                    let! couldRead = reader.ReadAsync(ct)
-
-                    let existing =
-                        if couldRead then
-                            let kind = reader.GetString 0
-                            let hash = Convert.ToHexString(reader.GetValue(1) :?> byte[])
-                            Some(kind, hash)
-                        else
-                            None
-
-                    reader.Dispose()
-                    let expected = Convert.ToHexString(payloadHash record.Action)
-
-                    let verified =
-                        existing
-                        |> Option.map (fun (kind, hash) -> kind = actionKind record.Action && hash = expected)
-                        |> Option.defaultValue false
-
-                    do! transaction.CommitAsync(ct)
-
-                    if verified then
-                        return Ok()
-                    else
-                        return Error FlowActionError.ActionReceiptMismatch
         }

@@ -1,6 +1,7 @@
 namespace App.Database
 
 open System
+open System.Collections.Concurrent
 open System.IO
 
 /// <summary>
@@ -22,25 +23,19 @@ module Sql =
         |> Array.map (fun name -> name["Sql/".Length .. name.Length - ".sql".Length - 1])
         |> Array.sort
 
-    /// <summary>Loads <c>Sql/{name}.sql</c>; a missing file fails at module initialisation, not
-    /// in the middle of a request.</summary>
+    let private loaded = ConcurrentDictionary<string, unit>()
+
+    /// <summary>Loads <c>Sql/{name}.sql</c>. Callers bind each query once, as a top-level value
+    /// of an <c>&lt;Area&gt;Sql</c> module, so the file is read once per process and a missing
+    /// file fails at module initialisation rather than in the middle of a request.</summary>
     let load (name: string) =
         match assembly.GetManifestResourceStream $"Sql/{name}.sql" with
         | null -> invalidOp $"Embedded SQL 'Sql/{name}.sql' does not exist."
         | stream ->
             use reader = new StreamReader(stream)
+            loaded[name] <- ()
             reader.ReadToEnd()
 
-[<RequireQualifiedAccess>]
-module InvoiceSql =
-    let allocateNumber = Sql.load "Invoices/allocate-number"
-    let documentHeader = Sql.load "Invoices/document-header"
-    let documentLines = Sql.load "Invoices/document-lines"
-    let existingNumber = Sql.load "Invoices/existing-number"
-    let exists = Sql.load "Invoices/exists"
-    let forOrder = Sql.load "Invoices/for-order"
-    let insertDocument = Sql.load "Invoices/insert-document"
-    let insertSnapshot = Sql.load "Invoices/insert-snapshot"
-    let latestDocument = Sql.load "Invoices/latest-document"
-    let list = Sql.load "Invoices/list"
-    let snapshotCheck = Sql.load "Invoices/snapshot-check"
+    /// <summary>Embedded files no loaded <c>&lt;Area&gt;Sql</c> module binds: dead SQL.</summary>
+    let unloaded () =
+        names |> Array.filter (loaded.ContainsKey >> not) |> List.ofArray

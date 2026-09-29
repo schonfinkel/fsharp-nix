@@ -36,127 +36,23 @@ module CartEffects =
         CartCodec.action.Encode action
         |> Result.mapError (fun _ -> CartActionError.CallbackEncodingFailed)
 
-    let private payloadHash (action: CartAction) : byte[] =
-        match encodeAction action with
-        | Ok json -> SHA256.HashData(Encoding.UTF8.GetBytes json)
-        | Error _ -> Array.empty
-
     let private callbackKey (record: ActionRecord<CartId, CartAction>) (purpose: string) : string =
         $"xmsg:v1:%s{MachineId.value record.MachineId}:%d{CommandId.value record.CommandId}:%d{record.Ordinal}:%s{purpose}"
 
-    /// <summary>Inserts the action receipt, or verifies an existing one matches the canonical
-    /// payload. Returns <c>true</c> on first delivery, <c>false</c> on a verified replay.</summary>
-    let private settleReceipt
-        (connection: NpgsqlConnection)
-        (transaction: NpgsqlTransaction)
-        (record: ActionRecord<CartId, CartAction>)
-        (ct: CancellationToken)
-        : Task<Result<bool, CartActionError>> =
-        task {
-            match encodeAction record.Action with
-            | Error error -> return Error error
-            | Ok encoded ->
-                let hash = SHA256.HashData(Encoding.UTF8.GetBytes encoded)
+    /// <summary>Returns <c>true</c> on first delivery, <c>false</c> on a verified replay.</summary>
+    let private settleReceipt connection transaction (record: ActionRecord<CartId, CartAction>) ct =
+        WorkflowEffects.firstDelivery
+            CartCodec.action
+            actionKind
+            CartActionError.CallbackEncodingFailed
+            CartActionError.ActionReceiptMismatch
+            connection
+            transaction
+            record
+            ct
 
-                use insert =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.action_receipts (machine_id, command_id, ordinal, action_kind, payload_hash)
-                           VALUES (@machine_id, @command_id, @ordinal, @action_kind, @payload_hash)
-                           ON CONFLICT (machine_id, command_id, ordinal) DO NOTHING
-                           RETURNING command_id""",
-                        connection,
-                        transaction
-                    )
-
-                insert.Parameters.AddWithValue("machine_id", MachineId.value record.MachineId)
-                |> ignore
-
-                insert.Parameters.AddWithValue("command_id", CommandId.value record.CommandId)
-                |> ignore
-
-                insert.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-
-                insert.Parameters.AddWithValue("action_kind", actionKind record.Action)
-                |> ignore
-
-                insert.Parameters.AddWithValue("payload_hash", hash) |> ignore
-
-                let! inserted = insert.ExecuteScalarAsync(ct)
-
-                if not (isNull inserted) then
-                    return Ok true
-                else
-                    use verify =
-                        new NpgsqlCommand(
-                            """SELECT action_kind, payload_hash
-                               FROM fsnix.action_receipts
-                               WHERE machine_id = @machine_id
-                                 AND command_id = @command_id
-                                 AND ordinal = @ordinal""",
-                            connection,
-                            transaction
-                        )
-
-                    verify.Parameters.AddWithValue("machine_id", MachineId.value record.MachineId)
-                    |> ignore
-
-                    verify.Parameters.AddWithValue("command_id", CommandId.value record.CommandId)
-                    |> ignore
-
-                    verify.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-
-                    let! reader = verify.ExecuteReaderAsync(ct)
-                    let! couldRead = reader.ReadAsync(ct)
-
-                    let existing =
-                        if couldRead then
-                            let kind = reader.GetString 0
-                            let storedHash = Convert.ToHexString(reader.GetValue(1) :?> byte[])
-                            Some(kind, storedHash)
-                        else
-                            None
-
-                    reader.Dispose()
-                    let expected = Convert.ToHexString(hash)
-
-                    let verified =
-                        existing
-                        |> Option.map (fun (kind, storedHash) ->
-                            kind = actionKind record.Action && storedHash = expected)
-                        |> Option.defaultValue false
-
-                    if verified then
-                        return Ok false
-                    else
-                        return Error CartActionError.ActionReceiptMismatch
-        }
-
-    let private insertCallback
-        (connection: NpgsqlConnection)
-        (transaction: NpgsqlTransaction)
-        (key: string)
-        (machineId: string)
-        (entityId: string)
-        (eventJson: string)
-        (ct: CancellationToken)
-        : Task =
-        task {
-            use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.integration_outbox (callback_key, machine_id, entity_id, event)
-                       VALUES (@callback_key, @machine_id, @entity_id, @event::jsonb)
-                       ON CONFLICT (callback_key) DO NOTHING""",
-                    connection,
-                    transaction
-                )
-
-            command.Parameters.AddWithValue("callback_key", key) |> ignore
-            command.Parameters.AddWithValue("machine_id", machineId) |> ignore
-            command.Parameters.AddWithValue("entity_id", entityId) |> ignore
-            command.Parameters.AddWithValue("event", eventJson) |> ignore
-            let! _ = command.ExecuteNonQueryAsync(ct)
-            ()
-        }
+    let private insertCallback connection transaction key machineId entityId eventJson ct : Task =
+        WorkflowEffects.callback connection transaction key machineId entityId eventJson ct
 
     let private notify
         (connection: NpgsqlConnection)

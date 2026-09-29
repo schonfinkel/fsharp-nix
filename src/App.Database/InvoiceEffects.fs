@@ -37,6 +37,20 @@ module InvoiceIssuer =
     let fiscalPeriod (issuedAt: DateTimeOffset) =
         issuedAt.UtcDateTime.ToString("yyyy-MM", Globalization.CultureInfo.InvariantCulture)
 
+[<RequireQualifiedAccess>]
+module InvoiceSql =
+    let allocateNumber = Sql.load "Invoices/allocate-number"
+    let documentHeader = Sql.load "Invoices/document-header"
+    let documentLines = Sql.load "Invoices/document-lines"
+    let existingNumber = Sql.load "Invoices/existing-number"
+    let exists = Sql.load "Invoices/exists"
+    let forOrder = Sql.load "Invoices/for-order"
+    let insertDocument = Sql.load "Invoices/insert-document"
+    let insertSnapshot = Sql.load "Invoices/insert-snapshot"
+    let latestDocument = Sql.load "Invoices/latest-document"
+    let list = Sql.load "Invoices/list"
+    let snapshotCheck = Sql.load "Invoices/snapshot-check"
+
 /// <summary>One rendered invoice line, read back from the immutable snapshot.</summary>
 type InvoiceDocumentLine =
     { Sku: string

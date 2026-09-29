@@ -26,6 +26,12 @@ type ReceiptFailure =
     /// hash: a codec or chart defect, never retried.</summary>
     | Mismatch
 
+[<RequireQualifiedAccess>]
+module WorkflowSql =
+    let insertCallback = Sql.load "Workflow/insert-callback"
+    let insertReceipt = Sql.load "Workflow/insert-receipt"
+    let verifyReceipt = Sql.load "Workflow/verify-receipt"
+
 /// <summary>
 /// The single implementation of the local-effect protocol (PLAN "Local database effects"): one
 /// PostgreSQL transaction holds the action receipt, payload-hash verification, all local writes
@@ -51,12 +57,7 @@ module WorkflowEffects =
         task {
             let hash = SHA256.HashData(Encoding.UTF8.GetBytes json)
 
-            use insert =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.action_receipts(machine_id,command_id,ordinal,action_kind,payload_hash) VALUES(@machine,@command,@ordinal,@kind,@hash) ON CONFLICT DO NOTHING RETURNING command_id",
-                    connection,
-                    tx
-                )
+            use insert = new NpgsqlCommand(WorkflowSql.insertReceipt, connection, tx)
 
             insert.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
             |> ignore
@@ -72,12 +73,7 @@ module WorkflowEffects =
             if not (isNull inserted) then
                 return Ok ReceiptStatus.FirstRun
             else
-                use verify =
-                    new NpgsqlCommand(
-                        "SELECT action_kind,payload_hash FROM fsnix.action_receipts WHERE machine_id=@machine AND command_id=@command AND ordinal=@ordinal",
-                        connection,
-                        tx
-                    )
+                use verify = new NpgsqlCommand(WorkflowSql.verifyReceipt, connection, tx)
 
                 verify.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
                 |> ignore
@@ -114,6 +110,27 @@ module WorkflowEffects =
         | Error _ -> Task.FromResult(Error ReceiptFailure.EncodingFailed)
         | Ok json -> receipt connection tx record (actionKind record.Action) json ct
 
+    /// <summary>Adapter for effect modules that track first delivery as a flag: <c>true</c> on
+    /// first run, <c>false</c> on a verified duplicate, each failure mapped to the module's own
+    /// error.</summary>
+    let firstDelivery
+        (codec: Codec<'Action>)
+        (actionKind: 'Action -> string)
+        (encodingFailed: 'Error)
+        (mismatch: 'Error)
+        (connection: NpgsqlConnection)
+        (tx: NpgsqlTransaction)
+        (record: ActionRecord<'Entity, 'Action>)
+        (ct: CancellationToken)
+        : Task<Result<bool, 'Error>> =
+        task {
+            match! receiptFor codec actionKind connection tx record ct with
+            | Ok ReceiptStatus.FirstRun -> return Ok true
+            | Ok ReceiptStatus.Duplicate -> return Ok false
+            | Error ReceiptFailure.EncodingFailed -> return Error encodingFailed
+            | Error ReceiptFailure.Mismatch -> return Error mismatch
+        }
+
     /// <summary>Inserts an already-encoded callback into the integration outbox. A repeat of the
     /// same stable key is a no-op.</summary>
     let callback
@@ -126,12 +143,7 @@ module WorkflowEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.integration_outbox(callback_key,machine_id,entity_id,event) VALUES(@key,@machine,@entity,@event::jsonb) ON CONFLICT(callback_key) DO NOTHING",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(WorkflowSql.insertCallback, connection, tx)
 
             command.Parameters.AddWithValue("key", callbackKey) |> ignore
             command.Parameters.AddWithValue("machine", machine) |> ignore

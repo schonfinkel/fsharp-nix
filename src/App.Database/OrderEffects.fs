@@ -50,89 +50,18 @@ module OrderEffects =
         (record: ActionRecord<OrderId, OrderAction>)
         (ct: CancellationToken)
         =
-        task {
-            let json =
-                OrderCodec.action.Encode record.Action
-                |> Result.defaultWith (fun _ -> "invalid")
+        WorkflowEffects.firstDelivery
+            OrderCodec.action
+            actionKind
+            OrderActionError.CallbackEncodingFailed
+            OrderActionError.ActionReceiptMismatch
+            connection
+            tx
+            record
+            ct
 
-            let hash = SHA256.HashData(Encoding.UTF8.GetBytes json)
-
-            use insert =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.action_receipts(machine_id,command_id,ordinal,action_kind,payload_hash) VALUES(@machine,@command,@ordinal,@kind,@hash) ON CONFLICT DO NOTHING RETURNING command_id",
-                    connection,
-                    tx
-                )
-
-            insert.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
-            |> ignore
-
-            insert.Parameters.AddWithValue("command", CommandId.value record.CommandId)
-            |> ignore
-
-            insert.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-            insert.Parameters.AddWithValue("kind", actionKind record.Action) |> ignore
-            insert.Parameters.AddWithValue("hash", hash) |> ignore
-            let! inserted = insert.ExecuteScalarAsync ct
-
-            if not (isNull inserted) then
-                return Ok true
-            else
-                use verify =
-                    new NpgsqlCommand(
-                        "SELECT action_kind,payload_hash FROM fsnix.action_receipts WHERE machine_id=@machine AND command_id=@command AND ordinal=@ordinal",
-                        connection,
-                        tx
-                    )
-
-                verify.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
-                |> ignore
-
-                verify.Parameters.AddWithValue("command", CommandId.value record.CommandId)
-                |> ignore
-
-                verify.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-                let! reader = verify.ExecuteReaderAsync ct
-                let! found = reader.ReadAsync ct
-
-                let matches =
-                    found
-                    && reader.GetString 0 = actionKind record.Action
-                    && CryptographicOperations.FixedTimeEquals(reader.GetFieldValue<byte array>(1), hash)
-
-                reader.Dispose()
-
-                return
-                    if matches then
-                        Ok false
-                    else
-                        Error OrderActionError.ActionReceiptMismatch
-        }
-
-    let private callback
-        (connection: NpgsqlConnection)
-        (tx: NpgsqlTransaction)
-        callbackKey
-        machine
-        entity
-        eventJson
-        (ct: CancellationToken)
-        =
-        task {
-            use command =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.integration_outbox(callback_key,machine_id,entity_id,event) VALUES(@key,@machine,@entity,@event::jsonb) ON CONFLICT(callback_key) DO NOTHING",
-                    connection,
-                    tx
-                )
-
-            command.Parameters.AddWithValue("key", callbackKey) |> ignore
-            command.Parameters.AddWithValue("machine", machine) |> ignore
-            command.Parameters.AddWithValue("entity", entity) |> ignore
-            command.Parameters.AddWithValue("event", eventJson) |> ignore
-            let! _ = command.ExecuteNonQueryAsync ct
-            return ()
-        }
+    let private callback connection tx callbackKey machine entity eventJson ct =
+        WorkflowEffects.callback connection tx callbackKey machine entity eventJson ct
 
     let applyReserveStock
         (dataSource: NpgsqlDataSource)
