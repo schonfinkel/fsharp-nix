@@ -7,12 +7,15 @@ open App.Cart
 open App.Database
 open App.Domain
 open App.Orders
+open App.Payments
+open App.Refunds
 open App.Auth
 open App.Returns
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Runtime
 open ByzantineSystems.Automata.Storage
 open Microsoft.AspNetCore.DataProtection
+open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Npgsql
@@ -78,6 +81,121 @@ module private Enqueued =
         match outcome with
         | Ok _ -> Settlement.Done
         | Error _ -> Settlement.Released
+
+/// <summary>Spacing of gateway reconciliation checks for a provider call with an unknown
+/// outcome: one check per delay, then the owning machine is told the checks are exhausted.</summary>
+type ReconciliationPolicy = { Backoff: TimeSpan list }
+
+[<RequireQualifiedAccess>]
+module ReconciliationPolicy =
+    let defaults =
+        { Backoff =
+            [ TimeSpan.FromSeconds 30.
+              TimeSpan.FromMinutes 2.
+              TimeSpan.FromMinutes 10.
+              TimeSpan.FromHours 1.
+              TimeSpan.FromHours 6. ] }
+
+    /// <summary><c>Reconciliation:Backoff</c> is a comma-separated list of invariant
+    /// <c>TimeSpan</c> values, e.g. <c>00:00:30,00:02:00</c>.</summary>
+    let load (configuration: IConfiguration) =
+        match configuration["Reconciliation:Backoff"] with
+        | value when String.IsNullOrWhiteSpace value -> defaults
+        | value ->
+            let delays =
+                value.Split(',', StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+                |> Array.map (fun text ->
+                    match TimeSpan.TryParse(text, Globalization.CultureInfo.InvariantCulture) with
+                    | true, delay when delay > TimeSpan.Zero -> delay
+                    | _ -> invalidOp "Reconciliation:Backoff must list positive TimeSpan values.")
+                |> List.ofArray
+
+            if delays.IsEmpty then
+                invalidOp "Reconciliation:Backoff must list at least one delay."
+
+            { Backoff = delays }
+
+/// <summary>
+/// Re-checks provider calls whose outcome is unknown (authorization, capture, void, refund). Each
+/// pass sends the owning machine one <c>ReconcileRequested</c> per due operation; the machine
+/// queries the gateway only if it is still waiting on that exact operation, so stale checks are
+/// no-ops. After the configured number of checks the machine receives
+/// <c>ReconciliationExhausted</c> and parks the entity for manual review.
+/// </summary>
+type GatewayReconciliationScanner
+    (
+        dataSource: NpgsqlDataSource,
+        payments: PaymentMachineClient,
+        refunds: RefundMachineClient,
+        policy: ReconciliationPolicy,
+        logger: ILogger<GatewayReconciliationScanner>,
+        health
+    ) =
+    inherit PeriodicWorker(RuntimeComponent.GatewayReconciliationScanner, TimeSpan.FromSeconds 5., logger, health)
+
+    let options = LeaseOptions.defaults (ScannerOwner.create "gateway-reconciliation")
+
+    let send (row: Ledgers.UnknownOperation) (operation: PaymentOperationId) exhausted ct =
+        let kind = if exhausted then "reconcile-exhausted" else "reconcile"
+
+        let key =
+            TimerKey.create row.Machine row.Entity $"{kind}:{row.OperationId}" (int64 row.Checks)
+
+        task {
+            match row.Machine with
+            | machine when machine = Payments.MachineKey ->
+                let event: PaymentEvent =
+                    if exhausted then
+                        PaymentEvent.ReconciliationExhausted operation
+                    else
+                        PaymentEvent.ReconcileRequested operation
+
+                let! outcome =
+                    Machine.enqueue payments.Payments (entityId row.Entity) (EventEnvelope.create key event) ct
+
+                return Result.isOk outcome
+            | machine when machine = Refunds.MachineKey ->
+                let event: RefundEvent =
+                    if exhausted then
+                        RefundEvent.ReconciliationExhausted operation
+                    else
+                        RefundEvent.ReconcileRequested operation
+
+                let! outcome = Machine.enqueue refunds.Refunds (entityId row.Entity) (EventEnvelope.create key event) ct
+                return Result.isOk outcome
+            | _ -> return false
+        }
+
+    override _.RunPass ct =
+        task {
+            let! claimed = LeasedLedger.claim dataSource Ledgers.gatewayUnknown options Ledgers.readUnknownOperation ct
+
+            for row in claimed do
+                let exhausted = row.Checks >= policy.Backoff.Length
+
+                let! settlement =
+                    match PaymentOperationId.tryParse row.OperationId with
+                    | Error _ -> Task.FromResult CheckSettlement.Parked
+                    | Ok operation ->
+                        task {
+                            let! accepted = send row operation exhausted ct
+
+                            return
+                                match accepted, exhausted with
+                                | false, _ -> CheckSettlement.Retry
+                                | true, true -> CheckSettlement.Parked
+                                | true, false ->
+                                    // The next check waits for the delay after this one; the final
+                                    // delay leads to the exhausted event.
+                                    CheckSettlement.Next(
+                                        policy.Backoff
+                                        |> List.tryItem (row.Checks + 1)
+                                        |> Option.defaultValue (List.last policy.Backoff)
+                                    )
+                        }
+
+                do! LeasedLedger.settleCheck dataSource options row.OperationId settlement ct
+        }
 
 /// <summary>Fires due return-window deadlines into the return machine.</summary>
 type ReturnWindowScanner

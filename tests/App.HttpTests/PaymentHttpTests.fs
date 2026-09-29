@@ -433,3 +433,98 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
             let gateway = factory.Services.GetRequiredService<SimulatedPaymentGateway>()
             Assert.Equal(1, gateway.AuthorizeCalls attempt)
         }
+
+    member private _.startUnknownAuthorization() =
+        task {
+            let factory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, userId = customerId)
+
+            let client =
+                factory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            do! seedCart factory
+            let! orderId, _ = submitCheckout client
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | AwaitingAuthorization _ -> true
+                    | _ -> false)
+
+            let! attempt = authorize client orderId PaymentMethodReference.Sandbox.Unknown
+
+            let! _ =
+                waitForPayment factory orderId (function
+                    | AuthorizationUnknown _ -> true
+                    | _ -> false)
+
+            let operation = PaymentOperationId.value attempt
+
+            let! scheduled =
+                scalar
+                    string
+                    $"SELECT reconcile_machine || ':' || (reconcile_entity = 'payment:{orderId:D}') || ':' || (next_check_at > statement_timestamp()) FROM fsnix.payment_operations WHERE operation_id='{operation}' AND status='unknown'"
+
+            Assert.Equal("payments:true:true", scheduled)
+            return factory, client, orderId, operation
+        }
+
+    member this.``an unknown authorization reconciles without customer action``() =
+        task {
+            let! factory, client, orderId, operation = this.startUnknownAuthorization ()
+            use factory = factory
+            use client = client
+
+            let! _ =
+                scalar
+                    ignore
+                    $"UPDATE fsnix.payment_operations SET next_check_at = statement_timestamp() - interval '1 second' WHERE operation_id='{operation}'"
+
+            let! settled =
+                waitForPayment factory orderId (function
+                    | Authorized _
+                    | Declined _ -> true
+                    | _ -> false)
+
+            let! order =
+                waitForOrder factory orderId (function
+                    | Placed _
+                    | AwaitingAuthorization _ -> true
+                    | _ -> false)
+
+            match settled, order with
+            | Authorized _, Placed _
+            | Declined _, AwaitingAuthorization _ -> ()
+            | other -> Assert.Fail $"Payment and order disagree after reconciliation: %A{other}"
+
+            let! row =
+                scalar
+                    string
+                    $"SELECT status || ':' || checks || ':' || (next_check_at IS NULL) FROM fsnix.payment_operations WHERE operation_id='{operation}'"
+
+            Assert.True(row.EndsWith(":1:true", StringComparison.Ordinal), row)
+            Assert.True(not (row.StartsWith("unknown", StringComparison.Ordinal)), row)
+        }
+
+    member this.``exhausted reconciliation parks the payment for review``() =
+        task {
+            let! factory, client, orderId, operation = this.startUnknownAuthorization ()
+            use factory = factory
+            use client = client
+
+            let! _ =
+                scalar
+                    ignore
+                    $"UPDATE fsnix.payment_operations SET checks = 5, next_check_at = statement_timestamp() - interval '1 second' WHERE operation_id='{operation}'"
+
+            let! _ =
+                waitForPayment factory orderId (function
+                    | PaymentState.ManualReview reason -> ReasonCode.value reason = "gateway-outcome-unknown"
+                    | _ -> false)
+
+            let! row =
+                scalar
+                    string
+                    $"SELECT status || ':' || checks || ':' || (next_check_at IS NULL) FROM fsnix.payment_operations WHERE operation_id='{operation}'"
+
+            Assert.Equal("unknown:6:true", row)
+        }

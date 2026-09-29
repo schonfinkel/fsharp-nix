@@ -6,6 +6,10 @@ SET
     result_code = @result,
     expires_at = @expires,
     attempts = attempts + 1,
+    -- The first unknown outcome schedules reconciliation; later ones keep the scanner's backoff.
+    next_check_at = CASE WHEN @status = 'unknown' THEN
+        COALESCE(next_check_at, STATEMENT_TIMESTAMP() + interval '30 seconds')
+    END,
     updated_at = STATEMENT_TIMESTAMP()
 WHERE
     operation_id = @operation

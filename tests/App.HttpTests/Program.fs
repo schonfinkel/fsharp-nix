@@ -97,7 +97,11 @@ let private tests =
                 DatabaseTest.isolated false "declined payment retries" (fun fixture ->
                     PaymentHttpTests(fixture).``declined payment returns to the pay step and a retry succeeds`` ())
                 DatabaseTest.isolated false "unknown cancellation unwinds" (fun fixture ->
-                    PaymentHttpTests(fixture).``cancelling an unknown authorization resolves and unwinds payment`` ()) ] ]
+                    PaymentHttpTests(fixture).``cancelling an unknown authorization resolves and unwinds payment`` ())
+                DatabaseTest.isolated false "unknown authorization reconciles" (fun fixture ->
+                    PaymentHttpTests(fixture).``an unknown authorization reconciles without customer action`` ())
+                DatabaseTest.isolated false "exhausted reconciliation parks payment" (fun fixture ->
+                    PaymentHttpTests(fixture).``exhausted reconciliation parks the payment for review`` ()) ] ]
     |> testSequenced
 
 [<EntryPoint>]

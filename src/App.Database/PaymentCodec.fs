@@ -528,6 +528,12 @@ module PaymentCodec =
                     | MarkManualReview reason ->
                         { empty "mark-manual-review-v1" with
                             Reason = ReasonCode.value reason }
+                    | ReconcileRequested operation ->
+                        { empty "reconcile-requested-v1" with
+                            OperationId = PaymentOperationId.value operation }
+                    | ReconciliationExhausted operation ->
+                        { empty "reconciliation-exhausted-v1" with
+                            OperationId = PaymentOperationId.value operation }
 
                 encode "PaymentEvent" dto)
             (fun json ->
@@ -597,6 +603,14 @@ module PaymentCodec =
                         |> Result.map (fun authorized -> VoidOutcomeUnknown authorized)
                     | "mark-manual-review-v1" when not (String.IsNullOrWhiteSpace dto.Reason) ->
                         (CodecSupport.reason dto.Reason |> Result.map MarkManualReview)
+                    | "reconcile-requested-v1" ->
+                        PaymentOperationId.tryParse dto.OperationId
+                        |> Result.mapError (codecError "PaymentEvent")
+                        |> Result.map ReconcileRequested
+                    | "reconciliation-exhausted-v1" ->
+                        PaymentOperationId.tryParse dto.OperationId
+                        |> Result.mapError (codecError "PaymentEvent")
+                        |> Result.map ReconciliationExhausted
                     | tag -> Error(codecError "PaymentEvent" $"Unknown tag '{tag}'.")))
 
     let action: Codec<PaymentAction> =

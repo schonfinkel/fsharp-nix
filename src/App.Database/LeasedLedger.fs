@@ -10,6 +10,8 @@ module LedgerSql =
     let cartDeadlinesClaim = Sql.load "Ledgers/cart-deadlines-claim"
     let cartDeadlinesSettle = Sql.load "Ledgers/cart-deadlines-settle"
     let flowDeadlinesClaim = Sql.load "Ledgers/flow-deadlines-claim"
+    let gatewayUnknownClaim = Sql.load "Ledgers/gateway-unknown-claim"
+    let gatewayUnknownSettle = Sql.load "Ledgers/gateway-unknown-settle"
     let flowDeadlinesSettle = Sql.load "Ledgers/flow-deadlines-settle"
     let gateState = Sql.load "Ledgers/gate-state"
     let reservationDeadlinesClaim = Sql.load "Ledgers/reservation-deadlines-claim"
@@ -58,6 +60,16 @@ type Settlement =
     | Released
     /// <summary>Return to the pool but not before the given delay (bounded retry backoff).</summary>
     | RetryAfter of TimeSpan
+
+/// <summary>How a claimed unknown-outcome check is settled.</summary>
+[<RequireQualifiedAccess>]
+type CheckSettlement =
+    /// <summary>The check event was accepted; the next one is due after the delay.</summary>
+    | Next of TimeSpan
+    /// <summary>The exhausted event was accepted; stop scheduling checks.</summary>
+    | Parked
+    /// <summary>The event was not accepted; keep the row due for the next pass.</summary>
+    | Retry
 
 /// <summary>What the gate callback's delivery state says about a due deadline.</summary>
 [<RequireQualifiedAccess>]
@@ -128,6 +140,42 @@ module LeasedLedger =
                     "delay_seconds",
                     NpgsqlTypes.NpgsqlDbType.Bigint,
                     Value = (delay |> Option.map box |> Option.defaultValue DBNull.Value)
+                )
+            )
+            |> ignore
+
+            let! _ = command.ExecuteNonQueryAsync ct
+            ()
+        }
+
+    /// <summary>Settles one claimed unknown-outcome check (<c>Ledgers.gatewayUnknown</c>).</summary>
+    let settleCheck
+        (dataSource: NpgsqlDataSource)
+        (options: LeaseOptions)
+        (operationId: string)
+        (settlement: CheckSettlement)
+        (ct: CancellationToken)
+        : Task =
+        task {
+            use connection = dataSource.CreateConnection()
+            do! connection.OpenAsync ct
+
+            let advance, next =
+                match settlement with
+                | CheckSettlement.Next delay -> true, Some(max 1L (int64 delay.TotalSeconds))
+                | CheckSettlement.Parked -> true, None
+                | CheckSettlement.Retry -> false, None
+
+            use command = new NpgsqlCommand(LedgerSql.gatewayUnknownSettle, connection)
+            command.Parameters.AddWithValue("id", operationId) |> ignore
+            command.Parameters.AddWithValue("owner", options.Owner) |> ignore
+            command.Parameters.AddWithValue("advance", advance) |> ignore
+
+            command.Parameters.Add(
+                NpgsqlParameter(
+                    "next_check_seconds",
+                    NpgsqlTypes.NpgsqlDbType.Bigint,
+                    Value = (next |> Option.map box |> Option.defaultValue DBNull.Value)
                 )
             )
             |> ignore
@@ -228,3 +276,21 @@ module Ledgers =
         { ReturnId = reader.GetGuid 0
           AuthorizationId = reader.GetGuid 1
           WindowEndsAt = reader.GetFieldValue<DateTimeOffset> 2 }
+
+    /// <summary>Provider calls with an unknown outcome, due for another gateway check. Only
+    /// <c>Claim</c> is used; settlement goes through <c>LeasedLedger.settleCheck</c>.</summary>
+    let gatewayUnknown =
+        { Claim = LedgerSql.gatewayUnknownClaim
+          Settle = LedgerSql.gatewayUnknownSettle }
+
+    type UnknownOperation =
+        { OperationId: string
+          Machine: string
+          Entity: string
+          Checks: int }
+
+    let readUnknownOperation (reader: NpgsqlDataReader) =
+        { OperationId = reader.GetString 0
+          Machine = reader.GetString 1
+          Entity = reader.GetString 2
+          Checks = reader.GetInt32 3 }

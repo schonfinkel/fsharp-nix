@@ -493,6 +493,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.CartMergeScanner
         health.Succeeded RuntimeComponent.ReservationExpiryScanner
         health.Succeeded RuntimeComponent.ReturnWindowScanner
+        health.Succeeded RuntimeComponent.GatewayReconciliationScanner
         let snapshot = health.Snapshot()
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) snapshot)
 
@@ -1998,6 +1999,127 @@ module UnitTests =
         Assert.NotEqual<byte array>(first, other)
         Assert.Equal("invoice-v1", InvoicePdf.renderer.Name)
 
+    let ``unknown provider calls reconcile on request and park when exhausted`` () =
+        let attempt = makeAuthorizationAttempt ()
+        let stale = (makeAuthorizationAttempt ()).OperationId
+
+        let pending =
+            AuthorizationUnknown
+                { Attempt = attempt
+                  CancelRequested = false }
+
+        let checkedAgain =
+            expectPaymentResolution pending (ReconcileRequested attempt.OperationId)
+
+        Assert.Equal(pending, checkedAgain.Next)
+        Assert.Equal([ QueryGatewayAuthorization attempt ], checkedAgain.Actions)
+
+        let staleCheck = expectPaymentResolution pending (ReconcileRequested stale)
+        Assert.Equal(pending, staleCheck.Next)
+        Assert.Empty(staleCheck.Actions)
+
+        let exhausted =
+            expectPaymentResolution pending (ReconciliationExhausted attempt.OperationId)
+
+        Assert.Equal(PaymentState.ManualReview(ReasonCode.ofLiteral "gateway-outcome-unknown"), exhausted.Next)
+
+        let authorized =
+            { Attempt = attempt
+              ProviderReference = "sim-abc123"
+              ExpiresAt = DateTimeOffset.UtcNow.AddDays 6. }
+
+        let settled =
+            expectPaymentResolution (Authorized authorized) (ReconcileRequested attempt.OperationId)
+
+        Assert.Equal(Authorized authorized, settled.Next)
+        Assert.Empty(settled.Actions)
+
+        let capture =
+            { OrderId = attempt.OrderId
+              CaptureId = CaptureId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+              OperationId =
+                PaymentOperationId.create "capture:v1:reconcile"
+                |> Result.defaultWith Assert.Fail
+              Amount = Money.create 10m "USD" |> Result.defaultWith Assert.Fail }
+
+        let captureUnknown =
+            CaptureUnknown
+                { Payment =
+                    { Authorization = authorized
+                      Captures = []
+                      Refunds = [] }
+                  Request = capture }
+
+        let captureCheck =
+            expectPaymentResolution captureUnknown (ReconcileRequested capture.OperationId)
+
+        Assert.Equal([ QueryGatewayCapture(authorized, capture) ], captureCheck.Actions)
+
+        let voidOperation = PaymentOperationId.voidOf attempt.OperationId
+
+        let voidCheck =
+            expectPaymentResolution (VoidUnknown authorized) (ReconcileRequested voidOperation)
+
+        Assert.Equal([ CallGatewayVoid authorized ], voidCheck.Actions)
+
+        let voided =
+            expectPaymentResolution (VoidUnknown authorized) (VoidSucceeded authorized)
+
+        Assert.Equal(Voided authorized, voided.Next)
+        Assert.Equal([ NotifyOrderVoided authorized ], voided.Actions)
+
+        let refund = makeRefundRequest 10m
+
+        let approved: ApprovedRefund =
+            { Request = refund
+              PaymentReference = "sim-abc123" }
+
+        let resolveRefund state event =
+            match Chart.resolve App.Refunds.Refunds.chartValue state event with
+            | Ok resolution -> resolution
+            | Error error -> Assert.Fail $"Expected refund event to resolve, got %A{error}."
+
+        let refundUnknown = App.Refunds.RefundState.OutcomeUnknown approved
+
+        let refundCheck =
+            resolveRefund refundUnknown (App.Refunds.RefundEvent.ReconcileRequested refund.OperationId)
+
+        Assert.Equal(refundUnknown, refundCheck.Next)
+        Assert.Equal([ App.Refunds.RefundAction.QueryGatewayRefund approved ], refundCheck.Actions)
+
+        let refundExhausted =
+            resolveRefund refundUnknown (App.Refunds.RefundEvent.ReconciliationExhausted refund.OperationId)
+
+        let reason = ReasonCode.ofLiteral "gateway-outcome-unknown"
+        Assert.Equal(App.Refunds.RefundState.ManualReview(refund, reason), refundExhausted.Next)
+        Assert.Equal([ App.Refunds.RefundAction.NotifyOriginFailed(refund, reason) ], refundExhausted.Actions)
+
+        for event in
+            [ ReconcileRequested attempt.OperationId
+              ReconciliationExhausted attempt.OperationId ] do
+            let json =
+                PaymentCodec.event.Encode event
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                event,
+                PaymentCodec.event.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
+        for event in
+            [ App.Refunds.RefundEvent.ReconcileRequested refund.OperationId
+              App.Refunds.RefundEvent.ReconciliationExhausted refund.OperationId ] do
+            let json =
+                RefundCodec.event.Encode event
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                event,
+                RefundCodec.event.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
     let tests =
         testList
             "unit"
@@ -2120,4 +2242,7 @@ module UnitTests =
                   "pdf renders deterministically with the shipped font"
                   ``pdf renders deterministically with the shipped font only``
               testCase "document digests are lowercase hex sha256" ``document digests are lowercase hex sha256``
-              testCase "invoice pdf is deterministic per snapshot" ``invoice pdf is deterministic per snapshot`` ]
+              testCase "invoice pdf is deterministic per snapshot" ``invoice pdf is deterministic per snapshot``
+              testCase
+                  "unknown provider calls reconcile and park"
+                  ``unknown provider calls reconcile on request and park when exhausted`` ]

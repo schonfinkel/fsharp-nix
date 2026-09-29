@@ -248,6 +248,10 @@ module RefundEffects =
                     insert.Parameters.AddWithValue("id", operationId) |> ignore
                     insert.Parameters.AddWithValue("entity", paymentEntity orderId) |> ignore
                     insert.Parameters.AddWithValue("order", orderId) |> ignore
+
+                    insert.Parameters.AddWithValue("refund_entity", EntityId.value record.EntityId)
+                    |> ignore
+
                     insert.Parameters.AddWithValue("amount", Money.amount request.Amount) |> ignore
 
                     insert.Parameters.AddWithValue("currency", Money.currencyCode request.Amount)

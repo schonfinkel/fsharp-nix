@@ -19,7 +19,9 @@ module RefundWire =
           PaymentReference: string
           ProviderRefundReference: string
           Reason: string
-          AllocationId: string }
+          AllocationId: string
+          [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+          OperationId: string }
 
 [<RequireQualifiedAccess>]
 module RefundCodec =
@@ -34,7 +36,8 @@ module RefundCodec =
           PaymentReference = ""
           ProviderRefundReference = ""
           Reason = ""
-          AllocationId = "" }
+          AllocationId = ""
+          OperationId = null }
 
     let private withRequest tag request =
         { empty tag with
@@ -153,6 +156,12 @@ module RefundCodec =
                     | ManualReviewRequested reason ->
                         { empty "manual-review-requested-v1" with
                             Reason = ReasonCode.value reason }
+                    | ReconcileRequested operation ->
+                        { empty "reconcile-requested-v1" with
+                            OperationId = PaymentOperationId.value operation }
+                    | ReconciliationExhausted operation ->
+                        { empty "reconciliation-exhausted-v1" with
+                            OperationId = PaymentOperationId.value operation }
                     | CloseRequested -> empty "close-requested-v1"
 
                 encode "RefundEvent" dto)
@@ -182,6 +191,14 @@ module RefundCodec =
                         |> Result.map AllocationSettled
                     | "manual-review-requested-v1" ->
                         (CodecSupport.reason dto.Reason |> Result.map ManualReviewRequested)
+                    | "reconcile-requested-v1" ->
+                        PaymentOperationId.tryParse dto.OperationId
+                        |> Result.mapError (error "RefundEvent")
+                        |> Result.map ReconcileRequested
+                    | "reconciliation-exhausted-v1" ->
+                        PaymentOperationId.tryParse dto.OperationId
+                        |> Result.mapError (error "RefundEvent")
+                        |> Result.map ReconciliationExhausted
                     | "close-requested-v1" -> Ok CloseRequested
                     | _ -> Error(error "RefundEvent" "Unknown refund event.")))
 

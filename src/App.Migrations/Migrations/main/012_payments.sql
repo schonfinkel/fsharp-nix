@@ -13,9 +13,18 @@ CREATE TABLE fsnix.payment_operations (
     result_code text,
     expires_at timestamptz,
     attempts integer NOT NULL DEFAULT 0,
+    reconcile_machine text NOT NULL,
+    reconcile_entity text NOT NULL,
+    next_check_at timestamptz,
+    checks integer NOT NULL DEFAULT 0,
+    lease_owner text,
+    lease_until timestamptz,
     created_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
     updated_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
     CONSTRAINT ck_payment_operations_kind CHECK (kind IN ('authorize', 'void')),
+    CONSTRAINT ck_payment_operations_reconcile_machine CHECK (reconcile_machine IN ('payments', 'refunds')),
+    CONSTRAINT ck_payment_operations_checks CHECK (checks >= 0),
+    CONSTRAINT ck_payment_operations_lease_pair CHECK ((lease_owner IS NULL) = (lease_until IS NULL)),
     CONSTRAINT ck_payment_operations_status CHECK (status IN ('pending', 'succeeded', 'failed', 'unknown')),
     CONSTRAINT ck_payment_operations_terminal_result CHECK (status IN ('pending', 'unknown') OR result_code IS NOT NULL),
     CONSTRAINT ck_payment_operations_provider_reference CHECK (kind <> 'authorize' OR status <> 'succeeded' OR provider_reference IS NOT NULL),
@@ -23,6 +32,12 @@ CREATE TABLE fsnix.payment_operations (
     CONSTRAINT ck_payment_operations_provider_reference_shape CHECK (provider_reference IS NULL OR (CHAR_LENGTH(provider_reference) BETWEEN 1 AND 256 AND provider_reference ~ '^[A-Za-z0-9:/_-]+$')),
     CONSTRAINT ck_payment_operations_result_code_shape CHECK (result_code IS NULL OR (CHAR_LENGTH(result_code) BETWEEN 1 AND 64 AND result_code ~ '^[a-z0-9-]+$'))
 );
+
+-- Provider calls whose outcome is unknown, due for a reconciliation query. Rows leave the index
+-- as soon as the query effect settles them to succeeded/failed.
+CREATE INDEX ix_payment_operations_unknown_due ON fsnix.payment_operations (next_check_at, operation_id)
+WHERE
+    status = 'unknown' AND next_check_at IS NOT NULL;
 
 COMMENT ON TABLE fsnix.payment_operations IS 'Gateway operation ledger. Sanitized outcome codes and opaque provider references only; never cardholder data.';
 

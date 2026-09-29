@@ -84,6 +84,12 @@ type PaymentEvent =
     | VoidSucceeded of AuthorizedPayment
     | VoidOutcomeUnknown of AuthorizedPayment
     | MarkManualReview of reasonCode: ReasonCode
+    /// <summary>The reconciliation scanner asks for another gateway check of a provider call
+    /// whose outcome is unknown. Carries the operation id so a check aimed at an older call is
+    /// absorbed.</summary>
+    | ReconcileRequested of operationId: PaymentOperationId
+    /// <summary>The reconciliation scanner ran out of checks for that operation.</summary>
+    | ReconciliationExhausted of operationId: PaymentOperationId
 
 type PaymentAction =
     | CallGatewayAuthorize of AuthorizationAttempt
@@ -179,10 +185,40 @@ module Payments =
 
     let private voidSettled state event =
         match state, event with
-        | VoidPending authorized, VoidSucceeded confirmed
+        | (VoidPending authorized | VoidUnknown authorized), VoidSucceeded confirmed
         | VoidPending authorized, VoidOutcomeUnknown confirmed ->
             confirmed.Attempt.OperationId = authorized.Attempt.OperationId
         | _ -> false
+
+    /// <summary>The provider call whose outcome an unknown state is waiting for.</summary>
+    let private unknownOperation =
+        function
+        | AuthorizationUnknown pending -> Some pending.Attempt.OperationId
+        | CaptureUnknown pending -> Some pending.Request.OperationId
+        | VoidUnknown authorized -> Some(PaymentOperationId.voidOf authorized.Attempt.OperationId)
+        | _ -> None
+
+    let private reconcile state event =
+        match unknownOperation state, event with
+        | Some operation, ReconcileRequested requested -> requested = operation
+        | _ -> false
+
+    let private reconciliationExhausted state event =
+        match unknownOperation state, event with
+        | Some operation, ReconciliationExhausted requested -> requested = operation
+        | _ -> false
+
+    let private applyReconcile state _ =
+        match state with
+        | AuthorizationUnknown pending -> [ QueryGatewayAuthorization pending.Attempt ], state
+        | CaptureUnknown pending -> [ QueryGatewayCapture(pending.Payment.Authorization, pending.Request) ], state
+        // Voids have no query operation; repeating the call under the same operation id is
+        // idempotent at the provider and returns the settled result.
+        | VoidUnknown authorized -> [ CallGatewayVoid authorized ], state
+        | _ -> [], state
+
+    let private applyExhausted state _ =
+        [], ManualReview(ReasonCode.ofLiteral "gateway-outcome-unknown")
 
     let private captureTotal (payment: CapturedPayment) =
         payment.Captures
@@ -386,7 +422,9 @@ module Payments =
         | CaptureOutcomeUnknown _
         | CaptureDeclined _
         | VoidSucceeded _
-        | VoidOutcomeUnknown _ -> true
+        | VoidOutcomeUnknown _
+        | ReconcileRequested _
+        | ReconciliationExhausted _ -> true
         | RefundAllocationSettled _
         | RefundAllocationReleased _ -> true
         | AuthorizeRequested _
@@ -483,6 +521,9 @@ module Payments =
                         actions, next
                     | _ -> [], state)
 
+                on reconcile applyReconcile
+                on reconciliationExhausted applyExhausted
+
                 on cancelInFlight (fun state _ ->
                     match state with
                     | AuthorizationUnknown pending ->
@@ -533,6 +574,9 @@ module Payments =
                 on cancelAfterCapture (fun _ _ ->
                     [], ManualReview(ReasonCode.ofLiteral "cancellation-during-unknown-capture"))
 
+                on reconcile applyReconcile
+                on reconciliationExhausted applyExhausted
+
                 internalOn absorb (fun _ _ -> [])
             }
 
@@ -581,7 +625,17 @@ module Payments =
                 internalOn absorb (fun _ _ -> [])
             }
 
-            state "void-unknown" { internalOn absorb (fun _ _ -> []) }
+            state "void-unknown" {
+                on voidSettled (fun state event ->
+                    match state, event with
+                    | VoidUnknown authorized, VoidSucceeded _ -> [ NotifyOrderVoided authorized ], Voided authorized
+                    | _ -> [], state)
+
+                on reconcile applyReconcile
+                on reconciliationExhausted applyExhausted
+                internalOn absorb (fun _ _ -> [])
+            }
+
             state "voided" { internalOn absorb (fun _ _ -> []) }
 
             state "declined" {

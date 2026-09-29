@@ -24,6 +24,10 @@ type RefundEvent =
     | GatewayUnknown of ApprovedRefund
     | AllocationSettled of RefundAllocationId
     | ManualReviewRequested of reasonCode: ReasonCode
+    /// <summary>The reconciliation scanner asks for another gateway check of the refund call.</summary>
+    | ReconcileRequested of operationId: PaymentOperationId
+    /// <summary>The reconciliation scanner ran out of checks for the refund call.</summary>
+    | ReconciliationExhausted of operationId: PaymentOperationId
     | CloseRequested
 
 type RefundAction =
@@ -100,8 +104,16 @@ module Refunds =
         | SettlementPending(approved, _), AllocationSettled id -> id = approved.Request.AllocationId
         | _ -> false
 
+    let private reconcile state event =
+        match state, event with
+        | OutcomeUnknown approved, (ReconcileRequested operation | ReconciliationExhausted operation) ->
+            operation = approved.Request.OperationId
+        | _ -> false
+
     let private callback _ =
         function
+        | ReconcileRequested _
+        | ReconciliationExhausted _
         | AllocationApproved _
         | AllocationDenied _
         | GatewayRefunded _
@@ -151,6 +163,14 @@ module Refunds =
             }
 
             state "outcome-unknown" {
+                on reconcile (fun state event ->
+                    match state, event with
+                    | OutcomeUnknown approved, ReconcileRequested _ -> [ QueryGatewayRefund approved ], state
+                    | OutcomeUnknown approved, ReconciliationExhausted _ ->
+                        let reason = ReasonCode.ofLiteral "gateway-outcome-unknown"
+                        [ NotifyOriginFailed(approved.Request, reason) ], ManualReview(approved.Request, reason)
+                    | _ -> [], state)
+
                 on gatewayResult (fun state event ->
                     match state, event with
                     | OutcomeUnknown approved, GatewayRefunded(_, reference) ->
