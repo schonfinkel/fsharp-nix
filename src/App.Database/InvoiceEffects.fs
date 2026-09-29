@@ -9,6 +9,17 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
 
+/// <summary>How long a render may take before the render scanner re-requests it, and how many
+/// times it does so before the invoice is parked in <c>RenderFailed</c>.</summary>
+type InvoiceRenderPolicy =
+    { CheckAfter: TimeSpan; MaxChecks: int }
+
+[<RequireQualifiedAccess>]
+module InvoiceRenderPolicy =
+    let defaults =
+        { CheckAfter = TimeSpan.FromMinutes 10.
+          MaxChecks = 3 }
+
 /// <summary>The issuing legal entity, snapshotted onto every invoice at issuance.</summary>
 type InvoiceIssuer =
     { LegalEntity: string
@@ -46,6 +57,7 @@ module InvoiceSql =
     let exists = Sql.load "Invoices/exists"
     let forOrder = Sql.load "Invoices/for-order"
     let insertDocument = Sql.load "Invoices/insert-document"
+    let insertRenderCheck = Sql.load "Invoices/insert-render-check"
     let insertSnapshot = Sql.load "Invoices/insert-snapshot"
     let latestDocument = Sql.load "Invoices/latest-document"
     let list = Sql.load "Invoices/list"
@@ -308,6 +320,7 @@ module InvoiceEffects =
     let applyIssue
         (dataSource: NpgsqlDataSource)
         (issuer: InvoiceIssuer)
+        (renderPolicy: InvoiceRenderPolicy)
         (issuedAt: DateTimeOffset)
         (record: ActionRecord<InvoiceEntityId, InvoiceAction>)
         (ct: CancellationToken)
@@ -346,6 +359,16 @@ module InvoiceEffects =
                                 | Error _ -> return! failed (ReasonCode.ofLiteral "invoice-number-invalid")
                                 | Ok number ->
                                     do! insertSnapshot connection tx issuer record request number issuedAt token
+
+                                    use check = new NpgsqlCommand(InvoiceSql.insertRenderCheck, connection, tx)
+
+                                    check.Parameters.AddWithValue("invoice", InvoiceId.value request.InvoiceId)
+                                    |> ignore
+
+                                    check.Parameters.AddWithValue("due", issuedAt + renderPolicy.CheckAfter)
+                                    |> ignore
+
+                                    let! _ = check.ExecuteNonQueryAsync token
                                     return! issued number
                     })
                 ct

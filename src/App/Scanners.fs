@@ -6,6 +6,7 @@ open System.Threading.Tasks
 open App.Cart
 open App.Database
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open App.Refunds
@@ -238,6 +239,64 @@ type AuthorizationExpiryScanner
                     | _ -> Task.FromResult Settlement.Cancelled
 
                 do! LeasedLedger.settle dataSource Ledgers.paymentDeadlines options row.DeadlineId settlement ct
+        }
+
+/// <summary>
+/// Recovers invoices whose render never produced a document (for example a dead-lettered render
+/// action). A due check with a stored document finishes; otherwise the invoice machine is asked
+/// to render again, up to the policy's limit, after which it parks in <c>RenderFailed</c> where
+/// the operator retry applies. The machine ignores both events unless it is still rendering.
+/// </summary>
+type InvoiceRenderScanner
+    (
+        dataSource: NpgsqlDataSource,
+        invoices: InvoiceMachineClient,
+        policy: InvoiceRenderPolicy,
+        logger: ILogger<InvoiceRenderScanner>,
+        health
+    ) =
+    inherit PeriodicWorker(RuntimeComponent.InvoiceRenderScanner, TimeSpan.FromSeconds 5., logger, health)
+
+    let options = LeaseOptions.defaults (ScannerOwner.create "invoice-render")
+
+    override _.RunPass ct =
+        task {
+            let! claimed =
+                LeasedLedger.claim dataSource Ledgers.invoiceRenders options Ledgers.readInvoiceRenderCheck ct
+
+            for row in claimed do
+                let! settlement =
+                    match row.HasDocument, InvoiceId.create row.InvoiceId with
+                    | true, _
+                    | _, Error _ -> Task.FromResult Settlement.Done
+                    | false, Ok invoiceId ->
+                        task {
+                            let entity = Invoices.invoiceEntityId invoiceId
+                            let exhausted = row.Checks >= policy.MaxChecks
+
+                            let event =
+                                if exhausted then
+                                    RenderReconcileExhausted
+                                else
+                                    RenderReconcileRequested row.Checks
+
+                            let key =
+                                TimerKey.create
+                                    Invoices.MachineKey
+                                    (EntityId.value entity)
+                                    (if exhausted then "render-exhausted" else "render-check")
+                                    (int64 row.Checks)
+
+                            let! outcome = Machine.enqueue invoices.Invoices entity (EventEnvelope.create key event) ct
+
+                            return
+                                match outcome, exhausted with
+                                | Error _, _ -> Settlement.Released
+                                | Ok _, true -> Settlement.Done
+                                | Ok _, false -> Settlement.RetryAfter policy.CheckAfter
+                        }
+
+                do! LeasedLedger.settle dataSource Ledgers.invoiceRenders options row.InvoiceId settlement ct
         }
 
 /// <summary>Fires due return-window deadlines into the return machine.</summary>

@@ -25,9 +25,38 @@ module InvoiceIssuerConfig =
         |> InvoiceIssuer.validate
         |> Result.defaultWith invalidOp
 
-type InvoiceEffectHandler(dataSource: NpgsqlDataSource, issuer: InvoiceIssuer, timeProvider: TimeProvider) =
+[<RequireQualifiedAccess>]
+module InvoiceRenderPolicyConfig =
+    /// <summary><c>Invoicing:RenderCheckAfter</c> (invariant TimeSpan) and
+    /// <c>Invoicing:RenderMaxChecks</c>.</summary>
+    let load (configuration: IConfiguration) =
+        let checkAfter =
+            match configuration["Invoicing:RenderCheckAfter"] with
+            | text when String.IsNullOrWhiteSpace text -> InvoiceRenderPolicy.defaults.CheckAfter
+            | text ->
+                match TimeSpan.TryParse(text, Globalization.CultureInfo.InvariantCulture) with
+                | true, value when value > TimeSpan.Zero -> value
+                | _ -> invalidOp "Invoicing:RenderCheckAfter must be a positive TimeSpan."
+
+        let maxChecks =
+            match configuration["Invoicing:RenderMaxChecks"] with
+            | text when String.IsNullOrWhiteSpace text -> InvoiceRenderPolicy.defaults.MaxChecks
+            | text ->
+                match
+                    Int32.TryParse(text, Globalization.NumberStyles.None, Globalization.CultureInfo.InvariantCulture)
+                with
+                | true, value -> value
+                | _ -> invalidOp "Invoicing:RenderMaxChecks must be a non-negative integer."
+
+        { CheckAfter = checkAfter
+          MaxChecks = maxChecks }
+
+type InvoiceEffectHandler
+    (dataSource: NpgsqlDataSource, issuer: InvoiceIssuer, renderPolicy: InvoiceRenderPolicy, timeProvider: TimeProvider)
+    =
     interface IActionHandler<InvoiceEntityId, InvoiceAction, InvoiceActionError> with
         member _.HandleAsync(action: LeasedAction<InvoiceEntityId, InvoiceAction>, ct: CancellationToken) =
             match action.Work.Action with
-            | IssueSnapshot _ -> InvoiceEffects.applyIssue dataSource issuer (timeProvider.GetUtcNow()) action.Work ct
+            | IssueSnapshot _ ->
+                InvoiceEffects.applyIssue dataSource issuer renderPolicy (timeProvider.GetUtcNow()) action.Work ct
             | RenderDocument _ -> InvoiceEffects.applyRender dataSource InvoicePdf.renderer action.Work ct

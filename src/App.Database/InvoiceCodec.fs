@@ -180,6 +180,10 @@ module InvoiceCodec =
                             InvoiceId = InvoiceId.wireString id
                             Reason = ReasonCode.value reason }
                     | RenderRetryRequested -> empty "render-retry-requested-v1"
+                    | RenderReconcileRequested check ->
+                        { empty "render-reconcile-requested-v1" with
+                            Sequence = int64 check }
+                    | RenderReconcileExhausted -> empty "render-reconcile-exhausted-v1"
                     | CloseRequested -> empty "close-requested-v1"
 
                 encode "InvoiceEvent" dto)
@@ -208,6 +212,9 @@ module InvoiceCodec =
                         invoiceId "InvoiceEvent" dto
                         |> Result.bind (reasoned "InvoiceEvent" dto DocumentRenderFailed)
                     | "render-retry-requested-v1" -> Ok RenderRetryRequested
+                    | "render-reconcile-requested-v1" when dto.Sequence >= 0L && dto.Sequence <= int64 Int32.MaxValue ->
+                        Ok(RenderReconcileRequested(int dto.Sequence))
+                    | "render-reconcile-exhausted-v1" -> Ok RenderReconcileExhausted
                     | "close-requested-v1" -> Ok CloseRequested
                     | _ -> Error(error "InvoiceEvent" "Unknown invoice event.")))
 

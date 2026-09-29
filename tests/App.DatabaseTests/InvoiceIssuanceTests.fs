@@ -82,7 +82,13 @@ module InvoiceIssuanceTests =
         actionRecord commandId request (IssueSnapshot request)
 
     let private issue dataSource commandId request =
-        InvoiceEffects.applyIssue dataSource issuer issuedAt (record commandId request) CancellationToken.None
+        InvoiceEffects.applyIssue
+            dataSource
+            issuer
+            InvoiceRenderPolicy.defaults
+            issuedAt
+            (record commandId request)
+            CancellationToken.None
 
     let private scalar (dataSource: NpgsqlDataSource) (sql: string) (request: InvoiceRequest option) =
         task {
@@ -482,4 +488,98 @@ module InvoiceIssuanceTests =
             Assert.False(foreign)
             let! forOrder = InvoiceQueries.tryForOrder dataSource theirs.OrderId customer CancellationToken.None
             Assert.True(forOrder.IsNone)
+        }
+
+
+    let ``render checks are armed at issuance and back off until a document exists`` (fixture: PostgreSqlFixture) =
+        task {
+            use dataSource = AutomataStore.createDataSource fixture.ConnectionString
+            let! request = insertSnapshot dataSource [ line "3" 1 ] 3m
+            let! issued = issueAndNumber dataSource 1L request
+
+            let! armed =
+                scalar
+                    dataSource
+                    "SELECT status || ':' || checks || ':' || (due_at = issued_at + interval '10 minutes') FROM fsnix.invoice_render_checks JOIN fsnix.invoices USING (invoice_id) WHERE invoice_id=@invoice"
+                    (Some request)
+
+            Assert.Equal("pending:0:true", armed :?> string)
+
+            let makeDue () =
+                scalar
+                    dataSource
+                    "UPDATE fsnix.invoice_render_checks SET due_at = statement_timestamp() - interval '1 second' WHERE invoice_id=@invoice RETURNING 1"
+                    (Some request)
+
+            let options = LeaseOptions.defaults "render-test"
+            let! _ = makeDue ()
+
+            let! claimed =
+                LeasedLedger.claim
+                    dataSource
+                    Ledgers.invoiceRenders
+                    options
+                    Ledgers.readInvoiceRenderCheck
+                    CancellationToken.None
+
+            let row = claimed |> List.exactlyOne
+            Assert.Equal((InvoiceId.value request.InvoiceId, 0, false), (row.InvoiceId, row.Checks, row.HasDocument))
+
+            do!
+                LeasedLedger.settle
+                    dataSource
+                    Ledgers.invoiceRenders
+                    options
+                    row.InvoiceId
+                    (Settlement.RetryAfter(TimeSpan.FromMinutes 10.))
+                    CancellationToken.None
+
+            let! backedOff =
+                scalar
+                    dataSource
+                    "SELECT status || ':' || checks || ':' || (due_at > statement_timestamp()) || ':' || (lease_owner IS NULL) FROM fsnix.invoice_render_checks WHERE invoice_id=@invoice"
+                    (Some request)
+
+            Assert.Equal("pending:1:true:true", backedOff :?> string)
+
+            let! nothingDue =
+                LeasedLedger.claim
+                    dataSource
+                    Ledgers.invoiceRenders
+                    options
+                    Ledgers.readInvoiceRenderCheck
+                    CancellationToken.None
+
+            Assert.Empty(nothingDue)
+
+            let! rendered = render dataSource fakeRenderer 2L issued
+            Assert.Equal(Ok(), rendered)
+            let! _ = makeDue ()
+
+            let! again =
+                LeasedLedger.claim
+                    dataSource
+                    Ledgers.invoiceRenders
+                    options
+                    Ledgers.readInvoiceRenderCheck
+                    CancellationToken.None
+
+            Assert.True((again |> List.exactlyOne).HasDocument)
+
+            do!
+                LeasedLedger.settle
+                    dataSource
+                    Ledgers.invoiceRenders
+                    options
+                    row.InvoiceId
+                    Settlement.Done
+                    CancellationToken.None
+
+            let! finished =
+                scalar
+                    dataSource
+                    "SELECT status || ':' || checks FROM fsnix.invoice_render_checks WHERE invoice_id=@invoice"
+                    (Some request)
+
+            Assert.Equal("done:1", finished :?> string)
         }

@@ -12,6 +12,8 @@ module LedgerSql =
     let flowDeadlinesClaim = Sql.load "Ledgers/flow-deadlines-claim"
     let gatewayUnknownClaim = Sql.load "Ledgers/gateway-unknown-claim"
     let gatewayUnknownSettle = Sql.load "Ledgers/gateway-unknown-settle"
+    let invoiceRendersClaim = Sql.load "Ledgers/invoice-renders-claim"
+    let invoiceRendersSettle = Sql.load "Ledgers/invoice-renders-settle"
     let paymentDeadlinesClaim = Sql.load "Ledgers/payment-deadlines-claim"
     let paymentDeadlinesSettle = Sql.load "Ledgers/payment-deadlines-settle"
     let flowDeadlinesSettle = Sql.load "Ledgers/flow-deadlines-settle"
@@ -315,3 +317,18 @@ module Ledgers =
           OperationId = reader.GetString 2
           Deadline = reader.GetFieldValue<DateTimeOffset> 3
           GateCallbackKey = reader.GetString 4 }
+
+    /// <summary>Invoice render checks; <c>RetryAfter</c> counts one re-render request.</summary>
+    let invoiceRenders =
+        { Claim = LedgerSql.invoiceRendersClaim
+          Settle = LedgerSql.invoiceRendersSettle }
+
+    type InvoiceRenderCheck =
+        { InvoiceId: Guid
+          Checks: int
+          HasDocument: bool }
+
+    let readInvoiceRenderCheck (reader: NpgsqlDataReader) =
+        { InvoiceId = reader.GetGuid 0
+          Checks = reader.GetInt32 1
+          HasDocument = reader.GetBoolean 2 }

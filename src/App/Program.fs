@@ -242,6 +242,9 @@ module Application =
         builder.Services.AddSingleton(ReconciliationPolicy.load builder.Configuration)
         |> ignore
 
+        builder.Services.AddSingleton(InvoiceRenderPolicyConfig.load builder.Configuration)
+        |> ignore
+
         builder.Services.AddSingleton<ICartChangeSource, PostgresCartChangeSource>()
         |> ignore
 
@@ -435,6 +438,7 @@ module Application =
             .AddHostedService<ReturnWindowScanner>()
             .AddHostedService<GatewayReconciliationScanner>()
             .AddHostedService<AuthorizationExpiryScanner>()
+            .AddHostedService<InvoiceRenderScanner>()
             .AddAutomata(worker Probe.MachineKey "probes" Probe.buildWorker)
             .AddAutomata(worker AccountFlow.MachineKey "flows" AccountFlowCodec.buildWorker)
             .AddAutomata(worker Cart.MachineKey "carts" CartCodec.buildWorker)

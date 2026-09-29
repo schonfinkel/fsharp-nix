@@ -83,6 +83,25 @@ CREATE TABLE fsnix.invoice_documents (
 
 CREATE INDEX ix_invoice_documents_latest ON fsnix.invoice_documents (invoice_id, created_at DESC);
 
+-- Render recovery: armed at issuance, checked by the invoice render scanner. A render that
+-- has not produced a document by due_at is re-requested a bounded number of times.
+CREATE TABLE fsnix.invoice_render_checks (
+    invoice_id uuid PRIMARY KEY REFERENCES fsnix.invoices (invoice_id),
+    due_at timestamptz NOT NULL,
+    checks integer NOT NULL DEFAULT 0,
+    status text NOT NULL DEFAULT 'pending',
+    lease_owner text,
+    lease_until timestamptz,
+    created_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    CONSTRAINT ck_invoice_render_checks_checks CHECK (checks >= 0),
+    CONSTRAINT ck_invoice_render_checks_status CHECK (status IN ('pending', 'done')),
+    CONSTRAINT ck_invoice_render_checks_lease_pair CHECK ((lease_owner IS NULL) = (lease_until IS NULL))
+);
+
+CREATE INDEX ix_invoice_render_checks_due ON fsnix.invoice_render_checks (due_at, invoice_id)
+WHERE
+    status = 'pending';
+
 -- An invoice may only take the number its scope counter currently holds. Issuance increments
 -- the counter and inserts in one transaction, so this rejects any number not allocated there
 -- (a hand-picked, reused or MAX+1 number).

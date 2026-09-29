@@ -128,7 +128,10 @@ let private tests =
                 DatabaseTest.isolated false "failing renderer stores nothing" (fun fixture ->
                     InvoiceIssuanceTests.``a failing renderer reports a bounded reason and stores nothing`` fixture)
                 DatabaseTest.isolated false "invoice lists page and scope" (fun fixture ->
-                    InvoiceIssuanceTests.``invoice lists page by keyset and stay customer scoped`` fixture) ] ]
+                    InvoiceIssuanceTests.``invoice lists page by keyset and stay customer scoped`` fixture)
+                DatabaseTest.isolated false "render checks back off" (fun fixture ->
+                    InvoiceIssuanceTests.``render checks are armed at issuance and back off until a document exists``
+                        fixture) ] ]
     |> testSequenced
 
 [<EntryPoint>]

@@ -495,6 +495,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.ReturnWindowScanner
         health.Succeeded RuntimeComponent.GatewayReconciliationScanner
         health.Succeeded RuntimeComponent.AuthorizationExpiryScanner
+        health.Succeeded RuntimeComponent.InvoiceRenderScanner
         let snapshot = health.Snapshot()
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) snapshot)
 
@@ -2211,6 +2212,49 @@ module UnitTests =
         | NotifyOrderAuthorizationExpired decoded -> Assert.Equal(authorized.Attempt, decoded.Attempt)
         | other -> Assert.Fail $"Expected NotifyOrderAuthorizationExpired, got %A{other}."
 
+    let ``stalled invoice renders are re-requested then parked`` () =
+        let request = invoiceRequest ()
+
+        let issued: App.Invoices.IssuedInvoice =
+            { Request = request
+              Number = invoiceNumber 5L }
+
+        let pending = App.Invoices.RenderPending issued
+
+        let again =
+            expectInvoiceResolution pending (App.Invoices.RenderReconcileRequested 0)
+
+        Assert.Equal(pending, again.Next)
+        Assert.Equal([ App.Invoices.RenderDocument issued ], again.Actions)
+
+        let parked = expectInvoiceResolution pending App.Invoices.RenderReconcileExhausted
+
+        Assert.Equal(App.Invoices.RenderFailed(issued, ReasonCode.ofLiteral "render-timeout"), parked.Next)
+
+        let digest =
+            DocumentDigest.create (String('b', 64)) |> Result.defaultWith Assert.Fail
+
+        let rendered = App.Invoices.Rendered(issued, digest)
+
+        let late =
+            expectInvoiceResolution rendered (App.Invoices.RenderReconcileRequested 1)
+
+        Assert.Equal(rendered, late.Next)
+        Assert.Empty(late.Actions)
+
+        for event in
+            [ App.Invoices.RenderReconcileRequested 2
+              App.Invoices.RenderReconcileExhausted ] do
+            let json =
+                InvoiceCodec.event.Encode event
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                event,
+                InvoiceCodec.event.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
     let tests =
         testList
             "unit"
@@ -2337,4 +2381,7 @@ module UnitTests =
               testCase
                   "unknown provider calls reconcile and park"
                   ``unknown provider calls reconcile on request and park when exhausted``
-              testCase "lapsed authorizations hold the order" ``lapsed authorizations hold the order for review`` ]
+              testCase "lapsed authorizations hold the order" ``lapsed authorizations hold the order for review``
+              testCase
+                  "stalled invoice renders are re-requested"
+                  ``stalled invoice renders are re-requested then parked`` ]

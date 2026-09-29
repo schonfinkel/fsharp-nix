@@ -32,6 +32,11 @@ type InvoiceEvent =
     /// <summary>Operator recovery from a failed render. Rendering is deterministic, so a retry
     /// that succeeds stores the same content address as any earlier success would have.</summary>
     | RenderRetryRequested
+    /// <summary>The render scanner found no stored document by the deadline and re-requests the
+    /// render; <c>check</c> numbers the request so each one is a distinct command.</summary>
+    | RenderReconcileRequested of check: int
+    /// <summary>The render scanner gave up; the operator retry applies from <c>RenderFailed</c>.</summary>
+    | RenderReconcileExhausted
     | CloseRequested
 
 type InvoiceAction =
@@ -102,6 +107,11 @@ module Invoices =
         | RenderFailed _, RenderRetryRequested -> true
         | _ -> false
 
+    let private renderReconcile state event =
+        match state, event with
+        | RenderPending _, (RenderReconcileRequested _ | RenderReconcileExhausted) -> true
+        | _ -> false
+
     let private close state event =
         match state, event with
         | Rendered _, CloseRequested -> true
@@ -114,7 +124,9 @@ module Invoices =
         | SnapshotIssued _
         | IssuanceFailed _
         | DocumentRendered _
-        | DocumentRenderFailed _ -> true
+        | DocumentRenderFailed _
+        | RenderReconcileRequested _
+        | RenderReconcileExhausted -> true
         | IssuanceRetryRequested
         | RenderRetryRequested
         | CloseRequested -> false
@@ -145,6 +157,13 @@ module Invoices =
             }
 
             state "render-pending" {
+                on renderReconcile (fun state event ->
+                    match state, event with
+                    | RenderPending issued, RenderReconcileRequested _ -> [ RenderDocument issued ], state
+                    | RenderPending issued, RenderReconcileExhausted ->
+                        [], RenderFailed(issued, ReasonCode.ofLiteral "render-timeout")
+                    | _ -> [], state)
+
                 on renderResult (fun state event ->
                     match state, event with
                     | RenderPending issued, DocumentRendered(_, digest) -> [], Rendered(issued, digest)
