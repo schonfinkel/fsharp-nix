@@ -16,7 +16,15 @@ CREATE TABLE fsnix.shipments (
     allocation_id uuid NOT NULL UNIQUE,
     order_id text NOT NULL,
     carrier_reference text,
+    capture_id uuid NOT NULL UNIQUE,
+    merchandise numeric(20, 8) NOT NULL,
+    shipping numeric(20, 8) NOT NULL,
+    tax numeric(20, 8) NOT NULL,
+    total numeric(20, 8) NOT NULL,
+    currency text NOT NULL,
+    lines jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
+    CONSTRAINT ck_shipments_allocation CHECK (merchandise >= 0 AND shipping >= 0 AND tax >= 0 AND total = merchandise + shipping + tax AND currency ~ '^[A-Z]{3}$'),
     CONSTRAINT ck_shipments_carrier_reference_shape CHECK (carrier_reference IS NULL OR (CHAR_LENGTH(carrier_reference) BETWEEN 1 AND 256 AND carrier_reference ~ '^[A-Za-z0-9:/_-]+$'))
 );
 

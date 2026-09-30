@@ -62,7 +62,7 @@ module ShipmentOperationTests =
 
             use command =
                 new NpgsqlCommand(
-                    "INSERT INTO fsnix.shipments(shipment_id,allocation_id,order_id) VALUES(@shipment,@allocation,@order) ON CONFLICT DO NOTHING",
+                    "INSERT INTO fsnix.shipments(shipment_id,allocation_id,order_id,capture_id,merchandise,shipping,tax,total,currency,lines) VALUES(@shipment,@allocation,@order,gen_random_uuid(),0,0,0,0,'USD','[]') ON CONFLICT DO NOTHING",
                     connection
                 )
 

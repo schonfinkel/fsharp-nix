@@ -1653,7 +1653,8 @@ module UnitTests =
           Lines =
             [ { OrderLineId = lineId
                 Quantity = 1
-                RefundAmount = Money.create 10m "USD" |> Result.defaultWith Assert.Fail } ] }
+                Merchandise = Money.create 9m "USD" |> Result.defaultWith Assert.Fail
+                Tax = Money.create 1m "USD" |> Result.defaultWith Assert.Fail } ] }
 
     let private expectReturnResolution state event =
         match Chart.resolve App.Returns.Returns.chartValue state event with

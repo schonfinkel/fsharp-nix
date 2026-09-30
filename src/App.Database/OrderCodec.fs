@@ -50,7 +50,8 @@ module OrderWire =
     type ReturnLineDto =
         { LineId: string
           Quantity: int
-          RefundAmount: string }
+          Merchandise: string
+          Tax: string }
 
     [<CLIMutable>]
     type ReturnDto =
@@ -423,7 +424,8 @@ module OrderCodec =
             |> List.map (fun line ->
                 ({ LineId = OrderLineId.wireString line.OrderLineId
                    Quantity = line.Quantity
-                   RefundAmount = Money.wireAmount line.RefundAmount }
+                   Merchandise = Money.wireAmount line.Merchandise
+                   Tax = Money.wireAmount line.Tax }
                 : OrderWire.ReturnLineDto))
             |> List.toArray
           Status = entry.Status }
@@ -445,12 +447,15 @@ module OrderCodec =
                             guid name line.LineId
                             |> Result.bind (OrderLineId.create >> Result.mapError (codecError name))
                             |> Result.bind (fun lineId ->
-                                Money.tryOfWire line.RefundAmount dto.Currency
-                                |> Result.mapError (codecError name)
-                                |> Result.map (fun amount ->
-                                    { OrderLineId = lineId
-                                      Quantity = line.Quantity
-                                      RefundAmount = amount })))
+                                Money.tryOfWire line.Merchandise dto.Currency
+                                |> Result.bind (fun merchandise ->
+                                    Money.tryOfWire line.Tax dto.Currency
+                                    |> Result.map (fun tax ->
+                                        { OrderLineId = lineId
+                                          Quantity = line.Quantity
+                                          Merchandise = merchandise
+                                          Tax = tax }))
+                                |> Result.mapError (codecError name)))
                         |> sequenceResults
 
                     lines

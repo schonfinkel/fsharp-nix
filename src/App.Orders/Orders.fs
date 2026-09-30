@@ -482,13 +482,16 @@ module Orders =
                     let priceValid =
                         original
                         |> Option.exists (fun item ->
-                            Money.currencyCode item.UnitPrice = Money.currencyCode line.RefundAmount
-                            && Money.amount line.RefundAmount > 0m
-                            && line.RefundAmount
-                               <= Money.multiply item.UnitPrice (decimal line.Quantity)
-                                  + Money.multiply
-                                      fulfilment.PlacedOrder.Reserved.Pending.Totals.Tax
-                                      (decimal line.Quantity / decimal (Quantity.value item.Quantity)))
+                            // Merchandise must be exactly the invoiced price, so the credit note
+                            // (re-priced from the invoice line) reverses exactly what is refunded.
+                            Money.currencyCode item.UnitPrice = Money.currencyCode line.Merchandise
+                            && line.Merchandise = Money.multiply item.UnitPrice (decimal line.Quantity)
+                            && Money.amount line.Merchandise > 0m
+                            && Money.amount line.Tax >= 0m
+                            && line.Tax
+                               <= Money.multiply
+                                   fulfilment.PlacedOrder.Reserved.Pending.Totals.Tax
+                                   (decimal line.Quantity / decimal (Quantity.value item.Quantity)))
 
                     delivered > 0 && line.Quantity + reserved <= delivered && priceValid))
         | _ -> false

@@ -726,7 +726,8 @@ module OrderEndpoints =
                                                   Lines =
                                                     [ { OrderLineId = line.LineId
                                                         Quantity = amount
-                                                        RefundAmount = merchandise + tax } ] }
+                                                        Merchandise = merchandise
+                                                        Tax = tax } ] }
 
                                             let! outcome =
                                                 Machine.send

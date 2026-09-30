@@ -476,6 +476,36 @@ module OrderEffects =
                     |> ignore
 
                     insert.Parameters.AddWithValue("order", orderEntity) |> ignore
+
+                    // The exact capture split, so a cancellation credit note can reverse it.
+                    let allocation = shipment.Allocation
+
+                    insert.Parameters.AddWithValue("capture", CaptureId.value shipment.CaptureId)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("merchandise", Money.amount allocation.Merchandise)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("shipping", Money.amount allocation.Shipping)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("tax", Money.amount allocation.Tax) |> ignore
+                    insert.Parameters.AddWithValue("total", Money.amount allocation.Total) |> ignore
+
+                    insert.Parameters.AddWithValue("currency", Money.currencyCode allocation.Total)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue(
+                        "lines",
+                        Text.Json.JsonSerializer.Serialize(
+                            allocation.Lines
+                            |> List.map (fun line ->
+                                {| lineId = OrderLineId.wireString line.LineId
+                                   quantity = line.Quantity |})
+                        )
+                    )
+                    |> ignore
+
                     let! _ = insert.ExecuteNonQueryAsync ct
 
                     let shipmentRequest =
@@ -655,7 +685,11 @@ module OrderEffects =
                         |> ignore
 
                         row.Parameters.AddWithValue("quantity", line.Quantity) |> ignore
-                        row.Parameters.AddWithValue("amount", Money.amount line.RefundAmount) |> ignore
+
+                        row.Parameters.AddWithValue("amount", Money.amount (ReturnLine.refundAmount line))
+                        |> ignore
+
+                        row.Parameters.AddWithValue("tax", Money.amount line.Tax) |> ignore
                         row.Parameters.AddWithValue("currency", request.Currency) |> ignore
                         let! _ = row.ExecuteNonQueryAsync ct
                         ()
