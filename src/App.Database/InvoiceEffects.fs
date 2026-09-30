@@ -22,11 +22,15 @@ module InvoiceRenderPolicy =
 
 /// <summary>The issuing legal entity, snapshotted onto every invoice at issuance.</summary>
 type InvoiceIssuer =
-    { LegalEntity: string
-      Series: string
-      Name: string
-      Address: string
-      TaxId: string }
+    {
+        LegalEntity: string
+        Series: string
+        /// <summary>Series for credit notes, numbered in their own gapless sequence.</summary>
+        CreditSeries: string
+        Name: string
+        Address: string
+        TaxId: string
+    }
 
 [<RequireQualifiedAccess>]
 module InvoiceIssuer =
@@ -35,6 +39,11 @@ module InvoiceIssuer =
             Error "Invoicing:LegalEntity must be a short upper-case code."
         elif not (InvoiceNumber.validScope issuer.Series) then
             Error "Invoicing:Series must be a short upper-case code."
+        elif
+            not (InvoiceNumber.validScope issuer.CreditSeries)
+            || issuer.CreditSeries = issuer.Series
+        then
+            Error "Invoicing:CreditSeries must be a short upper-case code distinct from the invoice series."
         elif
             String.IsNullOrWhiteSpace issuer.Name
             || String.IsNullOrWhiteSpace issuer.Address
@@ -60,8 +69,20 @@ module InvoiceSql =
     let insertRenderCheck = Sql.load "Invoices/insert-render-check"
     let insertSnapshot = Sql.load "Invoices/insert-snapshot"
     let latestDocument = Sql.load "Invoices/latest-document"
+    let creditsForOrder = Sql.load "Invoices/credits-for-order"
     let list = Sql.load "Invoices/list"
     let snapshotCheck = Sql.load "Invoices/snapshot-check"
+
+[<RequireQualifiedAccess>]
+module CreditNoteSql =
+    let cancellationLines = Sql.load "CreditNotes/cancellation-lines"
+    let cancellationTotals = Sql.load "CreditNotes/cancellation-totals"
+    let insertHeader = Sql.load "CreditNotes/insert-header"
+    let insertLine = Sql.load "CreditNotes/insert-line"
+    let original = Sql.load "CreditNotes/original"
+    let returnLines = Sql.load "CreditNotes/return-lines"
+    let returnTotals = Sql.load "CreditNotes/return-totals"
+    let settledRefund = Sql.load "CreditNotes/settled-refund"
 
 /// <summary>One rendered invoice line, read back from the immutable snapshot.</summary>
 type InvoiceDocumentLine =
@@ -74,20 +95,24 @@ type InvoiceDocumentLine =
 /// <summary>Everything a renderer needs, read from <c>fsnix.invoices</c>/<c>invoice_lines</c> only
 /// (never from mutable order or catalog state), so re-rendering reproduces the issued content.</summary>
 type InvoiceDocument =
-    { InvoiceId: InvoiceId
-      Number: InvoiceNumber
-      IssuedAt: DateTimeOffset
-      SellerName: string
-      SellerAddress: string
-      SellerTaxId: string
-      BuyerEmail: string
-      BillingAddress: string list
-      Lines: InvoiceDocumentLine list
-      Subtotal: decimal
-      Shipping: decimal
-      Tax: decimal
-      Total: decimal
-      Currency: string }
+    {
+        InvoiceId: InvoiceId
+        Number: InvoiceNumber
+        IssuedAt: DateTimeOffset
+        SellerName: string
+        SellerAddress: string
+        SellerTaxId: string
+        BuyerEmail: string
+        BillingAddress: string list
+        Lines: InvoiceDocumentLine list
+        Subtotal: decimal
+        Shipping: decimal
+        Tax: decimal
+        Total: decimal
+        Currency: string
+        /// <summary>For a credit note, the number of the invoice it credits.</summary>
+        Credits: InvoiceNumber option
+    }
 
 /// <summary>A named PDF template. Bump <c>Name</c> whenever the output changes; stored documents
 /// keep the renderer that produced them.</summary>
@@ -148,7 +173,17 @@ module InvoiceDocuments =
                           Shipping = reader.GetDecimal 11
                           Tax = reader.GetDecimal 12
                           Total = reader.GetDecimal 13
-                          Currency = reader.GetString 14 }
+                          Currency = reader.GetString 14
+                          Credits =
+                            if reader.IsDBNull 15 then
+                                None
+                            else
+                                InvoiceNumber.create
+                                    (reader.GetString 15)
+                                    (reader.GetString 16)
+                                    (reader.GetString 17)
+                                    (reader.GetInt64 18)
+                                |> Result.toOption }
 
                     do! reader.CloseAsync()
 
@@ -249,12 +284,12 @@ module InvoiceEffects =
 
     /// <summary>Locks the scope's counter row (creating it on first use) and returns the next
     /// number. The row lock serializes concurrent issuers in the same scope until commit.</summary>
-    let private allocate (connection: NpgsqlConnection) tx (issuer: InvoiceIssuer) fiscalPeriod ct =
+    let private allocate (connection: NpgsqlConnection) tx (issuer: InvoiceIssuer) (series: string) fiscalPeriod ct =
         task {
             use command = new NpgsqlCommand(InvoiceSql.allocateNumber, connection, tx)
 
             command.Parameters.AddWithValue("entity", issuer.LegalEntity) |> ignore
-            command.Parameters.AddWithValue("series", issuer.Series) |> ignore
+            command.Parameters.AddWithValue("series", series) |> ignore
             command.Parameters.AddWithValue("period", fiscalPeriod) |> ignore
             let! value = command.ExecuteScalarAsync ct
             return value :?> int64
@@ -297,6 +332,195 @@ module InvoiceEffects =
             command.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
             let! _ = command.ExecuteNonQueryAsync ct
             return ()
+        }
+
+    /// <summary>One credited line, priced exactly as the original invoice priced it.</summary>
+    type private CreditLine =
+        { OrderLineId: Guid
+          ProductId: Guid
+          Sku: string
+          Description: string
+          UnitPrice: decimal
+          Quantity: int }
+
+    type private CreditDraft =
+        { OriginalInvoiceId: Guid
+          RefundId: Guid
+          Lines: CreditLine list
+          Shipping: decimal
+          Tax: decimal
+          Currency: string }
+
+    let private readCreditLines (command: NpgsqlCommand) ct =
+        task {
+            use! reader = command.ExecuteReaderAsync(ct: CancellationToken)
+            let lines = Collections.Generic.List<CreditLine>()
+
+            while! reader.ReadAsync ct do
+                lines.Add
+                    { OrderLineId = reader.GetGuid 0
+                      ProductId = reader.GetGuid 1
+                      Sku = reader.GetString 2
+                      Description = reader.GetString 3
+                      UnitPrice = reader.GetDecimal 4
+                      Quantity = reader.GetInt32 5 }
+
+            return List.ofSeq lines
+        }
+
+    /// <summary>
+    /// Assembles and checks a credit note before any number is allocated: the original invoice
+    /// must exist, the refund must be settled, the reversed lines must all be on the original
+    /// invoice, and merchandise plus the recorded shipping and tax must equal the refunded amount
+    /// exactly. Returns the failure reason otherwise.
+    /// </summary>
+    let private prepareCredit (connection: NpgsqlConnection) tx (request: InvoiceRequest) (credit: CreditSource) ct =
+        task {
+            let refund = RefundId.value credit.RefundId
+
+            let command sql (bind: NpgsqlCommand -> unit) =
+                let command = new NpgsqlCommand(sql, connection, tx)
+                command.Parameters.AddWithValue("order", request.OrderId) |> ignore
+                bind command
+                command
+
+            use original = command CreditNoteSql.original ignore
+            let! originalRow = original.ExecuteReaderAsync(ct: CancellationToken)
+            let! hasOriginal = originalRow.ReadAsync ct
+
+            let originalInvoice =
+                if hasOriginal then
+                    Some(originalRow.GetGuid 0, originalRow.GetString 1)
+                else
+                    None
+
+            do! originalRow.DisposeAsync()
+
+            use settled =
+                command CreditNoteSql.settledRefund (fun c -> c.Parameters.AddWithValue("refund", refund) |> ignore)
+
+            let! settledRow = settled.ExecuteReaderAsync(ct: CancellationToken)
+            let! hasSettled = settledRow.ReadAsync ct
+
+            let refunded =
+                if hasSettled then
+                    Some(settledRow.GetDecimal 0, settledRow.GetString 1)
+                else
+                    None
+
+            do! settledRow.DisposeAsync()
+
+            match originalInvoice, refunded with
+            | None, _ -> return Error(ReasonCode.ofLiteral "original-invoice-missing")
+            | _, None -> return Error(ReasonCode.ofLiteral "refund-not-settled")
+            | Some(originalId, invoiceCurrency), Some(refundedAmount, refundCurrency) ->
+                let totalsSql, linesSql, bindSource =
+                    match credit.Origin with
+                    | OrderCancellation _ ->
+                        CreditNoteSql.cancellationTotals,
+                        CreditNoteSql.cancellationLines,
+                        (fun (c: NpgsqlCommand) -> c.Parameters.AddWithValue("refund", refund) |> ignore)
+                    | InspectedReturn(_, returnId) ->
+                        CreditNoteSql.returnTotals,
+                        CreditNoteSql.returnLines,
+                        (fun (c: NpgsqlCommand) -> c.Parameters.AddWithValue("return", returnId) |> ignore)
+
+                use totals = command totalsSql bindSource
+                let! totalsRow = totals.ExecuteReaderAsync(ct: CancellationToken)
+                let! hasTotals = totalsRow.ReadAsync ct
+
+                let source =
+                    if hasTotals && not (totalsRow.IsDBNull 2) then
+                        Some(totalsRow.GetDecimal 0, totalsRow.GetDecimal 1, totalsRow.GetString 2)
+                    else
+                        None
+
+                do! totalsRow.DisposeAsync()
+
+                match source with
+                | None -> return Error(ReasonCode.ofLiteral "credit-source-missing")
+                | Some(shipping, tax, sourceCurrency) ->
+                    use lines =
+                        command linesSql (fun c ->
+                            bindSource c
+                            c.Parameters.AddWithValue("original", originalId) |> ignore)
+
+                    let! creditLines = readCreditLines lines ct
+
+                    let merchandise =
+                        creditLines |> List.sumBy (fun line -> line.UnitPrice * decimal line.Quantity)
+
+                    if creditLines.IsEmpty then
+                        return Error(ReasonCode.ofLiteral "credit-lines-missing")
+                    elif sourceCurrency <> invoiceCurrency || refundCurrency <> invoiceCurrency then
+                        return Error(ReasonCode.ofLiteral "credit-currency-mismatch")
+                    elif merchandise + shipping + tax <> refundedAmount then
+                        return Error(ReasonCode.ofLiteral "credit-amount-mismatch")
+                    else
+                        return
+                            Ok
+                                { OriginalInvoiceId = originalId
+                                  RefundId = refund
+                                  Lines = creditLines
+                                  Shipping = shipping
+                                  Tax = tax
+                                  Currency = invoiceCurrency }
+        }
+
+    let private insertCredit
+        (connection: NpgsqlConnection)
+        tx
+        (record: ActionRecord<InvoiceEntityId, InvoiceAction>)
+        (request: InvoiceRequest)
+        (draft: CreditDraft)
+        (number: InvoiceNumber)
+        (issuedAt: DateTimeOffset)
+        ct
+        =
+        task {
+            let subtotal =
+                draft.Lines |> List.sumBy (fun line -> line.UnitPrice * decimal line.Quantity)
+
+            use header = new NpgsqlCommand(CreditNoteSql.insertHeader, connection, tx)
+
+            let add (name: string) (value: obj) =
+                header.Parameters.AddWithValue(name, value) |> ignore
+
+            add "invoice" (InvoiceId.value request.InvoiceId)
+            add "original" draft.OriginalInvoiceId
+            add "refund" draft.RefundId
+            add "entity" number.LegalEntity
+            add "series" number.Series
+            add "period" number.FiscalPeriod
+            add "number" number.Sequence
+            add "issued_at" issuedAt
+            add "subtotal" subtotal
+            add "shipping" draft.Shipping
+            add "tax" draft.Tax
+            add "total" (subtotal + draft.Shipping + draft.Tax)
+            add "machine" (MachineId.value record.MachineId)
+            add "command" (CommandId.value record.CommandId)
+            add "ordinal" record.Ordinal
+            let! _ = header.ExecuteNonQueryAsync ct
+
+            for index, line in List.indexed draft.Lines do
+                use row = new NpgsqlCommand(CreditNoteSql.insertLine, connection, tx)
+
+                let add (name: string) (value: obj) =
+                    row.Parameters.AddWithValue(name, value) |> ignore
+
+                add "invoice" (InvoiceId.value request.InvoiceId)
+                add "line_number" (index + 1)
+                add "order_line" line.OrderLineId
+                add "product" line.ProductId
+                add "sku" line.Sku
+                add "description" line.Description
+                add "unit_price" line.UnitPrice
+                add "quantity" line.Quantity
+                add "line_amount" (line.UnitPrice * decimal line.Quantity)
+                add "currency" draft.Currency
+                let! _ = row.ExecuteNonQueryAsync ct
+                ()
         }
 
     let private report connection tx record purpose (invoiceId: InvoiceId) event ct =
@@ -347,18 +571,63 @@ module InvoiceEffects =
                         | Some(Ok number) -> return! issued number
                         | Some(Error reason) -> return! failed reason
                         | None ->
-                            match! snapshotProblem connection tx request token with
-                            | Some reason -> return! failed reason
-                            | None ->
-                                let period = InvoiceIssuer.fiscalPeriod issuedAt
-                                let! sequence = allocate connection tx issuer period token
+                            // Both kinds share numbering, render-check arming and the callback;
+                            // only the checks and the rows written differ.
+                            let! prepared =
+                                match request.Credit with
+                                | None ->
+                                    task {
+                                        match! snapshotProblem connection tx request token with
+                                        | Some reason -> return Error reason
+                                        | None ->
+                                            return
+                                                Ok(
+                                                    issuer.Series,
+                                                    fun number ->
+                                                        insertSnapshot
+                                                            connection
+                                                            tx
+                                                            issuer
+                                                            record
+                                                            request
+                                                            number
+                                                            issuedAt
+                                                            token
+                                                )
+                                    }
+                                | Some credit ->
+                                    task {
+                                        match! prepareCredit connection tx request credit token with
+                                        | Error reason -> return Error reason
+                                        | Ok draft ->
+                                            return
+                                                Ok(
+                                                    issuer.CreditSeries,
+                                                    fun number ->
+                                                        insertCredit
+                                                            connection
+                                                            tx
+                                                            record
+                                                            request
+                                                            draft
+                                                            number
+                                                            issuedAt
+                                                            token
+                                                )
+                                    }
 
-                                match InvoiceNumber.create issuer.LegalEntity issuer.Series period sequence with
+                            match prepared with
+                            | Error reason -> return! failed reason
+                            | Ok(series, write) ->
+                                let period = InvoiceIssuer.fiscalPeriod issuedAt
+                                let! sequence = allocate connection tx issuer series period token
+
+                                match InvoiceNumber.create issuer.LegalEntity series period sequence with
                                 | Error _ when sequence > InvoiceNumber.MaxSequence ->
                                     return! failed (ReasonCode.ofLiteral "invoice-sequence-exhausted")
                                 | Error _ -> return! failed (ReasonCode.ofLiteral "invoice-number-invalid")
                                 | Ok number ->
-                                    do! insertSnapshot connection tx issuer record request number issuedAt token
+                                    do! write number
 
                                     use check = new NpgsqlCommand(InvoiceSql.insertRenderCheck, connection, tx)
 

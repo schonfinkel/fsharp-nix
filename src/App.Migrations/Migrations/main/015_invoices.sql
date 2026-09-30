@@ -33,14 +33,23 @@ CREATE TABLE fsnix.invoices (
     source_machine_id text NOT NULL,
     source_command_id bigint NOT NULL,
     source_ordinal integer NOT NULL,
+    kind text NOT NULL DEFAULT 'invoice',
+    credits_invoice_id uuid REFERENCES fsnix.invoices (invoice_id),
+    refund_id uuid UNIQUE,
     created_at timestamptz NOT NULL DEFAULT STATEMENT_TIMESTAMP(),
-    CONSTRAINT uq_invoices_order UNIQUE (order_id),
+    CONSTRAINT ck_invoices_kind CHECK (kind IN ('invoice', 'credit-note')),
+    CONSTRAINT ck_invoices_credit_reference CHECK ((kind = 'credit-note') = (credits_invoice_id IS NOT NULL AND refund_id IS NOT NULL)),
     CONSTRAINT uq_invoices_number UNIQUE (legal_entity, series, fiscal_period, number),
     CONSTRAINT fk_invoices_counter FOREIGN KEY (legal_entity, series, fiscal_period) REFERENCES fsnix.invoice_counters (legal_entity, series, fiscal_period),
     CONSTRAINT ck_invoices_number CHECK (number BETWEEN 1 AND 99999999),
     CONSTRAINT ck_invoices_amounts CHECK (subtotal_amount >= 0 AND shipping_amount >= 0 AND tax_amount >= 0 AND total_amount = subtotal_amount + shipping_amount + tax_amount),
     CONSTRAINT ck_invoices_currency CHECK (currency ~ '^[A-Z]{3}$')
 );
+
+-- One invoice per order; any number of credit notes against it.
+CREATE UNIQUE INDEX uq_invoices_order ON fsnix.invoices (order_id)
+WHERE
+    kind = 'invoice';
 
 CREATE INDEX ix_invoices_customer ON fsnix.invoices (customer_id, issued_at DESC, invoice_id DESC);
 

@@ -42,6 +42,10 @@ module InvoiceEndpoints =
 
     let private row (invoice: InvoiceListRow) status downloadUrl retry =
         { Number = InvoiceNumber.display invoice.Number
+          Kind =
+            match invoice.Credits with
+            | None -> "Invoice"
+            | Some credited -> $"Credit note ({InvoiceNumber.display credited})"
           IssuedOn = invoice.IssuedAt.UtcDateTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
           Total =
             Money.create invoice.Total invoice.Currency

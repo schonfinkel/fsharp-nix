@@ -17,6 +17,7 @@ module InvoiceIssuanceTests =
     let private issuer =
         { LegalEntity = "FSNIX"
           Series = "INV"
+          CreditSeries = "CN"
           Name = "fsnix Store"
           Address = "1 Example Street"
           TaxId = "TAX-1" }
@@ -582,4 +583,249 @@ module InvoiceIssuanceTests =
                     (Some request)
 
             Assert.Equal("done:1", finished :?> string)
+        }
+
+    /// <summary>Runs one SQL statement with named parameters (test seeding only).</summary>
+    let private exec (dataSource: NpgsqlDataSource) (sql: string) (parameters: (string * obj) list) =
+        task {
+            use connection = dataSource.CreateConnection()
+            do! connection.OpenAsync()
+            use command = new NpgsqlCommand(sql, connection)
+
+            for name, value in parameters do
+                command.Parameters.AddWithValue(name, value) |> ignore
+
+            let! value = command.ExecuteScalarAsync()
+            return value
+        }
+
+    let private settleRefund dataSource (refundId: Guid) (orderId: string) (amount: decimal) =
+        exec
+            dataSource
+            "INSERT INTO fsnix.refund_allocations(allocation_id, refund_id, order_id, amount, currency, status) VALUES (gen_random_uuid(), @refund, @order, @amount, 'USD', 'settled')"
+            [ "refund", box refundId; "order", box orderId; "amount", box amount ]
+
+    let private issueCredit dataSource commandId (request: InvoiceRequest) =
+        InvoiceEffects.applyIssue
+            dataSource
+            issuer
+            InvoiceRenderPolicy.defaults
+            issuedAt
+            (actionRecord commandId request (IssueSnapshot request))
+            CancellationToken.None
+
+    let ``credit notes reverse exact lines in their own gapless series`` (fixture: PostgreSqlFixture) =
+        task {
+            use dataSource = AutomataStore.createDataSource fixture.ConnectionString
+            let customer = Guid.NewGuid()
+            let! invoice = insertSnapshotFor customer dataSource [ line "10.00" 2; line "2.50" 1 ] 22.5m
+            let! _ = issueAndNumber dataSource 1L invoice
+
+            let! firstLine =
+                exec
+                    dataSource
+                    "SELECT order_line_id FROM fsnix.invoice_lines WHERE invoice_id=@invoice AND line_number=1"
+                    [ "invoice", box (InvoiceId.value invoice.InvoiceId) ]
+
+            let! secondLine =
+                exec
+                    dataSource
+                    "SELECT order_line_id FROM fsnix.invoice_lines WHERE invoice_id=@invoice AND line_number=2"
+                    [ "invoice", box (InvoiceId.value invoice.InvoiceId) ]
+
+            // A return of one unit of line 1: 10.00 merchandise plus its recorded 0.80 tax.
+            let returnId = Guid.NewGuid()
+
+            let returnRefund =
+                RefundId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+            let! _ =
+                exec
+                    dataSource
+                    "INSERT INTO fsnix.return_requests(return_id, authorization_id, order_id, window_ends_at) VALUES (@return, @return, @order, statement_timestamp() + interval '30 days')"
+                    [ "return", box returnId; "order", box invoice.OrderId ]
+
+            let! _ =
+                exec
+                    dataSource
+                    "INSERT INTO fsnix.return_lines(return_id, order_line_id, quantity, refunded_amount, refunded_tax, currency) VALUES (@return, @line, 1, 10.80, 0.80, 'USD')"
+                    [ "return", box returnId; "line", firstLine ]
+
+            let! _ = settleRefund dataSource (RefundId.value returnRefund) invoice.OrderId 10.80m
+
+            let returnCredit =
+                InvoiceRequest.forCredit returnRefund (InspectedReturn(invoice.OrderId, returnId))
+                |> Result.defaultWith Assert.Fail
+
+            let! issuedReturnCredit = issueCredit dataSource 2L returnCredit
+            Assert.Equal(Ok(), issuedReturnCredit)
+
+            // A cancelled shipment carrying line 2 with its exact captured shipping and tax.
+            let cancelRefund =
+                RefundId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+            let! _ =
+                exec
+                    dataSource
+                    "INSERT INTO fsnix.shipments(shipment_id, allocation_id, order_id, capture_id, merchandise, shipping, tax, total, currency, lines) VALUES (gen_random_uuid(), gen_random_uuid(), @order, @capture, 2.50, 5.00, 0.60, 8.10, 'USD', jsonb_build_array(jsonb_build_object('lineId', @line::text, 'quantity', 1)))"
+                    [ "order", box invoice.OrderId
+                      "capture", box (RefundId.value cancelRefund)
+                      "line", secondLine ]
+
+            let! _ = settleRefund dataSource (RefundId.value cancelRefund) invoice.OrderId 8.10m
+
+            let cancelCredit =
+                InvoiceRequest.forCredit cancelRefund (OrderCancellation invoice.OrderId)
+                |> Result.defaultWith Assert.Fail
+
+            let! issuedCancelCredit = issueCredit dataSource 3L cancelCredit
+            Assert.Equal(Ok(), issuedCancelCredit)
+
+            let describe (request: InvoiceRequest) =
+                scalar
+                    dataSource
+                    """SELECT i.kind || '|' || i.series || '-' || i.number || '|' || (i.credits_invoice_id = o.invoice_id)
+                              || '|' || (i.customer_id = o.customer_id) || '|' || i.subtotal_amount || '|' || i.shipping_amount
+                              || '|' || i.tax_amount || '|' || i.total_amount || '|'
+                              || (SELECT string_agg(l.quantity || 'x' || l.unit_price, ',' ORDER BY l.line_number)
+                                    FROM fsnix.invoice_lines l WHERE l.invoice_id = i.invoice_id)
+                       FROM fsnix.invoices i JOIN fsnix.invoices o ON o.invoice_id = i.credits_invoice_id
+                       WHERE i.invoice_id = @invoice"""
+                    (Some request)
+
+            let! returnRow = describe returnCredit
+
+            Assert.Equal(
+                "credit-note|CN-1|true|true|10.00000000|0.00000000|0.80000000|10.80000000|1x10.00000000",
+                returnRow :?> string
+            )
+
+            let! cancelRow = describe cancelCredit
+
+            Assert.Equal(
+                "credit-note|CN-2|true|true|2.50000000|5.00000000|0.60000000|8.10000000|1x2.50000000",
+                cancelRow :?> string
+            )
+
+            // Credit notes do not consume invoice numbers: the next invoice is still INV 2.
+            let! nextInvoice = insertSnapshot dataSource [ line "1" 1 ] 1m
+            let! next = issueAndNumber dataSource 4L nextInvoice
+            Assert.Equal(2L, next.Number.Sequence)
+
+            // Redelivery and a fresh command for the same refund resolve to the same credit note.
+            let! redelivered = issueCredit dataSource 2L returnCredit
+            let! reRequested = issueCredit dataSource 99L returnCredit
+            Assert.Equal(Ok(), redelivered)
+            Assert.Equal(Ok(), reRequested)
+
+            let! creditCounter =
+                scalar
+                    dataSource
+                    "SELECT last_number FROM fsnix.invoice_counters WHERE series='CN' AND fiscal_period='2026-09'"
+                    None
+
+            Assert.Equal(2L, creditCounter :?> int64)
+
+            // A refund whose amount does not match its source fails without taking a number.
+            let badRefund = RefundId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+            let! _ = settleRefund dataSource (RefundId.value badRefund) invoice.OrderId 99m
+
+            let badCredit =
+                InvoiceRequest.forCredit badRefund (InspectedReturn(invoice.OrderId, returnId))
+                |> Result.defaultWith Assert.Fail
+
+            let! _ = issueCredit dataSource 5L badCredit
+            let! badEvents = callbacks dataSource badCredit
+
+            Assert.Equal<InvoiceEvent list>(
+                [ IssuanceFailed(badCredit.InvoiceId, ReasonCode.ofLiteral "credit-amount-mismatch") ],
+                badEvents
+            )
+
+            // No invoice for the order: the credit note waits for review instead of numbering.
+            let! uninvoiced = insertSnapshot dataSource [ line "1" 1 ] 1m
+
+            let orphanRefund =
+                RefundId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+            let! _ = settleRefund dataSource (RefundId.value orphanRefund) uninvoiced.OrderId 1m
+
+            let orphan =
+                InvoiceRequest.forCredit orphanRefund (OrderCancellation uninvoiced.OrderId)
+                |> Result.defaultWith Assert.Fail
+
+            let! _ = issueCredit dataSource 6L orphan
+            let! orphanEvents = callbacks dataSource orphan
+
+            Assert.Equal<InvoiceEvent list>(
+                [ IssuanceFailed(orphan.InvoiceId, ReasonCode.ofLiteral "original-invoice-missing") ],
+                orphanEvents
+            )
+
+            let! stillTwo =
+                scalar
+                    dataSource
+                    "SELECT last_number FROM fsnix.invoice_counters WHERE series='CN' AND fiscal_period='2026-09'"
+                    None
+
+            Assert.Equal(2L, stillTwo :?> int64)
+
+            // Credit notes list next to invoices, naming what they credit, and render as such.
+            let! page = InvoiceQueries.list dataSource (Some customer) None 10 CancellationToken.None
+
+            let kinds =
+                page.Rows
+                |> List.map (fun row ->
+                    InvoiceNumber.display row.Number, row.Credits |> Option.map InvoiceNumber.display)
+                |> List.sort
+
+            Assert.Equal<(string * string option) list>(
+                [ "CN-2026-09-00000001", Some "INV-2026-09-00000001"
+                  "CN-2026-09-00000002", Some "INV-2026-09-00000001"
+                  "INV-2026-09-00000001", None ],
+                kinds
+            )
+
+            let! loaded = InvoiceDocuments.load dataSource returnCredit.InvoiceId CancellationToken.None
+
+            let document =
+                loaded |> Option.defaultWith (fun () -> Assert.Fail "Expected the credit note.")
+
+            Assert.Equal(Some "INV-2026-09-00000001", document.Credits |> Option.map InvoiceNumber.display)
+            Assert.Equal(10.80m, document.Total)
+        }
+
+    let ``a settled refund requests its credit note with the origin callback`` (fixture: PostgreSqlFixture) =
+        task {
+            use dataSource = AutomataStore.createDataSource fixture.ConnectionString
+            let orderId = $"order:{Guid.NewGuid():D}"
+            let refundGuid = Guid.NewGuid()
+
+            let request: RefundRequest =
+                { RefundId = RefundId.create refundGuid |> Result.defaultWith Assert.Fail
+                  AllocationId = RefundAllocationId.create refundGuid |> Result.defaultWith Assert.Fail
+                  OperationId =
+                    PaymentOperationId.create $"refund:cancel:{refundGuid:D}"
+                    |> Result.defaultWith Assert.Fail
+                  Origin = OrderCancellation orderId
+                  Amount = Money.create 8.10m "USD" |> Result.defaultWith Assert.Fail }
+
+            let record =
+                { MachineId = machineId App.Refunds.Refunds.MachineKey
+                  EntityId = App.Refunds.Refunds.refundEntityId request.RefundId
+                  CommandId = CommandId.ofInt64 1L
+                  Epoch = Epoch.ofUInt64 1UL
+                  Ordinal = 0
+                  Action = App.Refunds.NotifyOriginSucceeded request }
+
+            let! notified = RefundEffects.applyLocal dataSource record CancellationToken.None
+            Assert.Equal(Ok(), notified)
+
+            let! destinations =
+                scalar
+                    dataSource
+                    $"SELECT string_agg(machine_id || ' ' || entity_id, ',' ORDER BY machine_id) FROM fsnix.integration_outbox WHERE callback_key LIKE 'xmsg:v1:refunds:%%'"
+                    None
+
+            Assert.Equal($"invoices invoice:{refundGuid:D},orders {orderId}", destinations :?> string)
         }

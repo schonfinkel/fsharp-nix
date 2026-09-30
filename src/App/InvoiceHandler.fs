@@ -19,6 +19,7 @@ module InvoiceIssuerConfig =
     let load (configuration: IConfiguration) =
         { LegalEntity = value configuration "Invoicing:LegalEntity" "FSNIX"
           Series = value configuration "Invoicing:Series" "INV"
+          CreditSeries = value configuration "Invoicing:CreditSeries" "CN"
           Name = value configuration "Invoicing:SellerName" "fsnix Store"
           Address = value configuration "Invoicing:SellerAddress" "1 Example Street, Springfield"
           TaxId = value configuration "Invoicing:SellerTaxId" "" }

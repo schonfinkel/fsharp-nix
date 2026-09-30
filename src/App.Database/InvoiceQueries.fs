@@ -7,13 +7,17 @@ open App.Domain
 open Npgsql
 
 type InvoiceListRow =
-    { InvoiceId: InvoiceId
-      Number: InvoiceNumber
-      IssuedAt: DateTimeOffset
-      OrderId: string
-      Total: decimal
-      Currency: string
-      HasDocument: bool }
+    {
+        InvoiceId: InvoiceId
+        Number: InvoiceNumber
+        IssuedAt: DateTimeOffset
+        OrderId: string
+        Total: decimal
+        Currency: string
+        HasDocument: bool
+        /// <summary>For a credit note, the number of the invoice it credits.</summary>
+        Credits: InvoiceNumber option
+    }
 
 /// <summary>A keyset page, newest first. <c>Next</c> is the cursor for the following page.</summary>
 type InvoicePage =
@@ -92,7 +96,8 @@ module InvoiceQueries =
                           OrderId = reader.GetString 6
                           Total = reader.GetDecimal 7
                           Currency = reader.GetString 8
-                          HasDocument = reader.GetBoolean 9 }
+                          HasDocument = reader.GetBoolean 9
+                          Credits = if reader.IsDBNull 10 then None else Some(number reader 10) }
 
                 let page = rows |> Seq.truncate size |> List.ofSeq
 
@@ -125,6 +130,23 @@ module InvoiceQueries =
                         )
                 else
                     return None
+            })
+
+    /// <summary>The order's rendered credit notes visible to <paramref name="customerId"/>,
+    /// oldest first.</summary>
+    let creditsForOrder (dataSource: NpgsqlDataSource) (orderId: string) (customerId: Guid) (ct: CancellationToken) =
+        Execution.executeRead dataSource ct (fun connection token ->
+            task {
+                use command = new NpgsqlCommand(InvoiceSql.creditsForOrder, connection)
+                command.Parameters.AddWithValue("order", orderId) |> ignore
+                command.Parameters.AddWithValue("customer", customerId) |> ignore
+                use! reader = command.ExecuteReaderAsync(token: CancellationToken)
+                let credits = Collections.Generic.List<InvoiceId * InvoiceNumber>()
+
+                while! reader.ReadAsync token do
+                    credits.Add(InvoiceId.create (reader.GetGuid 0) |> Result.defaultWith invalidOp, number reader 1)
+
+                return List.ofSeq credits
             })
 
     /// <summary>The newest stored PDF of an invoice. <paramref name="customerId"/> <c>None</c>

@@ -14,9 +14,10 @@ SELECT
         FROM
             fsnix.invoice_documents d
         WHERE
-            d.invoice_id = i.invoice_id)
+            d.invoice_id = i.invoice_id), o.legal_entity, o.series, o.fiscal_period, o.number
 FROM
     fsnix.invoices i
+    LEFT JOIN fsnix.invoices o ON o.invoice_id = i.credits_invoice_id
 WHERE (@customer IS NULL
     OR i.customer_id = @customer)
 AND (@before IS NULL

@@ -185,12 +185,16 @@ type OrderStatusModel =
         ReturnStatuses: (string * string) list
         /// <summary>Download URL and display number, once the invoice PDF is stored.</summary>
         Invoice: (string * string) option
+        /// <summary>Download URL and number of each rendered credit note.</summary>
+        CreditNotes: (string * string) list
         Error: string option
     }
 
 type InvoiceRowModel =
     {
         Number: string
+        /// <summary>"Invoice", or "Credit note (INV-…)" naming the credited invoice.</summary>
+        Kind: string
         IssuedOn: string
         Total: string
         OrderId: string

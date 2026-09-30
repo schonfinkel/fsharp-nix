@@ -457,6 +457,13 @@ module OrderEndpoints =
                                 user.Id
                                 context.RequestAborted
 
+                        let! credits =
+                            InvoiceQueries.creditsForOrder
+                                dataSource
+                                (EntityId.value orderId)
+                                user.Id
+                                context.RequestAborted
+
                         match snapshot with
                         | Ok(Some order) ->
                             let pay =
@@ -516,6 +523,10 @@ module OrderEndpoints =
                                     invoice
                                     |> Option.filter (fun (_, _, hasDocument) -> hasDocument)
                                     |> Option.map (fun (id, number, _) ->
+                                        $"/invoices/{InvoiceId.wireString id}/pdf", InvoiceNumber.display number)
+                                  CreditNotes =
+                                    credits
+                                    |> List.map (fun (id, number) ->
                                         $"/invoices/{InvoiceId.wireString id}/pdf", InvoiceNumber.display number)
                                   Error = None }
 

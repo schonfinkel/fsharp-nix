@@ -1,20 +1,26 @@
+-- The last four columns name the invoice a credit note credits (NULL for an invoice).
 SELECT
-    legal_entity,
-    series,
-    fiscal_period,
-    number,
-    issued_at,
-    seller ->> 'name',
-    seller ->> 'address',
-    COALESCE(seller ->> 'taxId', ''),
-    buyer ->> 'email',
-    billing_address::text,
-    subtotal_amount,
-    shipping_amount,
-    tax_amount,
-    total_amount,
-    currency
+    i.legal_entity,
+    i.series,
+    i.fiscal_period,
+    i.number,
+    i.issued_at,
+    i.seller ->> 'name',
+    i.seller ->> 'address',
+    COALESCE(i.seller ->> 'taxId', ''),
+    i.buyer ->> 'email',
+    i.billing_address::text,
+    i.subtotal_amount,
+    i.shipping_amount,
+    i.tax_amount,
+    i.total_amount,
+    i.currency,
+    o.legal_entity,
+    o.series,
+    o.fiscal_period,
+    o.number
 FROM
-    fsnix.invoices
+    fsnix.invoices i
+    LEFT JOIN fsnix.invoices o ON o.invoice_id = i.credits_invoice_id
 WHERE
-    invoice_id = @invoice
+    i.invoice_id = @invoice

@@ -18,6 +18,7 @@ module InvoiceViews =
                         thead () {
                             tr () {
                                 th () { "Number" }
+                                th () { "Type" }
                                 th () { "Issued" }
                                 th () { "Order" }
                                 th () { "Total" }
@@ -30,6 +31,7 @@ module InvoiceViews =
                             for row in model.Rows do
                                 tr () {
                                     td () { row.Number }
+                                    td () { row.Kind }
                                     td () { row.IssuedOn }
                                     td () { row.OrderId }
                                     td () { row.Total }

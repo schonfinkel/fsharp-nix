@@ -14,16 +14,24 @@ open Microsoft.Extensions.Logging
 module InvoiceWire =
     [<CLIMutable>]
     type WireDto =
-        { Tag: string
-          InvoiceId: string
-          OrderId: string
-          SnapshotId: string
-          LegalEntity: string
-          Series: string
-          FiscalPeriod: string
-          Sequence: int64
-          Reason: string
-          Digest: string }
+        {
+            Tag: string
+            InvoiceId: string
+            OrderId: string
+            SnapshotId: string
+            LegalEntity: string
+            Series: string
+            FiscalPeriod: string
+            Sequence: int64
+            Reason: string
+            Digest: string
+            /// <summary>Credit notes only: the refund, and <c>cancellation</c> or
+            /// <c>return:{returnId}</c> for its origin.</summary>
+            [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+            CreditRefundId: string
+            [<JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)>]
+            CreditOrigin: string
+        }
 
 [<RequireQualifiedAccess>]
 module InvoiceCodec =
@@ -42,13 +50,26 @@ module InvoiceCodec =
           FiscalPeriod = ""
           Sequence = 0L
           Reason = ""
-          Digest = "" }
+          Digest = ""
+          CreditRefundId = null
+          CreditOrigin = null }
 
     let private withRequest tag (request: InvoiceRequest) =
         { empty tag with
             InvoiceId = InvoiceId.wireString request.InvoiceId
             OrderId = request.OrderId
-            SnapshotId = OrderSnapshotId.wireString request.SnapshotId }
+            SnapshotId = OrderSnapshotId.wireString request.SnapshotId
+            CreditRefundId =
+                request.Credit
+                |> Option.map (fun credit -> RefundId.wireString credit.RefundId)
+                |> Option.toObj
+            CreditOrigin =
+                request.Credit
+                |> Option.map (fun credit ->
+                    match credit.Origin with
+                    | OrderCancellation _ -> "cancellation"
+                    | InspectedReturn(_, returnId) -> $"return:{returnId:D}")
+                |> Option.toObj }
 
     let private withNumber (number: InvoiceNumber) (dto: InvoiceWire.WireDto) =
         { dto with
@@ -89,10 +110,29 @@ module InvoiceCodec =
             |> Result.bind (fun snapshotId ->
                 invoiceId name dto
                 |> Result.mapError (fun _ -> "Invalid invoice id.")
-                |> Result.map (fun id ->
-                    { InvoiceId = id
-                      OrderId = dto.OrderId
-                      SnapshotId = snapshotId }))
+                |> Result.bind (fun id ->
+                    let credit =
+                        match dto.CreditRefundId, dto.CreditOrigin with
+                        | null, null -> Ok None
+                        | refund, origin when not (isNull refund) && not (isNull origin) ->
+                            RefundId.tryParse refund
+                            |> Result.bind (fun refundId ->
+                                match origin with
+                                | "cancellation" -> Ok(OrderCancellation dto.OrderId)
+                                | text when text.StartsWith("return:", StringComparison.Ordinal) ->
+                                    match Guid.TryParseExact(text.Substring 7, "D") with
+                                    | true, returnId -> Ok(InspectedReturn(dto.OrderId, returnId))
+                                    | _ -> Error "Invalid credit return id."
+                                | _ -> Error "Invalid credit origin."
+                                |> Result.map (fun origin -> Some { RefundId = refundId; Origin = origin }))
+                        | _ -> Error "Incomplete credit source."
+
+                    credit
+                    |> Result.map (fun credit ->
+                        { InvoiceId = id
+                          OrderId = dto.OrderId
+                          SnapshotId = snapshotId
+                          Credit = credit })))
             |> Result.bind InvoiceRequest.validate
             |> Result.mapError (error name)
         | _ -> Error(error name "Invalid invoice snapshot id.")

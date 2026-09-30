@@ -131,7 +131,11 @@ let private tests =
                     InvoiceIssuanceTests.``invoice lists page by keyset and stay customer scoped`` fixture)
                 DatabaseTest.isolated false "render checks back off" (fun fixture ->
                     InvoiceIssuanceTests.``render checks are armed at issuance and back off until a document exists``
-                        fixture) ] ]
+                        fixture)
+                DatabaseTest.isolated false "credit notes reverse exact lines" (fun fixture ->
+                    InvoiceIssuanceTests.``credit notes reverse exact lines in their own gapless series`` fixture)
+                DatabaseTest.isolated false "settled refund requests its credit note" (fun fixture ->
+                    InvoiceIssuanceTests.``a settled refund requests its credit note with the origin callback`` fixture) ] ]
     |> testSequenced
 
 [<EntryPoint>]

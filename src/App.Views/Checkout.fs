@@ -133,6 +133,9 @@ module CheckoutViews =
                 | Some(url, number) -> p () { a (href = url) { $"Invoice {number} (PDF)" } }
                 | None -> ()
 
+                for (url, number) in model.CreditNotes do
+                    p () { a (href = url) { $"Credit note {number} (PDF)" } }
+
                 for (returnId, returnStatus) in model.ReturnStatuses do
                     p () { a (href = $"/returns/{returnId}") { $"Return {returnId}: {returnStatus}" } }
 

@@ -29,8 +29,15 @@ module InvoicePdf =
         let number = InvoiceNumber.display document.Number
         let amount value = money value document.Currency
 
+        // A credit note reuses the invoice layout; only its heading, reference and totals label
+        // differ, so an invoice renders byte-for-byte as before.
+        let title =
+            match document.Credits with
+            | None -> $"Invoice {number}"
+            | Some _ -> $"Credit note {number}"
+
         let metadata =
-            Pdf.metadata $"Invoice {number}"
+            Pdf.metadata title
             |> fun metadata ->
                 metadata.CreationDate <- document.IssuedAt
                 metadata.ModifiedDate <- document.IssuedAt
@@ -59,7 +66,14 @@ module InvoicePdf =
                                 .RelativeItem()
                                 .AlignRight()
                                 .Column(fun column ->
-                                    column.Item().Text($"Invoice {number}").SemiBold().FontSize(16f) |> ignore
+                                    column.Item().Text(title).SemiBold().FontSize(16f) |> ignore
+
+                                    match document.Credits with
+                                    | Some credited ->
+                                        column.Item().Text($"Credits invoice {InvoiceNumber.display credited}")
+                                        |> ignore
+                                    | None -> ()
+
                                     column.Item().Text($"Issued {date document.IssuedAt}") |> ignore))
 
                     page
@@ -118,7 +132,12 @@ module InvoicePdf =
                                         [ "Subtotal", document.Subtotal, false
                                           "Shipping", document.Shipping, false
                                           "Tax", document.Tax, false
-                                          "Total", document.Total, true ] do
+                                          (if document.Credits.IsSome then
+                                               "Total credited"
+                                           else
+                                               "Total"),
+                                          document.Total,
+                                          true ] do
                                         let caption = totals.Cell().Text(label)
                                         let figure = totals.Cell().AlignRight().Text(amount value)
 

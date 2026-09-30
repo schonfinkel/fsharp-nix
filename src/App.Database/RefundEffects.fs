@@ -4,6 +4,7 @@ open System
 open System.Threading
 open System.Threading.Tasks
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open App.Refunds
@@ -129,33 +130,52 @@ module RefundEffects =
                                     PaymentCodec.event
                                     ct
                         | NotifyOriginSucceeded request ->
-                            match request.Origin with
-                            | OrderCancellation orderId ->
-                                return!
+                            // Every settled refund gets exactly one credit note, keyed by the refund.
+                            let! credit =
+                                match InvoiceRequest.forCredit request.RefundId request.Origin with
+                                | Ok creditRequest ->
                                     deliver
                                         connection
                                         tx
                                         record
-                                        "order-refunded"
-                                        Orders.MachineKey
-                                        orderId
-                                        (OrderRefunded request.RefundId)
-                                        OrderCodec.event
+                                        "credit-note-request"
+                                        Invoices.MachineKey
+                                        (EntityId.value (Invoices.invoiceEntityId creditRequest.InvoiceId))
+                                        (InvoiceRequested creditRequest)
+                                        InvoiceCodec.event
                                         ct
-                            | InspectedReturn(_, returnId) ->
-                                let id = ReturnId.create returnId |> Result.defaultWith invalidOp
+                                | Error _ -> Task.FromResult(Error RefundActionError.InvalidAction)
 
-                                return!
-                                    deliver
-                                        connection
-                                        tx
-                                        record
-                                        "return-refunded"
-                                        Returns.MachineKey
-                                        (EntityId.value (Returns.returnEntityId id))
-                                        (RefundSucceeded request.RefundId)
-                                        ReturnCodec.event
-                                        ct
+                            match credit with
+                            | Error error -> return Error error
+                            | Ok() ->
+                                match request.Origin with
+                                | OrderCancellation orderId ->
+                                    return!
+                                        deliver
+                                            connection
+                                            tx
+                                            record
+                                            "order-refunded"
+                                            Orders.MachineKey
+                                            orderId
+                                            (OrderRefunded request.RefundId)
+                                            OrderCodec.event
+                                            ct
+                                | InspectedReturn(_, returnId) ->
+                                    let id = ReturnId.create returnId |> Result.defaultWith invalidOp
+
+                                    return!
+                                        deliver
+                                            connection
+                                            tx
+                                            record
+                                            "return-refunded"
+                                            Returns.MachineKey
+                                            (EntityId.value (Returns.returnEntityId id))
+                                            (RefundSucceeded request.RefundId)
+                                            ReturnCodec.event
+                                            ct
                         | NotifyOriginFailed(request, reason) ->
                             match request.Origin with
                             | OrderCancellation orderId ->

@@ -2037,7 +2037,8 @@ module UnitTests =
           Shipping = 5m
           Tax = 4.38m
           Total = 59.18m
-          Currency = "USD" }
+          Currency = "USD"
+          Credits = None }
 
     let ``invoice pdf is deterministic per snapshot`` () =
         let first = InvoicePdf.render (sampleInvoiceDocument 42L)
@@ -2303,6 +2304,85 @@ module UnitTests =
                 |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
             )
 
+    let ``credit notes are keyed by refund and render distinctly`` () =
+        let snapshot =
+            OrderSnapshotId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+        let orderId = $"order:{OrderSnapshotId.value snapshot:D}"
+        let refundId = RefundId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+        let returnId = Guid.NewGuid()
+
+        let credit =
+            InvoiceRequest.forCredit refundId (InspectedReturn(orderId, returnId))
+            |> Result.defaultWith Assert.Fail
+
+        Assert.Equal(RefundId.value refundId, InvoiceId.value credit.InvoiceId)
+        Assert.Equal(snapshot, credit.SnapshotId)
+        Assert.True(Result.isOk (InvoiceRequest.validate credit))
+
+        Assert.True(
+            Result.isError (
+                InvoiceRequest.validate
+                    { credit with
+                        InvoiceId = InvoiceId.ofSnapshot snapshot }
+            )
+        )
+
+        Assert.True(
+            Result.isError (
+                InvoiceRequest.validate
+                    { credit with
+                        Credit =
+                            Some
+                                { RefundId = refundId
+                                  Origin = OrderCancellation $"order:{Guid.NewGuid():D}" } }
+            )
+        )
+
+        Assert.True(Result.isError (InvoiceRequest.forCredit refundId (OrderCancellation "cart:nope")))
+
+        for request in
+            [ credit
+              InvoiceRequest.forCredit refundId (OrderCancellation orderId)
+              |> Result.defaultWith Assert.Fail ] do
+            let action = App.Invoices.IssueSnapshot request
+
+            let json =
+                InvoiceCodec.action.Encode action
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                action,
+                InvoiceCodec.action.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
+        let invoiceJson =
+            InvoiceCodec.action.Encode(App.Invoices.IssueSnapshot(InvoiceRequest.forOrder snapshot))
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+        Assert.DoesNotContain("credit", invoiceJson)
+
+        let line: ReturnLine =
+            { OrderLineId = OrderLineId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+              Quantity = 2
+              Merchandise = Money.create 49.80m "USD" |> Result.defaultWith Assert.Fail
+              Tax = Money.create 3.98m "USD" |> Result.defaultWith Assert.Fail }
+
+        Assert.Equal(53.78m, Money.amount (ReturnLine.refundAmount line))
+
+        let invoicePdf = InvoicePdf.render (sampleInvoiceDocument 42L)
+
+        let creditDocument =
+            { sampleInvoiceDocument 1L with
+                Number = InvoiceNumber.create "FSNIX" "CN" "2026-09" 1L |> Result.defaultWith Assert.Fail
+                Credits = Some(invoiceNumber 42L) }
+
+        let creditPdf = InvoicePdf.render creditDocument
+        Assert.True(Pdf.isPdf creditPdf, "Expected a PDF header.")
+        Assert.Equal<byte array>(creditPdf, InvoicePdf.render creditDocument)
+        Assert.NotEqual<byte array>(invoicePdf, creditPdf)
+
     let tests =
         testList
             "unit"
@@ -2432,4 +2512,5 @@ module UnitTests =
               testCase "lapsed authorizations hold the order" ``lapsed authorizations hold the order for review``
               testCase
                   "stalled invoice renders are re-requested"
-                  ``stalled invoice renders are re-requested then parked`` ]
+                  ``stalled invoice renders are re-requested then parked``
+              testCase "credit notes are keyed by refund" ``credit notes are keyed by refund and render distinctly`` ]
