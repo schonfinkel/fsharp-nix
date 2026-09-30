@@ -166,6 +166,19 @@ type AccountOperationContext() =
         taken
 
 [<RequireQualifiedAccess>]
+module AccountSql =
+    let cancelFlowDeadlines = Sql.load "Accounts/cancel-flow-deadlines"
+    let cancelSupersededDeadlines = Sql.load "Accounts/cancel-superseded-deadlines"
+    let completeFlowRequest = Sql.load "Accounts/complete-flow-request"
+    let insertCompletedMarker = Sql.load "Accounts/insert-completed-marker"
+    let insertFlowDeadline = Sql.load "Accounts/insert-flow-deadline"
+    let insertFlowRequest = Sql.load "Accounts/insert-flow-request"
+    let insertOperationCallback = Sql.load "Accounts/insert-operation-callback"
+    let insertOperationMarker = Sql.load "Accounts/insert-operation-marker"
+    let supersedeOtherFlows = Sql.load "Accounts/supersede-other-flows"
+    let verifyOperationCallback = Sql.load "Accounts/verify-operation-callback"
+
+[<RequireQualifiedAccess>]
 module internal AccountOperationSql =
 
     /// <summary>
@@ -184,14 +197,7 @@ module internal AccountOperationSql =
         : Task<Result<unit, string>> =
         task {
             use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.integration_outbox (callback_key, machine_id, entity_id, event)
-                       VALUES (@callback_key, @machine_id, @entity_id, @event::jsonb)
-                       ON CONFLICT (callback_key) DO NOTHING
-                       RETURNING outbox_id""",
-                    connection,
-                    transaction
-                )
+                new NpgsqlCommand(AccountSql.insertOperationCallback, connection, transaction)
 
             command.Parameters.AddWithValue("callback_key", callbackKey) |> ignore
             command.Parameters.AddWithValue("machine_id", machineId) |> ignore
@@ -204,13 +210,7 @@ module internal AccountOperationSql =
                 return Ok()
             else
                 use verify =
-                    new NpgsqlCommand(
-                        """SELECT machine_id, entity_id, event = @event::jsonb
-                           FROM fsnix.integration_outbox
-                           WHERE callback_key = @callback_key""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(AccountSql.verifyOperationCallback, connection, transaction)
 
                 verify.Parameters.AddWithValue("callback_key", callbackKey) |> ignore
                 verify.Parameters.AddWithValue("event", eventJson) |> ignore
@@ -246,16 +246,7 @@ module internal AccountOperationSql =
             match operation with
             | RegisterFlow op ->
                 use supersede =
-                    new NpgsqlCommand(
-                        """UPDATE fsnix.account_flow_requests
-                           SET status = 'superseded', superseded_by = @flow_id, updated_at = statement_timestamp()
-                           WHERE user_id = @user_id
-                             AND flow_kind = @flow_kind
-                             AND status = 'requested'
-                             AND flow_id <> @flow_id""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(AccountSql.supersedeOtherFlows, connection, transaction)
 
                 supersede.Parameters.AddWithValue("flow_id", op.FlowId) |> ignore
                 supersede.Parameters.AddWithValue("user_id", op.UserId) |> ignore
@@ -266,16 +257,7 @@ module internal AccountOperationSql =
                 let! _ = supersede.ExecuteNonQueryAsync(ct)
 
                 use cancelDeadlines =
-                    new NpgsqlCommand(
-                        """UPDATE fsnix.flow_deadlines
-                           SET status = 'cancelled'
-                           WHERE status = 'pending'
-                             AND flow_id IN (
-                                 SELECT flow_id FROM fsnix.account_flow_requests
-                                 WHERE user_id = @user_id AND flow_kind = @flow_kind AND status = 'superseded')""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(AccountSql.cancelSupersededDeadlines, connection, transaction)
 
                 cancelDeadlines.Parameters.AddWithValue("user_id", op.UserId) |> ignore
 
@@ -285,15 +267,7 @@ module internal AccountOperationSql =
                 let! _ = cancelDeadlines.ExecuteNonQueryAsync(ct)
 
                 use request =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.account_flow_requests
-                               (flow_id, flow_kind, user_id, destination_email, status, generation,
-                                resend_count, expires_at, created_at, updated_at)
-                           VALUES (@flow_id, @flow_kind, @user_id, @destination_email, 'requested', 1, 0,
-                                   @expires_at, statement_timestamp(), statement_timestamp())""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(AccountSql.insertFlowRequest, connection, transaction)
 
                 request.Parameters.AddWithValue("flow_id", op.FlowId) |> ignore
 
@@ -309,13 +283,7 @@ module internal AccountOperationSql =
                 let! _ = request.ExecuteNonQueryAsync(ct)
 
                 use deadline =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.flow_deadlines
-                               (flow_id, timer_kind, generation, deadline, gate_callback_key)
-                           VALUES (@flow_id, 'flow-expiry', 1, @deadline, @gate)""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(AccountSql.insertFlowDeadline, connection, transaction)
 
                 deadline.Parameters.AddWithValue("flow_id", op.FlowId) |> ignore
                 deadline.Parameters.AddWithValue("deadline", op.ExpiresAt) |> ignore
@@ -323,12 +291,7 @@ module internal AccountOperationSql =
                 let! _ = deadline.ExecuteNonQueryAsync(ct)
 
                 use marker =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.account_operation_markers (operation_id, user_id, flow_id, operation)
-                           VALUES (@operation_id, @user_id, @flow_id, @operation)""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(AccountSql.insertOperationMarker, connection, transaction)
 
                 marker.Parameters.AddWithValue("operation_id", op.OperationId) |> ignore
                 marker.Parameters.AddWithValue("user_id", op.UserId) |> ignore
@@ -350,16 +313,7 @@ module internal AccountOperationSql =
                         ct
             | CompleteFlow op ->
                 use request =
-                    new NpgsqlCommand(
-                        """UPDATE fsnix.account_flow_requests
-                           SET status = 'completed', updated_at = statement_timestamp()
-                           WHERE flow_id = @flow_id
-                             AND user_id = @user_id
-                             AND flow_kind = @flow_kind
-                             AND status = 'requested'""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(AccountSql.completeFlowRequest, connection, transaction)
 
                 request.Parameters.AddWithValue("flow_id", op.FlowId) |> ignore
                 request.Parameters.AddWithValue("user_id", op.UserId) |> ignore
@@ -373,14 +327,7 @@ module internal AccountOperationSql =
                     return Error "the requested account flow was not active for this user and kind"
                 else
                     use marker =
-                        new NpgsqlCommand(
-                            """INSERT INTO fsnix.account_operation_markers
-                               (operation_id, user_id, flow_id, operation, completed_at)
-                            VALUES (@operation_id, @user_id, @flow_id, @operation, @completed_at)
-                            ON CONFLICT (operation_id) DO NOTHING""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountSql.insertCompletedMarker, connection, transaction)
 
                     marker.Parameters.AddWithValue("operation_id", op.OperationId) |> ignore
                     marker.Parameters.AddWithValue("user_id", op.UserId) |> ignore
@@ -390,13 +337,7 @@ module internal AccountOperationSql =
                     let! _ = marker.ExecuteNonQueryAsync(ct)
 
                     use cancelDeadline =
-                        new NpgsqlCommand(
-                            """UPDATE fsnix.flow_deadlines
-                            SET status = 'cancelled'
-                            WHERE flow_id = @flow_id AND status = 'pending'""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountSql.cancelFlowDeadlines, connection, transaction)
 
                     cancelDeadline.Parameters.AddWithValue("flow_id", op.FlowId) |> ignore
                     let! _ = cancelDeadline.ExecuteNonQueryAsync(ct)

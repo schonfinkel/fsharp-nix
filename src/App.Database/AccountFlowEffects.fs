@@ -100,6 +100,14 @@ module AccountEmail =
         with error ->
             Error $"the payload did not decode: {error.GetType().Name}"
 
+[<RequireQualifiedAccess>]
+module AccountFlowEffectSql =
+    let advanceFlowGeneration = Sql.load "Accounts/advance-flow-generation"
+    let cancelOlderDeadlines = Sql.load "Accounts/cancel-older-deadlines"
+    let insertEmailOutbox = Sql.load "Accounts/insert-email-outbox"
+    let insertGenerationDeadline = Sql.load "Accounts/insert-generation-deadline"
+    let loadRequestedFlow = Sql.load "Accounts/load-requested-flow"
+
 /// <summary>The durable work of the <c>SendNotification</c> action: an idempotent receipt, the
 /// protected email row, and the sanitized notification callback.</summary>
 [<RequireQualifiedAccess>]
@@ -114,13 +122,7 @@ module AccountFlowEffects =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT flow_id, flow_kind, user_id, destination_email, generation
-                       FROM fsnix.account_flow_requests
-                       WHERE flow_id = @flow_id AND status = 'requested'""",
-                    connection
-                )
+            use command = new NpgsqlCommand(AccountFlowEffectSql.loadRequestedFlow, connection)
 
             command.Parameters.AddWithValue("flow_id", flowId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -153,9 +155,6 @@ module AccountFlowEffects =
 
     let private actionKind (action: FlowAction) = string action
 
-    let private payloadHash (action: FlowAction) : byte[] =
-        SHA256.HashData(Encoding.UTF8.GetBytes(actionKind action))
-
     let private callbackKey (record: ActionRecord<FlowId, FlowAction>) : string =
         $"xmsg:v1:%s{MachineId.value record.MachineId}:%d{CommandId.value record.CommandId}:%d{record.Ordinal}:flow-effect"
 
@@ -182,45 +181,21 @@ module AccountFlowEffects =
                 do! connection.OpenAsync(ct)
                 use! transaction = connection.BeginTransactionAsync(ct)
 
-                use insert =
-                    new NpgsqlCommand(
-                        """INSERT INTO fsnix.action_receipts (machine_id, command_id, ordinal, action_kind, payload_hash)
-                           VALUES (@machine_id, @command_id, @ordinal, @action_kind, @payload_hash)
-                           ON CONFLICT (machine_id, command_id, ordinal) DO NOTHING
-                           RETURNING command_id""",
-                        connection,
-                        transaction
-                    )
+                // The receipt payload is the action kind (a generation-free digest), unchanged
+                // from the original account-flow protocol.
+                let kind = actionKind record.Action
 
-                insert.Parameters.AddWithValue("machine_id", MachineId.value record.MachineId)
-                |> ignore
-
-                insert.Parameters.AddWithValue("command_id", CommandId.value record.CommandId)
-                |> ignore
-
-                insert.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-
-                insert.Parameters.AddWithValue("action_kind", actionKind record.Action)
-                |> ignore
-
-                insert.Parameters.AddWithValue("payload_hash", payloadHash record.Action)
-                |> ignore
-
-                let! inserted = insert.ExecuteScalarAsync(ct)
-                let isFirstDelivery = inserted |> Option.ofObj |> Option.isSome
-
-                if isFirstDelivery then
+                match! WorkflowEffects.receipt connection transaction record kind kind ct with
+                | Error ReceiptFailure.EncodingFailed -> return Error FlowActionError.CallbackEncodingFailed
+                | Error ReceiptFailure.Mismatch ->
+                    do! transaction.CommitAsync(ct)
+                    return Error FlowActionError.ActionReceiptMismatch
+                | Ok ReceiptStatus.Duplicate ->
+                    do! transaction.CommitAsync(ct)
+                    return Ok()
+                | Ok ReceiptStatus.FirstRun ->
                     use advance =
-                        new NpgsqlCommand(
-                            """UPDATE fsnix.account_flow_requests
-                               SET generation = @generation,
-                                   resend_count = @generation - 1,
-                                   expires_at = @expires_at,
-                                   updated_at = statement_timestamp()
-                               WHERE flow_id = @flow_id AND status = 'requested'""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountFlowEffectSql.advanceFlowGeneration, connection, transaction)
 
                     advance.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                     advance.Parameters.AddWithValue("generation", generation) |> ignore
@@ -228,15 +203,7 @@ module AccountFlowEffects =
                     let! _ = advance.ExecuteNonQueryAsync(ct)
 
                     use cancelSuperseded =
-                        new NpgsqlCommand(
-                            """UPDATE fsnix.flow_deadlines
-                               SET status = 'cancelled'
-                               WHERE flow_id = @flow_id
-                                 AND status = 'pending'
-                                 AND generation < @generation""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountFlowEffectSql.cancelOlderDeadlines, connection, transaction)
 
                     cancelSuperseded.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                     cancelSuperseded.Parameters.AddWithValue("generation", generation) |> ignore
@@ -245,13 +212,7 @@ module AccountFlowEffects =
                     match protectedPayload with
                     | Some payload ->
                         use email =
-                            new NpgsqlCommand(
-                                """INSERT INTO fsnix.account_email_outbox (flow_id, generation, protected_payload, encryption_version)
-                                   VALUES (@flow_id, @generation, @protected_payload, @encryption_version)
-                                   ON CONFLICT (flow_id, generation) DO NOTHING""",
-                                connection,
-                                transaction
-                            )
+                            new NpgsqlCommand(AccountFlowEffectSql.insertEmailOutbox, connection, transaction)
 
                         email.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                         email.Parameters.AddWithValue("generation", generation) |> ignore
@@ -265,13 +226,7 @@ module AccountFlowEffects =
                     | None -> ()
 
                     use deadline =
-                        new NpgsqlCommand(
-                            """INSERT INTO fsnix.flow_deadlines (flow_id, timer_kind, generation, deadline, gate_callback_key)
-                               VALUES (@flow_id, 'flow-expiry', @generation, @deadline, @gate)
-                               ON CONFLICT (flow_id, timer_kind, generation) DO NOTHING""",
-                            connection,
-                            transaction
-                        )
+                        new NpgsqlCommand(AccountFlowEffectSql.insertGenerationDeadline, connection, transaction)
 
                     deadline.Parameters.AddWithValue("flow_id", request.FlowId) |> ignore
                     deadline.Parameters.AddWithValue("generation", generation) |> ignore
@@ -279,69 +234,16 @@ module AccountFlowEffects =
                     deadline.Parameters.AddWithValue("gate", callback) |> ignore
                     let! _ = deadline.ExecuteNonQueryAsync(ct)
 
-                    use outbox =
-                        new NpgsqlCommand(
-                            """INSERT INTO fsnix.integration_outbox (callback_key, machine_id, entity_id, event)
-                               VALUES (@callback_key, @machine_id, @entity_id, @event::jsonb)
-                               ON CONFLICT (callback_key) DO NOTHING""",
-                            connection,
+                    do!
+                        WorkflowEffects.callback
+                            connection
                             transaction
-                        )
-
-                    outbox.Parameters.AddWithValue("callback_key", callback) |> ignore
-                    outbox.Parameters.AddWithValue("machine_id", AccountFlow.MachineKey) |> ignore
-
-                    outbox.Parameters.AddWithValue("entity_id", EntityId.value record.EntityId)
-                    |> ignore
-
-                    outbox.Parameters.AddWithValue("event", eventJson) |> ignore
-                    let! _ = outbox.ExecuteNonQueryAsync(ct)
+                            callback
+                            AccountFlow.MachineKey
+                            (EntityId.value record.EntityId)
+                            eventJson
+                            ct
 
                     do! transaction.CommitAsync(ct)
                     return Ok()
-                else
-                    use verify =
-                        new NpgsqlCommand(
-                            """SELECT action_kind, payload_hash
-                               FROM fsnix.action_receipts
-                               WHERE machine_id = @machine_id
-                                 AND command_id = @command_id
-                                 AND ordinal = @ordinal""",
-                            connection,
-                            transaction
-                        )
-
-                    verify.Parameters.AddWithValue("machine_id", MachineId.value record.MachineId)
-                    |> ignore
-
-                    verify.Parameters.AddWithValue("command_id", CommandId.value record.CommandId)
-                    |> ignore
-
-                    verify.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-
-                    let! reader = verify.ExecuteReaderAsync(ct)
-                    let! couldRead = reader.ReadAsync(ct)
-
-                    let existing =
-                        if couldRead then
-                            let kind = reader.GetString 0
-                            let hash = Convert.ToHexString(reader.GetValue(1) :?> byte[])
-                            Some(kind, hash)
-                        else
-                            None
-
-                    reader.Dispose()
-                    let expected = Convert.ToHexString(payloadHash record.Action)
-
-                    let verified =
-                        existing
-                        |> Option.map (fun (kind, hash) -> kind = actionKind record.Action && hash = expected)
-                        |> Option.defaultValue false
-
-                    do! transaction.CommitAsync(ct)
-
-                    if verified then
-                        return Ok()
-                    else
-                        return Error FlowActionError.ActionReceiptMismatch
         }

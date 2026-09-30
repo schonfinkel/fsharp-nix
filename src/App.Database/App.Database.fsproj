@@ -13,6 +13,10 @@
     <PackageReference Include="SqlHydra.Query" Version="5.0.0" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Forward slashes on every OS so Sql.load names are stable. -->
+    <EmbeddedResource Include="Sql/**/*.sql" LogicalName="Sql/$([System.String]::Copy('%(RecursiveDir)').Replace('\','/'))%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\App.Domain\App.Domain.fsproj" />
     <ProjectReference Include="..\App.Auth\App.Auth.fsproj" />
     <ProjectReference Include="..\App.Cart\App.Cart.fsproj" />
@@ -21,20 +25,25 @@
     <ProjectReference Include="..\App.Refunds\App.Refunds.fsproj" />
     <ProjectReference Include="..\App.Returns\App.Returns.fsproj" />
     <ProjectReference Include="..\App.Shipments\App.Shipments.fsproj" />
+    <ProjectReference Include="..\App.Invoices\App.Invoices.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="SchemaTypeMappings.fs" />
     <Compile Include="Database.Generated.fs">
       <Visible>False</Visible>
     </Compile>
+    <Compile Include="Sql.fs" />
+    <Compile Include="Execution.fs" />
     <Compile Include="FeatureFlagStore.fs" />
     <Compile Include="FeatureChangeSource.fs" />
     <Compile Include="AutomataStore.fs" />
+    <Compile Include="LeasedLedger.fs" />
+    <Compile Include="CodecSupport.fs" />
+    <Compile Include="WorkflowEffects.fs" />
     <Compile Include="AccountFlowCodec.fs" />
     <Compile Include="AccountFlowEffects.fs" />
     <Compile Include="AccountOperations.fs" />
     <Compile Include="AccountFlowRequests.fs" />
-    <Compile Include="FlowDeadlines.fs" />
     <Compile Include="IdentityStore.fs" />
     <Compile Include="Outbox.fs" />
     <Compile Include="EmailOutbox.fs" />
@@ -44,17 +53,15 @@
     <Compile Include="CartCodec.fs" />
     <Compile Include="CartGuestCapabilities.fs" />
     <Compile Include="CartMerge.fs" />
-    <Compile Include="CartDeadlines.fs" />
     <Compile Include="CartChangeSource.fs" />
     <Compile Include="CartEffects.fs" />
     <Compile Include="PaymentCodec.fs" />
     <Compile Include="RefundCodec.fs" />
     <Compile Include="OrderCodec.fs" />
     <Compile Include="ReturnCodec.fs" />
-    <Compile Include="WorkflowEffects.fs" />
+    <Compile Include="InvoiceCodec.fs" />
     <Compile Include="OrderSnapshots.fs" />
     <Compile Include="StockReservations.fs" />
-    <Compile Include="ReservationDeadlines.fs" />
     <Compile Include="PaymentGateway.fs" />
     <Compile Include="Carrier.fs" />
     <Compile Include="ShipmentCodec.fs" />
@@ -63,6 +70,8 @@
     <Compile Include="RefundEffects.fs" />
     <Compile Include="ReturnEffects.fs" />
     <Compile Include="ShipmentEffects.fs" />
+    <Compile Include="InvoiceEffects.fs" />
+    <Compile Include="InvoiceQueries.fs" />
     <Compile Include="Services.fs" />
   </ItemGroup>
 </Project>

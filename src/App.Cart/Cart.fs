@@ -106,6 +106,11 @@ module Cart =
     [<Literal>]
     let ActionQueue = "cart_actions"
 
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
+
     [<Literal>]
     let InitialEpoch: CartEpoch = 0L
 

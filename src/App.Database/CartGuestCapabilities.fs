@@ -6,6 +6,12 @@ open System.Threading.Tasks
 open App.Domain
 open Npgsql
 
+[<RequireQualifiedAccess>]
+module CartCapabilitySql =
+    let insertCapability = Sql.load "Carts/insert-capability"
+    let resolveCapability = Sql.load "Carts/resolve-capability"
+    let revokeCapabilities = Sql.load "Carts/revoke-capabilities"
+
 /// <summary>Guest-cart bearer capability store. Only the purpose-scoped keyed hash is stored;
 /// the raw 256-bit token never reaches the database. Entity ids are the cart machine's entity
 /// id string.</summary>
@@ -35,13 +41,7 @@ module CartGuestCapabilities =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.cart_guest_capabilities (locate_digest, key_id, purpose, entity_id, expires_at)
-                       VALUES (@locate_digest, @key_id, @purpose, @entity_id, @expires_at)
-                       ON CONFLICT (locate_digest) DO NOTHING""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CartCapabilitySql.insertCapability, connection)
 
             command.Parameters.AddWithValue("locate_digest", digest) |> ignore
             command.Parameters.AddWithValue("key_id", key.KeyId) |> ignore
@@ -63,17 +63,7 @@ module CartGuestCapabilities =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT entity_id
-                       FROM fsnix.cart_guest_capabilities
-                       WHERE locate_digest = @locate_digest
-                         AND key_id = @key_id
-                         AND purpose = @purpose
-                         AND NOT revoked
-                         AND expires_at > statement_timestamp()""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CartCapabilitySql.resolveCapability, connection)
 
             command.Parameters.AddWithValue("locate_digest", digest) |> ignore
             command.Parameters.AddWithValue("key_id", key.KeyId) |> ignore
@@ -87,13 +77,7 @@ module CartGuestCapabilities =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.cart_guest_capabilities
-                       SET revoked = TRUE, revoked_at = statement_timestamp()
-                       WHERE entity_id = @entity_id AND NOT revoked""",
-                    connection
-                )
+            use command = new NpgsqlCommand(CartCapabilitySql.revokeCapabilities, connection)
 
             command.Parameters.AddWithValue("entity_id", entityId) |> ignore
             let! _ = command.ExecuteNonQueryAsync(ct)

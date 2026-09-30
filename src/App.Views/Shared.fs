@@ -37,6 +37,7 @@ module SharedViews =
                         a (href = "/admin/operations") { "Operations" }
 
                         if context.User.Identity.IsAuthenticated then
+                            a (href = "/invoices") { "Invoices" }
                             span (class' = "muted") { context.User.Identity.Name }
                             a (href = "/account/2fa") { "2FA" }
                             a (href = "/account/email") { "Email" }

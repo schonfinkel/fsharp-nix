@@ -62,7 +62,7 @@ module ShipmentOperationTests =
 
             use command =
                 new NpgsqlCommand(
-                    "INSERT INTO fsnix.shipments(shipment_id,allocation_id,order_id) VALUES(@shipment,@allocation,@order) ON CONFLICT DO NOTHING",
+                    "INSERT INTO fsnix.shipments(shipment_id,allocation_id,order_id,capture_id,merchandise,shipping,tax,total,currency,lines) VALUES(@shipment,@allocation,@order,gen_random_uuid(),0,0,0,0,'USD','[]') ON CONFLICT DO NOTHING",
                     connection
                 )
 
@@ -95,7 +95,10 @@ module ShipmentOperationTests =
                         | CreateCarrierLabel _ -> ShipmentEffects.applyCreateLabel started.DataSource carrier record ct
                         | NotifyOrderDispatched _
                         | NotifyOrderDelivered _ -> ShipmentEffects.applyNotifyOrder started.DataSource record ct
-                        | RequestDeliveryRetry _ -> ShipmentEffects.applyDeliveryRetry started.DataSource record ct)
+                        | RequestDeliveryRetry _ -> ShipmentEffects.applyDeliveryRetry started.DataSource record ct
+                        | RecordTrackingCheckpoint _
+                        | StopTrackingCheck _ ->
+                            ShipmentEffects.applyTrackingCheck started.DataSource (TimeSpan.FromDays 7.) record ct)
 
             let destination =
                 OutboxDestination.forMachine Shipments.MachineKey EntityId.create ShipmentCodec.event started.Machine
@@ -186,6 +189,92 @@ module ShipmentOperationTests =
                                 |> fun value -> value.StartsWith "sim-"
                             )
                         | other -> Assert.Fail $"Expected ready-to-dispatch, got %A{other}."
+
+                        let dispatchedAt =
+                            DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+
+                        let! dispatched =
+                            Machine.send
+                                started.Machine
+                                entity
+                                (EventEnvelope.create $"{key}:dispatch" (DispatchConfirmed dispatchedAt))
+                                CancellationToken.None
+
+                        Assert.True(Result.isOk dispatched)
+                        let! _ = dispatcher.PollAsync CancellationToken.None
+
+                        use connection = started.DataSource.CreateConnection()
+                        do! connection.OpenAsync()
+
+                        use armed =
+                            new NpgsqlCommand(
+                                "SELECT status || ':' || tracking_generation || ':' || (last_scan_at IS NULL) || ':' || (lost_due_at = @dispatched + interval '7 days') FROM fsnix.shipment_tracking WHERE shipment_id=@shipment",
+                                connection
+                            )
+
+                        armed.Parameters.AddWithValue("shipment", ShipmentId.value shipmentId) |> ignore
+                        armed.Parameters.AddWithValue("dispatched", dispatchedAt) |> ignore
+                        let! armedRow = armed.ExecuteScalarAsync()
+                        Assert.Equal("pending:1:true:true", string armedRow)
+
+                        use makeDue =
+                            new NpgsqlCommand(
+                                "UPDATE fsnix.shipment_tracking SET lost_due_at = statement_timestamp() - interval '1 second' WHERE shipment_id=@shipment",
+                                connection
+                            )
+
+                        makeDue.Parameters.AddWithValue("shipment", ShipmentId.value shipmentId)
+                        |> ignore
+
+                        let! _ = makeDue.ExecuteNonQueryAsync()
+
+                        // What ShipmentLostScanner does: claim, send MarkLost from the ledger row, settle.
+                        let options = LeaseOptions.defaults "shipment-lost-test"
+
+                        let! claimed =
+                            LeasedLedger.claim
+                                started.DataSource
+                                Ledgers.lostShipments
+                                options
+                                Ledgers.readLostShipmentCheck
+                                CancellationToken.None
+
+                        let check = claimed |> List.exactlyOne
+
+                        let! marked =
+                            Machine.send
+                                started.Machine
+                                entity
+                                (EventEnvelope.create
+                                    $"{key}:lost"
+                                    (MarkLost(check.TrackingGeneration, check.LastScanAt, DateTimeOffset.UtcNow)))
+                                CancellationToken.None
+
+                        Assert.True(Result.isOk marked)
+
+                        let! _ =
+                            waitForState started entity (function
+                                | Lost _ -> true
+                                | _ -> false)
+
+                        do!
+                            LeasedLedger.settle
+                                started.DataSource
+                                Ledgers.lostShipments
+                                options
+                                check.ShipmentId
+                                Settlement.Done
+                                CancellationToken.None
+
+                        use fired =
+                            new NpgsqlCommand(
+                                "SELECT status FROM fsnix.shipment_tracking WHERE shipment_id=@shipment",
+                                connection
+                            )
+
+                        fired.Parameters.AddWithValue("shipment", ShipmentId.value shipmentId) |> ignore
+                        let! firedStatus = fired.ExecuteScalarAsync()
+                        Assert.Equal("fired", string firedStatus)
                     finally
                         workers.Cancel()
                 }

@@ -34,12 +34,25 @@ type DeadlineHealthSnapshot =
       EarliestPendingDeadline: DateTimeOffset option
       LatestFiredAt: DateTimeOffset option }
 
+/// <summary>Provider calls with an unknown outcome: due for a gateway check, or parked for
+/// manual review after the checks ran out.</summary>
+type ReconciliationHealthSnapshot =
+    { Unknown: int64
+      Due: int64
+      Parked: int64
+      MaximumChecks: int option }
+
 type OperationalHealthSnapshot =
     { CapturedAt: DateTimeOffset
       IntegrationOutbox: OutboxHealthSnapshot
       EmailOutbox: OutboxHealthSnapshot
       FlowRequests: FlowRequestHealthSnapshot list
-      Deadlines: DeadlineHealthSnapshot list }
+      Deadlines: DeadlineHealthSnapshot list
+      Reconciliation: ReconciliationHealthSnapshot }
+
+[<RequireQualifiedAccess>]
+module OperationalHealthSql =
+    let healthSnapshot = Sql.load "Operations/health-snapshot"
 
 [<RequireQualifiedAccess>]
 module OperationalHealth =
@@ -71,53 +84,7 @@ module OperationalHealth =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT statement_timestamp();
-
-                       SELECT COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND available_at <= statement_timestamp()
-                                  AND (lease_until IS NULL OR lease_until < statement_timestamp()))::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND lease_until >= statement_timestamp())::bigint,
-                              COUNT(*) FILTER (WHERE status = 'sent')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'dead')::bigint,
-                              MIN(created_at) FILTER (WHERE status = 'pending'),
-                              MIN(available_at) FILTER (WHERE status = 'pending'),
-                              MAX(attempts) FILTER (WHERE status = 'pending')
-                       FROM fsnix.integration_outbox;
-
-                       SELECT COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND available_at <= statement_timestamp()
-                                  AND (lease_until IS NULL OR lease_until < statement_timestamp()))::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND lease_until >= statement_timestamp())::bigint,
-                              COUNT(*) FILTER (WHERE status = 'sent')::bigint,
-                              COUNT(*) FILTER (WHERE status = 'dead')::bigint,
-                              MIN(created_at) FILTER (WHERE status = 'pending'),
-                              MIN(available_at) FILTER (WHERE status = 'pending'),
-                              MAX(attempts) FILTER (WHERE status = 'pending')
-                       FROM fsnix.account_email_outbox;
-
-                       SELECT flow_kind, status, COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'requested' AND expires_at <= statement_timestamp())::bigint,
-                              MIN(created_at),
-                              MIN(expires_at) FILTER (WHERE status = 'requested'),
-                              MAX(updated_at)
-                       FROM fsnix.account_flow_requests
-                       GROUP BY flow_kind, status
-                       ORDER BY flow_kind, status;
-
-                       SELECT timer_kind, status, COUNT(*)::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND deadline <= statement_timestamp())::bigint,
-                              COUNT(*) FILTER (WHERE status = 'pending' AND lease_until >= statement_timestamp())::bigint,
-                              MIN(deadline) FILTER (WHERE status = 'pending'),
-                              MAX(fired_at) FILTER (WHERE status = 'fired')
-                       FROM fsnix.flow_deadlines
-                       GROUP BY timer_kind, status
-                       ORDER BY timer_kind, status;""",
-                    connection
-                )
+            use command = new NpgsqlCommand(OperationalHealthSql.healthSnapshot, connection)
 
             let! reader = command.ExecuteReaderAsync(ct)
             let! capturedRow = reader.ReadAsync(ct)
@@ -166,10 +133,23 @@ module OperationalHealth =
                       EarliestPendingDeadline = optionalTime reader 5
                       LatestFiredAt = optionalTime reader 6 }
 
+            let! hasReconciliation = reader.NextResultAsync(ct)
+            let! reconciliationRow = reader.ReadAsync(ct)
+
+            if not hasReconciliation || not reconciliationRow then
+                invalidOp "operational health capture returned no reconciliation row"
+
+            let reconciliation =
+                { Unknown = reader.GetInt64 0
+                  Due = reader.GetInt64 1
+                  Parked = reader.GetInt64 2
+                  MaximumChecks = optionalInt reader 3 }
+
             return
                 { CapturedAt = capturedAt
                   IntegrationOutbox = integration
                   EmailOutbox = email
                   FlowRequests = List.ofSeq flowRequests
-                  Deadlines = List.ofSeq deadlines }
+                  Deadlines = List.ofSeq deadlines
+                  Reconciliation = reconciliation }
         }

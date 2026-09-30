@@ -31,6 +31,7 @@
     <ProjectReference Include="..\..\src\App.Cart\App.Cart.fsproj" />
     <ProjectReference Include="..\..\src\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\..\src\App.Domain\App.Domain.fsproj" />
+    <ProjectReference Include="..\..\src\App.Invoices\App.Invoices.fsproj" />
     <ProjectReference Include="..\..\src\App.Orders\App.Orders.fsproj" />
     <ProjectReference Include="..\..\src\App.Payments\App.Payments.fsproj" />
     <ProjectReference Include="..\App.Testing\App.Testing.fsproj" />

@@ -15,7 +15,7 @@ type ReturnState =
     | Initial
     | AuthorizationPending of ReturnProgress
     | Approved of ReturnProgress
-    | Rejected of ReturnProgress * reasonCode: string
+    | Rejected of ReturnProgress * reasonCode: ReasonCode
     | LabelPending of ReturnProgress
     | LabelIssued of ReturnProgress * CarrierReference
     | InTransit of ReturnProgress * CarrierReference
@@ -23,24 +23,27 @@ type ReturnState =
     | Inspected of ReturnProgress * CarrierReference
     | RefundPending of ReturnProgress * RefundRequest
     | Refunded of ReturnProgress * RefundRequest
-    | RejectedAfterInspection of ReturnProgress * reasonCode: string
-    | ManualReview of ReturnProgress * reasonCode: string
+    | RejectedAfterInspection of ReturnProgress * reasonCode: ReasonCode
+    | ManualReview of ReturnProgress * reasonCode: ReasonCode
     | Closed of ReturnProgress
 
 type ReturnEvent =
     | ReturnRequested of ReturnRequest
     | AuthorizationApproved of ReturnAuthorizationId
-    | AuthorizationRejected of ReturnAuthorizationId * reasonCode: string
+    | AuthorizationRejected of ReturnAuthorizationId * reasonCode: ReasonCode
     | LabelCreated of CarrierReference
-    | LabelFailed of reasonCode: string
+    | LabelFailed of reasonCode: ReasonCode
     | CarrierScanReceived of ReturnTrackingEventId
     | ItemsReceived of (OrderLineId * int) list
     | InspectionApproved of (OrderLineId * int) list
     | RestockCompleted of ReturnId
-    | InspectionRejected of reasonCode: string
+    | InspectionRejected of reasonCode: ReasonCode
     | RefundSucceeded of RefundId
-    | RefundFailed of RefundId * reasonCode: string
+    | RefundFailed of RefundId * reasonCode: ReasonCode
     | ReturnWindowExpired of ReturnAuthorizationId * DateTimeOffset
+    /// <summary>Operator decision after inspection and restock: refund the inspected items.</summary>
+    | RefundStartRequested
+    /// <summary>Operator/scanner closure of a resolved RMA; valid only once nothing is pending.</summary>
     | CloseRequested
 
 type ReturnAction =
@@ -67,6 +70,11 @@ module Returns =
 
     [<Literal>]
     let ActionQueue = "return_actions"
+
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
 
     let initialState = Initial
 
@@ -203,7 +211,9 @@ module Returns =
                        |> Option.defaultValue 0
 
                    count + already <= received)
-        | Received _, InspectionRejected reason -> not (String.IsNullOrWhiteSpace reason)
+        | Received _, InspectionRejected reason ->
+            (ignore reason
+             true)
         | _ -> false
 
     let private refundResult state event =
@@ -217,6 +227,17 @@ module Returns =
         | Some p, ReturnWindowExpired(id, deadline) ->
             p.Request.AuthorizationId = id && p.Request.WindowEndsAt = deadline
         | _ -> false
+
+    let private closeRequested _ event = event = CloseRequested
+
+    /// <summary>Closes a resolved RMA. Only resolved states route here, so no pending effect
+    /// can be orphaned by closing.</summary>
+    let private close state _ =
+        match state with
+        | ReturnState.Rejected(p, _)
+        | Refunded(p, _)
+        | RejectedAfterInspection(p, _) -> [], Closed p
+        | _ -> [], state
 
     let private absorb _ =
         function
@@ -262,14 +283,19 @@ module Returns =
 
                 on expiry (fun state _ ->
                     match state with
-                    | AuthorizationPending p -> [ NotifyOrderRejected p.Request ], Rejected(p, "window-expired")
+                    | AuthorizationPending p ->
+                        [ NotifyOrderRejected p.Request ], Rejected(p, (ReasonCode.ofLiteral "window-expired"))
                     | _ -> [], state)
 
                 internalOn absorb (fun _ _ -> [])
             }
 
             state "approved" { internalOn absorb (fun _ _ -> []) }
-            state "rejected" { internalOn absorb (fun _ _ -> []) }
+
+            state "rejected" {
+                on closeRequested close
+                internalOn absorb (fun _ _ -> [])
+            }
 
             state "label-pending" {
                 on label (fun state event ->
@@ -353,7 +379,7 @@ module Returns =
                 on
                     (fun state event ->
                         match state, event with
-                        | Inspected(p, _), CloseRequested -> p.RestockSettled
+                        | Inspected(p, _), RefundStartRequested -> p.RestockSettled
                         | _ -> false)
                     (fun state _ ->
                         match state with
@@ -386,8 +412,16 @@ module Returns =
                 internalOn absorb (fun _ _ -> [])
             }
 
-            state "refunded" { internalOn absorb (fun _ _ -> []) }
-            state "rejected-after-inspection" { internalOn absorb (fun _ _ -> []) }
+            state "refunded" {
+                on closeRequested close
+                internalOn absorb (fun _ _ -> [])
+            }
+
+            state "rejected-after-inspection" {
+                on closeRequested close
+                internalOn absorb (fun _ _ -> [])
+            }
+
             state "manual-review" { internalOn absorb (fun _ _ -> []) }
             state "closed" { internalOn absorb (fun _ _ -> []) }
         }

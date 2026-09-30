@@ -11,19 +11,23 @@ type RefundState =
     | OutcomeUnknown of ApprovedRefund
     | SettlementPending of ApprovedRefund * providerRefundReference: string
     | Succeeded of RefundRequest
-    | Failed of RefundRequest * reasonCode: string
-    | ManualReview of RefundRequest * reasonCode: string
+    | Failed of RefundRequest * reasonCode: ReasonCode
+    | ManualReview of RefundRequest * reasonCode: ReasonCode
     | Closed of RefundRequest
 
 type RefundEvent =
     | RefundRequested of RefundRequest
     | AllocationApproved of ApprovedRefund
-    | AllocationDenied of RefundRequest * reasonCode: string
+    | AllocationDenied of RefundRequest * reasonCode: ReasonCode
     | GatewayRefunded of ApprovedRefund * providerRefundReference: string
-    | GatewayDeclined of ApprovedRefund * reasonCode: string
+    | GatewayDeclined of ApprovedRefund * reasonCode: ReasonCode
     | GatewayUnknown of ApprovedRefund
     | AllocationSettled of RefundAllocationId
-    | ManualReviewRequested of reasonCode: string
+    | ManualReviewRequested of reasonCode: ReasonCode
+    /// <summary>The reconciliation scanner asks for another gateway check of the refund call.</summary>
+    | ReconcileRequested of operationId: PaymentOperationId
+    /// <summary>The reconciliation scanner ran out of checks for the refund call.</summary>
+    | ReconciliationExhausted of operationId: PaymentOperationId
     | CloseRequested
 
 type RefundAction =
@@ -33,7 +37,7 @@ type RefundAction =
     | SettleAllocation of ApprovedRefund * providerRefundReference: string
     | ReleaseAllocation of RefundRequest
     | NotifyOriginSucceeded of RefundRequest
-    | NotifyOriginFailed of RefundRequest * reasonCode: string
+    | NotifyOriginFailed of RefundRequest * reasonCode: ReasonCode
 
 [<RequireQualifiedAccess>]
 type RefundActionError =
@@ -52,6 +56,11 @@ module Refunds =
 
     [<Literal>]
     let ActionQueue = "refund_actions"
+
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
 
     let initialState = Initial
 
@@ -95,8 +104,16 @@ module Refunds =
         | SettlementPending(approved, _), AllocationSettled id -> id = approved.Request.AllocationId
         | _ -> false
 
+    let private reconcile state event =
+        match state, event with
+        | OutcomeUnknown approved, (ReconcileRequested operation | ReconciliationExhausted operation) ->
+            operation = approved.Request.OperationId
+        | _ -> false
+
     let private callback _ =
         function
+        | ReconcileRequested _
+        | ReconciliationExhausted _
         | AllocationApproved _
         | AllocationDenied _
         | GatewayRefunded _
@@ -146,6 +163,14 @@ module Refunds =
             }
 
             state "outcome-unknown" {
+                on reconcile (fun state event ->
+                    match state, event with
+                    | OutcomeUnknown approved, ReconcileRequested _ -> [ QueryGatewayRefund approved ], state
+                    | OutcomeUnknown approved, ReconciliationExhausted _ ->
+                        let reason = ReasonCode.ofLiteral "gateway-outcome-unknown"
+                        [ NotifyOriginFailed(approved.Request, reason) ], ManualReview(approved.Request, reason)
+                    | _ -> [], state)
+
                 on gatewayResult (fun state event ->
                     match state, event with
                     | OutcomeUnknown approved, GatewayRefunded(_, reference) ->

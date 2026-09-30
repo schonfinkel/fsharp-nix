@@ -56,6 +56,7 @@ CREATE TABLE fsnix.return_lines (
     order_line_id uuid NOT NULL,
     quantity integer NOT NULL CHECK (quantity > 0),
     refunded_amount numeric(20, 8) NOT NULL CHECK (refunded_amount >= 0),
+    refunded_tax numeric(20, 8) NOT NULL CHECK (refunded_tax >= 0 AND refunded_tax <= refunded_amount),
     currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
     PRIMARY KEY (return_id, order_line_id)
 );

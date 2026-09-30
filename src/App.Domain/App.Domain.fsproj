@@ -17,6 +17,7 @@
     <Compile Include="ShipmentIds.fs" />
     <Compile Include="RefundIds.fs" />
     <Compile Include="ReturnIds.fs" />
+    <Compile Include="InvoiceIds.fs" />
     <Compile Include="OrderAddress.fs" />
     <Compile Include="OrderPricing.fs" />
     <Compile Include="CaptureAllocation.fs" />

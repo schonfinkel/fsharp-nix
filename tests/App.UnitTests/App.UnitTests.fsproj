@@ -23,6 +23,7 @@
     <ProjectReference Include="..\..\src\App.Cart\App.Cart.fsproj" />
     <ProjectReference Include="..\..\src\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\..\src\App.Domain\App.Domain.fsproj" />
+    <ProjectReference Include="..\..\src\App.Invoices\App.Invoices.fsproj" />
     <ProjectReference Include="..\..\src\App.Views\App.Views.fsproj" />
     <ProjectReference Include="..\App.Testing\App.Testing.fsproj" />
   </ItemGroup>

@@ -111,7 +111,31 @@ let private tests =
           testList
               "shipment operations"
               [ DatabaseTest.isolated false "shipment confirms allocation and labels" (fun fixture ->
-                    ShipmentOperationTests.``shipment confirms allocation and creates a carrier label`` fixture) ] ]
+                    ShipmentOperationTests.``shipment confirms allocation and creates a carrier label`` fixture) ]
+          testList
+              "invoice issuance"
+              [ DatabaseTest.isolated false "gapless numbers and redelivery idempotency" (fun fixture ->
+                    InvoiceIssuanceTests.``issuance allocates gapless numbers and is idempotent under redelivery``
+                        fixture)
+                DatabaseTest.isolated false "failed issuance never consumes a number" (fun fixture ->
+                    InvoiceIssuanceTests.``failed issuance never consumes a number`` fixture)
+                DatabaseTest.isolated false "concurrent issuers share one sequence" (fun fixture ->
+                    InvoiceIssuanceTests.``concurrent issuers share one gapless sequence`` fixture)
+                DatabaseTest.isolated false "invoice rows are insert-only" (fun fixture ->
+                    InvoiceIssuanceTests.``invoice rows are insert-only and numbers must be allocated`` fixture)
+                DatabaseTest.isolated false "rendering stores one document" (fun fixture ->
+                    InvoiceIssuanceTests.``rendering stores one content-addressed document per snapshot`` fixture)
+                DatabaseTest.isolated false "failing renderer stores nothing" (fun fixture ->
+                    InvoiceIssuanceTests.``a failing renderer reports a bounded reason and stores nothing`` fixture)
+                DatabaseTest.isolated false "invoice lists page and scope" (fun fixture ->
+                    InvoiceIssuanceTests.``invoice lists page by keyset and stay customer scoped`` fixture)
+                DatabaseTest.isolated false "render checks back off" (fun fixture ->
+                    InvoiceIssuanceTests.``render checks are armed at issuance and back off until a document exists``
+                        fixture)
+                DatabaseTest.isolated false "credit notes reverse exact lines" (fun fixture ->
+                    InvoiceIssuanceTests.``credit notes reverse exact lines in their own gapless series`` fixture)
+                DatabaseTest.isolated false "settled refund requests its credit note" (fun fixture ->
+                    InvoiceIssuanceTests.``a settled refund requests its credit note with the origin callback`` fixture) ] ]
     |> testSequenced
 
 [<EntryPoint>]

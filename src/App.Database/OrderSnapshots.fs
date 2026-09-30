@@ -19,6 +19,13 @@ type OrderSnapshotRow =
       Currency: string }
 
 [<RequireQualifiedAccess>]
+module OrderSnapshotSql =
+    let snapshotInsert = Sql.load "Orders/snapshot-insert"
+    let snapshotLoad = Sql.load "Orders/snapshot-load"
+    let snapshotMatches = Sql.load "Orders/snapshot-matches"
+    let snapshotOwned = Sql.load "Orders/snapshot-owned"
+
+[<RequireQualifiedAccess>]
 module OrderSnapshots =
     let insert
         (connection: NpgsqlConnection)
@@ -28,17 +35,7 @@ module OrderSnapshots =
         =
         task {
             use command =
-                new NpgsqlCommand(
-                    """INSERT INTO fsnix.order_snapshots
-                           (snapshot_id, order_id, customer_id, customer_email, address, lines,
-                            subtotal_amount, shipping_amount, tax_amount, total_amount, currency)
-                       VALUES (@snapshot_id, @order_id, @customer_id, @email, @address::jsonb, @lines::jsonb,
-                               @subtotal, @shipping, @tax, @total, @currency)
-                       ON CONFLICT (snapshot_id) DO NOTHING
-                       RETURNING snapshot_id""",
-                    connection,
-                    transaction
-                )
+                new NpgsqlCommand(OrderSnapshotSql.snapshotInsert, connection, transaction)
 
             command.Parameters.AddWithValue("snapshot_id", snapshot.SnapshotId) |> ignore
             command.Parameters.AddWithValue("order_id", snapshot.OrderId) |> ignore
@@ -58,15 +55,7 @@ module OrderSnapshots =
                 return Ok()
             else
                 use verify =
-                    new NpgsqlCommand(
-                        """SELECT EXISTS (SELECT 1 FROM fsnix.order_snapshots
-                           WHERE snapshot_id=@snapshot_id AND order_id=@order_id AND customer_id=@customer_id
-                             AND customer_email=@email AND address=@address::jsonb AND lines=@lines::jsonb
-                             AND subtotal_amount=@subtotal AND shipping_amount=@shipping AND tax_amount=@tax
-                             AND total_amount=@total AND currency=@currency)""",
-                        connection,
-                        transaction
-                    )
+                    new NpgsqlCommand(OrderSnapshotSql.snapshotMatches, connection, transaction)
 
                 verify.Parameters.AddWithValue("snapshot_id", snapshot.SnapshotId) |> ignore
                 verify.Parameters.AddWithValue("order_id", snapshot.OrderId) |> ignore
@@ -97,13 +86,7 @@ module OrderSnapshots =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync(ct)
 
-            use command =
-                new NpgsqlCommand(
-                    """SELECT snapshot_id, order_id, customer_id, customer_email, address::text, lines::text,
-                              subtotal_amount, shipping_amount, tax_amount, total_amount, currency
-                       FROM fsnix.order_snapshots WHERE snapshot_id = @id""",
-                    connection
-                )
+            use command = new NpgsqlCommand(OrderSnapshotSql.snapshotLoad, connection)
 
             command.Parameters.AddWithValue("id", snapshotId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -135,11 +118,7 @@ module OrderSnapshots =
             use connection = dataSource.CreateConnection()
             do! connection.OpenAsync ct
 
-            use command =
-                new NpgsqlCommand(
-                    "SELECT EXISTS (SELECT 1 FROM fsnix.order_snapshots WHERE order_id = @order_id AND customer_id = @customer_id)",
-                    connection
-                )
+            use command = new NpgsqlCommand(OrderSnapshotSql.snapshotOwned, connection)
 
             command.Parameters.AddWithValue("order_id", orderId) |> ignore
             command.Parameters.AddWithValue("customer_id", customerId) |> ignore

@@ -4,6 +4,7 @@ open System
 open System.Threading
 open System.Threading.Tasks
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open App.Refunds
@@ -11,6 +12,15 @@ open App.Returns
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
+
+[<RequireQualifiedAccess>]
+module RefundSql =
+    let insertRefundOperation = Sql.load "Refunds/insert-refund-operation"
+    let refundOperationRow = Sql.load "Refunds/refund-operation-row"
+    let refundOperationStatus = Sql.load "Refunds/refund-operation-status"
+    let releaseAllocation = Sql.load "Refunds/release-allocation"
+    let settleAllocation = Sql.load "Refunds/settle-allocation"
+    let settleRefundOperation = Sql.load "Refunds/settle-refund-operation"
 
 [<RequireQualifiedAccess>]
 module RefundEffects =
@@ -29,8 +39,11 @@ module RefundEffects =
         | Error _ -> Task.FromResult(Error RefundActionError.CallbackEncodingFailed)
         | Ok json ->
             task {
-                let! first = WorkflowEffects.receipt connection tx record (actionKind record.Action) json ct
-                return Ok first
+                match! WorkflowEffects.receipt connection tx record (actionKind record.Action) json ct with
+                | Ok ReceiptStatus.FirstRun -> return Ok true
+                | Ok ReceiptStatus.Duplicate -> return Ok false
+                | Error ReceiptFailure.EncodingFailed -> return Error RefundActionError.CallbackEncodingFailed
+                | Error ReceiptFailure.Mismatch -> return Error RefundActionError.ActionReceiptMismatch
             }
 
     let private deliver connection tx record purpose machine entity codecEvent (codec: Codec<'Event>) ct =
@@ -79,12 +92,7 @@ module RefundEffects =
                                     PaymentCodec.event
                                     ct
                         | SettleAllocation(approved, _) ->
-                            use update =
-                                new NpgsqlCommand(
-                                    "UPDATE fsnix.refund_allocations SET status='settled',updated_at=statement_timestamp() WHERE allocation_id=@id AND status='pending'",
-                                    connection,
-                                    tx
-                                )
+                            use update = new NpgsqlCommand(RefundSql.settleAllocation, connection, tx)
 
                             update.Parameters.AddWithValue("id", RefundAllocationId.value approved.Request.AllocationId)
                             |> ignore
@@ -103,12 +111,7 @@ module RefundEffects =
                                     PaymentCodec.event
                                     ct
                         | ReleaseAllocation request ->
-                            use update =
-                                new NpgsqlCommand(
-                                    "UPDATE fsnix.refund_allocations SET status='released',updated_at=statement_timestamp() WHERE allocation_id=@id AND status='pending'",
-                                    connection,
-                                    tx
-                                )
+                            use update = new NpgsqlCommand(RefundSql.releaseAllocation, connection, tx)
 
                             update.Parameters.AddWithValue("id", RefundAllocationId.value request.AllocationId)
                             |> ignore
@@ -127,33 +130,52 @@ module RefundEffects =
                                     PaymentCodec.event
                                     ct
                         | NotifyOriginSucceeded request ->
-                            match request.Origin with
-                            | OrderCancellation orderId ->
-                                return!
+                            // Every settled refund gets exactly one credit note, keyed by the refund.
+                            let! credit =
+                                match InvoiceRequest.forCredit request.RefundId request.Origin with
+                                | Ok creditRequest ->
                                     deliver
                                         connection
                                         tx
                                         record
-                                        "order-refunded"
-                                        Orders.MachineKey
-                                        orderId
-                                        (OrderRefunded request.RefundId)
-                                        OrderCodec.event
+                                        "credit-note-request"
+                                        Invoices.MachineKey
+                                        (EntityId.value (Invoices.invoiceEntityId creditRequest.InvoiceId))
+                                        (InvoiceRequested creditRequest)
+                                        InvoiceCodec.event
                                         ct
-                            | InspectedReturn(_, returnId) ->
-                                let id = ReturnId.create returnId |> Result.defaultWith invalidOp
+                                | Error _ -> Task.FromResult(Error RefundActionError.InvalidAction)
 
-                                return!
-                                    deliver
-                                        connection
-                                        tx
-                                        record
-                                        "return-refunded"
-                                        Returns.MachineKey
-                                        (EntityId.value (Returns.returnEntityId id))
-                                        (RefundSucceeded request.RefundId)
-                                        ReturnCodec.event
-                                        ct
+                            match credit with
+                            | Error error -> return Error error
+                            | Ok() ->
+                                match request.Origin with
+                                | OrderCancellation orderId ->
+                                    return!
+                                        deliver
+                                            connection
+                                            tx
+                                            record
+                                            "order-refunded"
+                                            Orders.MachineKey
+                                            orderId
+                                            (OrderRefunded request.RefundId)
+                                            OrderCodec.event
+                                            ct
+                                | InspectedReturn(_, returnId) ->
+                                    let id = ReturnId.create returnId |> Result.defaultWith invalidOp
+
+                                    return!
+                                        deliver
+                                            connection
+                                            tx
+                                            record
+                                            "return-refunded"
+                                            Returns.MachineKey
+                                            (EntityId.value (Returns.returnEntityId id))
+                                            (RefundSucceeded request.RefundId)
+                                            ReturnCodec.event
+                                            ct
                         | NotifyOriginFailed(request, reason) ->
                             match request.Origin with
                             | OrderCancellation orderId ->
@@ -194,6 +216,8 @@ module RefundEffects =
                     return Ok()
         }
 
+    let private providerDeclined = ReasonCode.ofLiteral "provider-declined"
+
     let private recordedEvent approved status reference result =
         match status with
         | "succeeded" ->
@@ -202,7 +226,13 @@ module RefundEffects =
                 reference
                 |> Option.defaultWith (fun () -> invalidOp "Missing refund reference.")
             )
-        | "failed" -> GatewayDeclined(approved, result |> Option.defaultValue "provider-declined")
+        | "failed" ->
+            GatewayDeclined(
+                approved,
+                result
+                |> Option.map (ReasonCode.sanitize providerDeclined)
+                |> Option.defaultValue providerDeclined
+            )
         | _ -> GatewayUnknown approved
 
     let applyGateway
@@ -233,16 +263,15 @@ module RefundEffects =
                     do! tx.RollbackAsync ct
                     return Error error
                 | Ok first ->
-                    use insert =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.payment_operations(operation_id,payment_entity_id,order_id,kind,amount,currency) VALUES(@id,@entity,@order,'refund',@amount,@currency) ON CONFLICT(operation_id) DO NOTHING",
-                            connection,
-                            tx
-                        )
+                    use insert = new NpgsqlCommand(RefundSql.insertRefundOperation, connection, tx)
 
                     insert.Parameters.AddWithValue("id", operationId) |> ignore
                     insert.Parameters.AddWithValue("entity", paymentEntity orderId) |> ignore
                     insert.Parameters.AddWithValue("order", orderId) |> ignore
+
+                    insert.Parameters.AddWithValue("refund_entity", EntityId.value record.EntityId)
+                    |> ignore
+
                     insert.Parameters.AddWithValue("amount", Money.amount request.Amount) |> ignore
 
                     insert.Parameters.AddWithValue("currency", Money.currencyCode request.Amount)
@@ -250,12 +279,7 @@ module RefundEffects =
 
                     let! _ = insert.ExecuteNonQueryAsync ct
 
-                    use read =
-                        new NpgsqlCommand(
-                            "SELECT payment_entity_id,order_id,kind,amount,currency,status,provider_reference,result_code FROM fsnix.payment_operations WHERE operation_id=@id",
-                            connection,
-                            tx
-                        )
+                    use read = new NpgsqlCommand(RefundSql.refundOperationRow, connection, tx)
 
                     read.Parameters.AddWithValue("id", operationId) |> ignore
                     use! reader = read.ExecuteReaderAsync ct
@@ -327,10 +351,9 @@ module RefundEffects =
                                 not (String.IsNullOrWhiteSpace providerRef) && providerRef.Length <= 256
                                 ->
                                 "succeeded", Some providerRef, "refunded", GatewayRefunded(approved, providerRef)
-                            | GatewayRefund.GatewayRefundDeclined code when
-                                not (String.IsNullOrWhiteSpace code) && code.Length <= 64
-                                ->
-                                "failed", None, code, GatewayDeclined(approved, code)
+                            | GatewayRefund.GatewayRefundDeclined text ->
+                                let reason = ReasonCode.sanitize providerDeclined text
+                                "failed", None, ReasonCode.value reason, GatewayDeclined(approved, reason)
                             | _ -> "unknown", None, "outcome-unknown", GatewayUnknown approved
 
                         use settleConnection = dataSource.CreateConnection()
@@ -338,11 +361,7 @@ module RefundEffects =
                         use! settleTx = settleConnection.BeginTransactionAsync ct
 
                         use update =
-                            new NpgsqlCommand(
-                                "UPDATE fsnix.payment_operations SET status=@status,provider_reference=@ref,result_code=@result,attempts=attempts+1,updated_at=statement_timestamp() WHERE operation_id=@id AND status IN ('pending','unknown')",
-                                settleConnection,
-                                settleTx
-                            )
+                            new NpgsqlCommand(RefundSql.settleRefundOperation, settleConnection, settleTx)
 
                         update.Parameters.AddWithValue("id", operationId) |> ignore
                         update.Parameters.AddWithValue("status", status) |> ignore
@@ -362,11 +381,7 @@ module RefundEffects =
                             else
                                 task {
                                     use readBack =
-                                        new NpgsqlCommand(
-                                            "SELECT status,provider_reference,result_code FROM fsnix.payment_operations WHERE operation_id=@id",
-                                            settleConnection,
-                                            settleTx
-                                        )
+                                        new NpgsqlCommand(RefundSql.refundOperationStatus, settleConnection, settleTx)
 
                                     readBack.Parameters.AddWithValue("id", operationId) |> ignore
                                     use! row = readBack.ExecuteReaderAsync ct

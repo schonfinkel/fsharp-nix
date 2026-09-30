@@ -7,6 +7,7 @@ open System.Threading
 open System.Threading.Tasks
 open App.Cart
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open App.Refunds
@@ -15,6 +16,17 @@ open App.Shipments
 open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
+
+[<RequireQualifiedAccess>]
+module OrderSql =
+    let authorizationIntentStatus = Sql.load "Orders/authorization-intent-status"
+    let cancelReservationDeadlines = Sql.load "Orders/cancel-reservation-deadlines"
+    let claimAuthorizationIntent = Sql.load "Orders/claim-authorization-intent"
+    let completeAuthorizationIntent = Sql.load "Orders/complete-authorization-intent"
+    let insertReservationDeadline = Sql.load "Orders/insert-reservation-deadline"
+    let insertReturnLine = Sql.load "Orders/insert-return-line"
+    let insertReturnRequest = Sql.load "Orders/insert-return-request"
+    let insertShipment = Sql.load "Orders/insert-shipment"
 
 [<RequireQualifiedAccess>]
 module OrderEffects =
@@ -30,6 +42,7 @@ module OrderEffects =
         | RequestCapture _ -> "request-capture"
         | StartReturn _ -> "start-return"
         | StartRefund _ -> "start-refund"
+        | RequestInvoice _ -> "request-invoice"
 
     let private key (record: ActionRecord<OrderId, OrderAction>) purpose =
         $"xmsg:v1:{MachineId.value record.MachineId}:{CommandId.value record.CommandId}:{record.Ordinal}:{purpose}"
@@ -48,89 +61,18 @@ module OrderEffects =
         (record: ActionRecord<OrderId, OrderAction>)
         (ct: CancellationToken)
         =
-        task {
-            let json =
-                OrderCodec.action.Encode record.Action
-                |> Result.defaultWith (fun _ -> "invalid")
+        WorkflowEffects.firstDelivery
+            OrderCodec.action
+            actionKind
+            OrderActionError.CallbackEncodingFailed
+            OrderActionError.ActionReceiptMismatch
+            connection
+            tx
+            record
+            ct
 
-            let hash = SHA256.HashData(Encoding.UTF8.GetBytes json)
-
-            use insert =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.action_receipts(machine_id,command_id,ordinal,action_kind,payload_hash) VALUES(@machine,@command,@ordinal,@kind,@hash) ON CONFLICT DO NOTHING RETURNING command_id",
-                    connection,
-                    tx
-                )
-
-            insert.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
-            |> ignore
-
-            insert.Parameters.AddWithValue("command", CommandId.value record.CommandId)
-            |> ignore
-
-            insert.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-            insert.Parameters.AddWithValue("kind", actionKind record.Action) |> ignore
-            insert.Parameters.AddWithValue("hash", hash) |> ignore
-            let! inserted = insert.ExecuteScalarAsync ct
-
-            if not (isNull inserted) then
-                return Ok true
-            else
-                use verify =
-                    new NpgsqlCommand(
-                        "SELECT action_kind,payload_hash FROM fsnix.action_receipts WHERE machine_id=@machine AND command_id=@command AND ordinal=@ordinal",
-                        connection,
-                        tx
-                    )
-
-                verify.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
-                |> ignore
-
-                verify.Parameters.AddWithValue("command", CommandId.value record.CommandId)
-                |> ignore
-
-                verify.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-                let! reader = verify.ExecuteReaderAsync ct
-                let! found = reader.ReadAsync ct
-
-                let matches =
-                    found
-                    && reader.GetString 0 = actionKind record.Action
-                    && CryptographicOperations.FixedTimeEquals(reader.GetFieldValue<byte array>(1), hash)
-
-                reader.Dispose()
-
-                return
-                    if matches then
-                        Ok false
-                    else
-                        Error OrderActionError.ActionReceiptMismatch
-        }
-
-    let private callback
-        (connection: NpgsqlConnection)
-        (tx: NpgsqlTransaction)
-        callbackKey
-        machine
-        entity
-        eventJson
-        (ct: CancellationToken)
-        =
-        task {
-            use command =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.integration_outbox(callback_key,machine_id,entity_id,event) VALUES(@key,@machine,@entity,@event::jsonb) ON CONFLICT(callback_key) DO NOTHING",
-                    connection,
-                    tx
-                )
-
-            command.Parameters.AddWithValue("key", callbackKey) |> ignore
-            command.Parameters.AddWithValue("machine", machine) |> ignore
-            command.Parameters.AddWithValue("entity", entity) |> ignore
-            command.Parameters.AddWithValue("event", eventJson) |> ignore
-            let! _ = command.ExecuteNonQueryAsync ct
-            return ()
-        }
+    let private callback connection tx callbackKey machine entity eventJson ct =
+        WorkflowEffects.callback connection tx callbackKey machine entity eventJson ct
 
     let applyReserveStock
         (dataSource: NpgsqlDataSource)
@@ -201,12 +143,7 @@ module OrderEffects =
 
                         match result with
                         | Ok _ ->
-                            use deadline =
-                                new NpgsqlCommand(
-                                    "INSERT INTO fsnix.reservation_deadlines(order_id,generation,deadline,gate_callback_key) VALUES(@order,@generation,@deadline,@gate) ON CONFLICT DO NOTHING",
-                                    connection,
-                                    tx
-                                )
+                            use deadline = new NpgsqlCommand(OrderSql.insertReservationDeadline, connection, tx)
 
                             deadline.Parameters.AddWithValue("order", orderEntity) |> ignore
                             deadline.Parameters.AddWithValue("generation", order.Generation) |> ignore
@@ -246,12 +183,7 @@ module OrderEffects =
                     let entity = EntityId.value record.EntityId
                     do! StockReservations.release connection tx entity ct
 
-                    use cancel =
-                        new NpgsqlCommand(
-                            "UPDATE fsnix.reservation_deadlines SET status='cancelled',lease_owner=NULL,lease_until=NULL WHERE order_id=@order AND status='pending'",
-                            connection,
-                            tx
-                        )
+                    use cancel = new NpgsqlCommand(OrderSql.cancelReservationDeadlines, connection, tx)
 
                     cancel.Parameters.AddWithValue("order", entity) |> ignore
                     let! _ = cancel.ExecuteNonQueryAsync ct
@@ -334,28 +266,14 @@ module OrderEffects =
                 | RequestAuthorization(method, attempt, amount) ->
                     let orderEntity = EntityId.value record.EntityId
 
-                    use claim =
-                        new NpgsqlCommand(
-                            """INSERT INTO fsnix.authorization_intents(order_id,amount,currency,status)
-                               SELECT @order,@amount,@currency,'claimed'
-                               WHERE EXISTS (SELECT 1 FROM fsnix.order_reservation_controls WHERE order_id=@order AND status='open')
-                               ON CONFLICT(order_id) DO UPDATE SET status='claimed', updated_at=statement_timestamp()
-                                   WHERE fsnix.authorization_intents.status='pending'""",
-                            connection,
-                            tx
-                        )
+                    use claim = new NpgsqlCommand(OrderSql.claimAuthorizationIntent, connection, tx)
 
                     claim.Parameters.AddWithValue("order", orderEntity) |> ignore
                     claim.Parameters.AddWithValue("amount", Money.amount amount) |> ignore
                     claim.Parameters.AddWithValue("currency", Money.currencyCode amount) |> ignore
                     let! _ = claim.ExecuteNonQueryAsync ct
 
-                    use read =
-                        new NpgsqlCommand(
-                            "SELECT status FROM fsnix.authorization_intents WHERE order_id=@order",
-                            connection,
-                            tx
-                        )
+                    use read = new NpgsqlCommand(OrderSql.authorizationIntentStatus, connection, tx)
 
                     read.Parameters.AddWithValue("order", orderEntity) |> ignore
                     let! status = read.ExecuteScalarAsync ct
@@ -428,22 +346,12 @@ module OrderEffects =
                 | RequestPaymentCancellation reason ->
                     let orderEntity = EntityId.value record.EntityId
 
-                    use fence =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.order_reservation_controls(order_id,generation,status) VALUES(@order,1,'cancelled') ON CONFLICT(order_id) DO UPDATE SET status='cancelled',updated_at=statement_timestamp()",
-                            connection,
-                            tx
-                        )
+                    use fence = new NpgsqlCommand(StockSql.cancelReservationControl, connection, tx)
 
                     fence.Parameters.AddWithValue("order", orderEntity) |> ignore
                     let! _ = fence.ExecuteNonQueryAsync ct
 
-                    use intent =
-                        new NpgsqlCommand(
-                            "UPDATE fsnix.authorization_intents SET status='cancelled' WHERE order_id=@order AND status IN ('pending','claimed')",
-                            connection,
-                            tx
-                        )
+                    use intent = new NpgsqlCommand(StockSql.cancelAuthorizationIntent, connection, tx)
 
                     intent.Parameters.AddWithValue("order", orderEntity) |> ignore
                     let! _ = intent.ExecuteNonQueryAsync ct
@@ -494,11 +402,7 @@ module OrderEffects =
                     let! committed = StockReservations.commit connection tx entity ct
 
                     use cancelDeadline =
-                        new NpgsqlCommand(
-                            "UPDATE fsnix.reservation_deadlines SET status='cancelled',lease_owner=NULL,lease_until=NULL WHERE order_id=@order AND status='pending'",
-                            connection,
-                            tx
-                        )
+                        new NpgsqlCommand(OrderSql.cancelReservationDeadlines, connection, tx)
 
                     cancelDeadline.Parameters.AddWithValue("order", entity) |> ignore
                     let! _ = cancelDeadline.ExecuteNonQueryAsync ct
@@ -507,7 +411,7 @@ module OrderEffects =
                         if committed > 0 then
                             StockCommitted
                         else
-                            StockCommitFailed "no-open-reservations"
+                            StockCommitFailed(ReasonCode.ofLiteral "no-open-reservations")
 
                     match OrderCodec.event.Encode event with
                     | Error _ ->
@@ -516,11 +420,7 @@ module OrderEffects =
                     | Ok eventJson ->
                         if committed > 0 then
                             use complete =
-                                new NpgsqlCommand(
-                                    "UPDATE fsnix.authorization_intents SET status='completed' WHERE order_id=@order AND status='claimed'",
-                                    connection,
-                                    tx
-                                )
+                                new NpgsqlCommand(OrderSql.completeAuthorizationIntent, connection, tx)
 
                             complete.Parameters.AddWithValue("order", entity) |> ignore
                             let! _ = complete.ExecuteNonQueryAsync ct
@@ -564,12 +464,7 @@ module OrderEffects =
                 | CreateShipment(shipment, addressSnapshotId) ->
                     let orderEntity = EntityId.value record.EntityId
 
-                    use insert =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.shipments(shipment_id,allocation_id,order_id) VALUES(@shipment,@allocation,@order) ON CONFLICT(shipment_id) DO NOTHING",
-                            connection,
-                            tx
-                        )
+                    use insert = new NpgsqlCommand(OrderSql.insertShipment, connection, tx)
 
                     insert.Parameters.AddWithValue("shipment", ShipmentId.value shipment.ShipmentId)
                     |> ignore
@@ -581,6 +476,36 @@ module OrderEffects =
                     |> ignore
 
                     insert.Parameters.AddWithValue("order", orderEntity) |> ignore
+
+                    // The exact capture split, so a cancellation credit note can reverse it.
+                    let allocation = shipment.Allocation
+
+                    insert.Parameters.AddWithValue("capture", CaptureId.value shipment.CaptureId)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("merchandise", Money.amount allocation.Merchandise)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("shipping", Money.amount allocation.Shipping)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue("tax", Money.amount allocation.Tax) |> ignore
+                    insert.Parameters.AddWithValue("total", Money.amount allocation.Total) |> ignore
+
+                    insert.Parameters.AddWithValue("currency", Money.currencyCode allocation.Total)
+                    |> ignore
+
+                    insert.Parameters.AddWithValue(
+                        "lines",
+                        Text.Json.JsonSerializer.Serialize(
+                            allocation.Lines
+                            |> List.map (fun line ->
+                                {| lineId = OrderLineId.wireString line.LineId
+                                   quantity = line.Quantity |})
+                        )
+                    )
+                    |> ignore
+
                     let! _ = insert.ExecuteNonQueryAsync ct
 
                     let shipmentRequest =
@@ -740,12 +665,7 @@ module OrderEffects =
             | Ok _ ->
                 match record.Action with
                 | StartReturn request when request.OrderId = EntityId.value record.EntityId ->
-                    use insert =
-                        new NpgsqlCommand(
-                            "INSERT INTO fsnix.return_requests(return_id,authorization_id,order_id,window_ends_at) VALUES(@id,@auth,@order,@deadline) ON CONFLICT(return_id) DO NOTHING",
-                            connection,
-                            tx
-                        )
+                    use insert = new NpgsqlCommand(OrderSql.insertReturnRequest, connection, tx)
 
                     insert.Parameters.AddWithValue("id", ReturnId.value request.ReturnId) |> ignore
 
@@ -757,12 +677,7 @@ module OrderEffects =
                     let! _ = insert.ExecuteNonQueryAsync ct
 
                     for line in request.Lines do
-                        use row =
-                            new NpgsqlCommand(
-                                "INSERT INTO fsnix.return_lines(return_id,order_line_id,quantity,refunded_amount,currency) VALUES(@return,@line,@quantity,@amount,@currency) ON CONFLICT(return_id,order_line_id) DO NOTHING",
-                                connection,
-                                tx
-                            )
+                        use row = new NpgsqlCommand(OrderSql.insertReturnLine, connection, tx)
 
                         row.Parameters.AddWithValue("return", ReturnId.value request.ReturnId) |> ignore
 
@@ -770,7 +685,11 @@ module OrderEffects =
                         |> ignore
 
                         row.Parameters.AddWithValue("quantity", line.Quantity) |> ignore
-                        row.Parameters.AddWithValue("amount", Money.amount line.RefundAmount) |> ignore
+
+                        row.Parameters.AddWithValue("amount", Money.amount (ReturnLine.refundAmount line))
+                        |> ignore
+
+                        row.Parameters.AddWithValue("tax", Money.amount line.Tax) |> ignore
                         row.Parameters.AddWithValue("currency", request.Currency) |> ignore
                         let! _ = row.ExecuteNonQueryAsync ct
                         ()
@@ -796,3 +715,46 @@ module OrderEffects =
                     do! tx.RollbackAsync ct
                     return Error OrderActionError.InvalidAction
         }
+
+    let private orderError (result: Task<Result<'T, ReceiptFailure>>) =
+        task {
+            let! value = result
+
+            return
+                value
+                |> Result.mapError (function
+                    | ReceiptFailure.EncodingFailed -> OrderActionError.CallbackEncodingFailed
+                    | ReceiptFailure.Mismatch -> OrderActionError.ActionReceiptMismatch)
+        }
+
+    /// <summary>Hands the placed order to the invoice machine. The invoice entity and request
+    /// derive from the order's own snapshot, so a redelivered or repeated request lands on the
+    /// same invoice.</summary>
+    let applyRequestInvoice
+        (dataSource: NpgsqlDataSource)
+        (record: ActionRecord<OrderId, OrderAction>)
+        (ct: CancellationToken)
+        : Task<Result<unit, OrderActionError>> =
+        match record.Action with
+        | RequestInvoice snapshotId when (InvoiceRequest.forOrder snapshotId).OrderId = EntityId.value record.EntityId ->
+            let request = InvoiceRequest.forOrder snapshotId
+
+            WorkflowEffects.runLocalEffect
+                dataSource
+                (fun connection tx token ->
+                    WorkflowEffects.receiptFor OrderCodec.action actionKind connection tx record token
+                    |> orderError)
+                (fun connection tx token ->
+                    WorkflowEffects.deliver
+                        connection
+                        tx
+                        record
+                        "invoice-request"
+                        Invoices.MachineKey
+                        (EntityId.value (Invoices.invoiceEntityId request.InvoiceId))
+                        InvoiceCodec.event
+                        (InvoiceRequested request)
+                        token
+                    |> orderError)
+                ct
+        | _ -> Task.FromResult(Error OrderActionError.InvalidAction)

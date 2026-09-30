@@ -52,6 +52,10 @@ module CheckoutPricing =
         pricing
 
 [<RequireQualifiedAccess>]
+module OrderEndpointSql =
+    let lastDeliveredAt = Sql.load "Orders/last-delivered-at"
+
+[<RequireQualifiedAccess>]
 module OrderEndpoints =
     let private formValue (form: IFormCollection) name =
         match form.TryGetValue name with
@@ -446,6 +450,20 @@ module OrderEndpoints =
                         let orders = context.GetService<OrderMachineClient>()
                         let! snapshot = Machine.state orders.Orders orderId context.RequestAborted
 
+                        let! invoice =
+                            InvoiceQueries.tryForOrder
+                                dataSource
+                                (EntityId.value orderId)
+                                user.Id
+                                context.RequestAborted
+
+                        let! credits =
+                            InvoiceQueries.creditsForOrder
+                                dataSource
+                                (EntityId.value orderId)
+                                user.Id
+                                context.RequestAborted
+
                         match snapshot with
                         | Ok(Some order) ->
                             let pay =
@@ -501,6 +519,15 @@ module OrderEndpoints =
                                   Pay = pay
                                   ReturnLines = returnLines
                                   ReturnStatuses = returnStatuses
+                                  Invoice =
+                                    invoice
+                                    |> Option.filter (fun (_, _, hasDocument) -> hasDocument)
+                                    |> Option.map (fun (id, number, _) ->
+                                        $"/invoices/{InvoiceId.wireString id}/pdf", InvoiceNumber.display number)
+                                  CreditNotes =
+                                    credits
+                                    |> List.map (fun (id, number) ->
+                                        $"/invoices/{InvoiceId.wireString id}/pdf", InvoiceNumber.display number)
                                   Error = None }
 
                             return! context.WriteHtmlView(CheckoutViews.orderPage context model)
@@ -666,11 +693,7 @@ module OrderEndpoints =
                                     use connection = dataSource.CreateConnection()
                                     do! connection.OpenAsync context.RequestAborted
 
-                                    use cmd =
-                                        new NpgsqlCommand(
-                                            "SELECT max(delivered_at) FROM fsnix.shipments WHERE order_id=@order",
-                                            connection
-                                        )
+                                    use cmd = new NpgsqlCommand(OrderEndpointSql.lastDeliveredAt, connection)
 
                                     cmd.Parameters.AddWithValue("order", EntityId.value orderId) |> ignore
                                     let! delivered = cmd.ExecuteScalarAsync context.RequestAborted
@@ -714,7 +737,8 @@ module OrderEndpoints =
                                                   Lines =
                                                     [ { OrderLineId = line.LineId
                                                         Quantity = amount
-                                                        RefundAmount = merchandise + tax } ] }
+                                                        Merchandise = merchandise
+                                                        Tax = tax } ] }
 
                                             let! outcome =
                                                 Machine.send

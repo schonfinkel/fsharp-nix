@@ -36,7 +36,7 @@ type ShipmentInTransit =
 
 type FailedShipmentDelivery =
     { Transit: ShipmentInTransit
-      ReasonCode: string }
+      ReasonCode: ReasonCode }
 
 type CompletedShipment =
     { Transit: ShipmentInTransit
@@ -52,13 +52,13 @@ type ShipmentState =
     | Delivered of CompletedShipment
     | ReturnedToSender of CompletedShipment
     | Lost of CompletedShipment
-    | ManualReview of ShipmentRequest * reasonCode: string
+    | ManualReview of ShipmentRequest * reasonCode: ReasonCode
     | Closed of ShipmentRequest
 
 [<RequireQualifiedAccess>]
 type CarrierTrackingStatus =
     | InTransit
-    | DeliveryFailed of reasonCode: string
+    | DeliveryFailed of reasonCode: ReasonCode
     | Delivered
     | ReturnedToSender
     | Lost
@@ -72,15 +72,15 @@ type CarrierTrackingUpdate =
 type ShipmentEvent =
     | ShipmentRequested of ShipmentRequest
     | AllocationConfirmed of ShipmentAllocationId
-    | AllocationRejected of ShipmentAllocationId * reasonCode: string
+    | AllocationRejected of ShipmentAllocationId * reasonCode: ReasonCode
     | PreparationCompleted
     | LabelCreated of generation: int64 * carrierReference: CarrierReference
-    | LabelCreationFailed of generation: int64 * reasonCode: string
+    | LabelCreationFailed of generation: int64 * reasonCode: ReasonCode
     | DispatchConfirmed of dispatchedAt: DateTimeOffset
     | CarrierTrackingReceived of CarrierTrackingUpdate
     | DeliveryRetryRequested
     | MarkLost of expectedGeneration: int64 * expectedLastScan: DateTimeOffset option * detectedAt: DateTimeOffset
-    | ManualReviewRequested of reasonCode: string
+    | ManualReviewRequested of reasonCode: ReasonCode
     | ShipmentCloseRequested
 
 type ShipmentAction =
@@ -89,6 +89,16 @@ type ShipmentAction =
     | NotifyOrderDispatched of orderId: string * ShipmentId * ShipmentAllocationId * dispatchedAt: DateTimeOffset
     | NotifyOrderDelivered of orderId: string * ShipmentId * ShipmentAllocationId * deliveredAt: DateTimeOffset
     | RequestDeliveryRetry of CarrierReference * attempt: int
+    /// <summary>Arms (or moves forward) the lost-shipment check: no newer scan by
+    /// <c>observedAt</c> plus the configured window fires <c>MarkLost</c> with exactly this
+    /// generation and last scan.</summary>
+    | RecordTrackingCheckpoint of
+        ShipmentId *
+        generation: int64 *
+        lastScanAt: DateTimeOffset option *
+        observedAt: DateTimeOffset
+    /// <summary>The shipment reached a terminal carrier outcome; stop checking for loss.</summary>
+    | StopTrackingCheck of ShipmentId
 
 [<RequireQualifiedAccess>]
 type ShipmentActionError =
@@ -110,6 +120,11 @@ module Shipments =
 
     [<Literal>]
     let ActionQueue = "shipment_actions"
+
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
 
     [<Literal>]
     let MaxDeliveryAttempts = 3
@@ -276,13 +291,25 @@ module Shipments =
         | Some transit, CarrierTrackingReceived update ->
             let next = applyTracking transit update
 
+            let request = transit.Shipment.Shipment.Request
+
+            let checkpoint =
+                RecordTrackingCheckpoint(
+                    request.ShipmentId,
+                    transit.TrackingGeneration,
+                    Some update.OccurredAt,
+                    update.OccurredAt
+                )
+
             let actions =
                 match update.Status with
                 | CarrierTrackingStatus.Delivered ->
-                    let request = transit.Shipment.Shipment.Request
-
-                    [ NotifyOrderDelivered(request.OrderId, request.ShipmentId, request.AllocationId, update.OccurredAt) ]
-                | _ -> []
+                    [ NotifyOrderDelivered(request.OrderId, request.ShipmentId, request.AllocationId, update.OccurredAt)
+                      StopTrackingCheck request.ShipmentId ]
+                | CarrierTrackingStatus.ReturnedToSender
+                | CarrierTrackingStatus.Lost -> [ StopTrackingCheck request.ShipmentId ]
+                | CarrierTrackingStatus.InTransit
+                | CarrierTrackingStatus.DeliveryFailed _ -> [ checkpoint ]
 
             actions, next
         | _ -> [], state
@@ -369,7 +396,8 @@ module Shipments =
                               request.ShipmentId,
                               request.AllocationId,
                               dispatchedAt
-                          ) ],
+                          )
+                          RecordTrackingCheckpoint(request.ShipmentId, 1L, None, dispatchedAt) ],
                         InTransit
                             { Shipment = shipment
                               TrackingGeneration = 1L
@@ -407,7 +435,15 @@ module Shipments =
                             { failed.Transit with
                                 TrackingGeneration = failed.Transit.TrackingGeneration + 1L }
 
-                        [ RequestDeliveryRetry(transit.Shipment.CarrierReference, transit.FailedDeliveryAttempts) ],
+                        let lastScan = transit.LastCheckpoint |> Option.map _.OccurredAt
+
+                        [ RequestDeliveryRetry(transit.Shipment.CarrierReference, transit.FailedDeliveryAttempts)
+                          RecordTrackingCheckpoint(
+                              transit.Shipment.Shipment.Request.ShipmentId,
+                              transit.TrackingGeneration,
+                              lastScan,
+                              lastScan |> Option.defaultValue DateTimeOffset.UnixEpoch
+                          ) ],
                         InTransit transit
                     | _ -> [], state)
 

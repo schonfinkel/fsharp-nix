@@ -1,11 +1,16 @@
 namespace App
 
+open App.Database
 open System
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Npgsql
+
+[<RequireQualifiedAccess>]
+module HealthSql =
+    let ping = Sql.load "Health/ping"
 
 [<RequireQualifiedAccess>]
 module Health =
@@ -48,7 +53,7 @@ module Health =
                         let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
                         use connection = dataSource.CreateConnection()
                         do! connection.OpenAsync(context.RequestAborted)
-                        use command = new NpgsqlCommand("SELECT 1", connection)
+                        use command = new NpgsqlCommand(HealthSql.ping, connection)
                         let! result = command.ExecuteScalarAsync(context.RequestAborted)
                         return not (isNull result)
                     with

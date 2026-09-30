@@ -11,6 +11,7 @@ open App
 open App.Cart
 open App.Database
 open App.Domain
+open App.Invoices
 open App.Orders
 open App.Payments
 open ByzantineSystems.Automata.Core
@@ -118,6 +119,32 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
                 |> Option.defaultWith (fun () -> Assert.Fail $"Payment {paymentId:D} did not reach the expected state.")
         }
 
+    let waitForInvoice (factory: AppFactory) orderId =
+        task {
+            let invoices = factory.Services.GetRequiredService<InvoiceMachineClient>()
+
+            let entity =
+                OrderSnapshotId.create orderId
+                |> Result.defaultWith Assert.Fail
+                |> InvoiceId.ofSnapshot
+                |> Invoices.invoiceEntityId
+
+            let deadline = DateTimeOffset.UtcNow.AddSeconds 20.
+            let mutable found = None
+
+            while DateTimeOffset.UtcNow < deadline && found.IsNone do
+                match! Machine.state invoices.Invoices entity CancellationToken.None with
+                | Ok(Some snapshot) ->
+                    match snapshot.State with
+                    | Rendered(issued, _) -> found <- Some issued
+                    | _ -> do! Task.Delay 100
+                | _ -> do! Task.Delay 100
+
+            return
+                found
+                |> Option.defaultWith (fun () -> Assert.Fail $"Order {orderId:D} was not invoiced.")
+        }
+
     let authorize (client: HttpClient) orderId method =
         task {
             let! html = client.GetStringAsync $"/orders/{orderId:D}"
@@ -198,6 +225,71 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
             let! html = client.GetStringAsync $"/orders/{orderId:D}"
             Assert.Contains("Order placed", html)
             Assert.Contains("can no longer be cancelled", html)
+
+            let! invoice = waitForInvoice factory orderId
+            Assert.Equal($"order:{orderId:D}", invoice.Request.OrderId)
+            Assert.Equal(1L, invoice.Number.Sequence)
+
+            let! invoicedTotal =
+                scalar
+                    string
+                    $"SELECT i.total_amount = s.total_amount AND i.number = 1 FROM fsnix.invoices i JOIN fsnix.order_snapshots s USING (snapshot_id) WHERE i.order_id='order:{orderId:D}'"
+
+            Assert.Equal("True", invoicedTotal)
+
+            let number = InvoiceNumber.display invoice.Number
+            let invoiceId = InvoiceId.wireString invoice.Request.InvoiceId
+
+            Assert.True(
+                Text.RegularExpressions.Regex.IsMatch(number, "^INV-[0-9]{4}-(0[1-9]|1[0-2])-00000001$"),
+                number
+            )
+
+            let! invoices = client.GetStringAsync "/invoices"
+            Assert.Contains(number, invoices)
+            Assert.Contains($"/invoices/{invoiceId}/pdf", invoices)
+
+            let! orderPage = client.GetStringAsync $"/orders/{orderId:D}"
+            Assert.Contains($"Invoice {number} (PDF)", orderPage)
+
+            use! pdf = client.GetAsync $"/invoices/{invoiceId}/pdf"
+            Assert.Equal(HttpStatusCode.OK, pdf.StatusCode)
+            Assert.Equal("application/pdf", pdf.Content.Headers.ContentType.MediaType)
+            Assert.Equal($"{number}.pdf", pdf.Content.Headers.ContentDisposition.FileName.Trim('"'))
+            Assert.Contains("no-store", pdf.Headers.CacheControl.ToString())
+            let! bytes = pdf.Content.ReadAsByteArrayAsync()
+            Assert.True(Pdf.isPdf bytes, "Expected a PDF body.")
+
+            let! stored =
+                scalar
+                    string
+                    $"SELECT encode(sha256, 'hex') FROM fsnix.invoice_documents WHERE invoice_id='{invoiceId}'"
+
+            Assert.Equal(Convert.ToHexStringLower(Security.Cryptography.SHA256.HashData(bytes: byte array)), stored)
+
+            let! admin = client.GetStringAsync "/admin/invoices"
+            Assert.Contains(number, admin)
+            Assert.Contains($"/admin/invoices/{invoiceId}/pdf", admin)
+
+            use strangerFactory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, userId = Guid.NewGuid())
+
+            use stranger =
+                strangerFactory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            let! foreign = stranger.GetAsync $"/invoices/{invoiceId}/pdf"
+            Assert.Equal(HttpStatusCode.NotFound, foreign.StatusCode)
+
+            use anonymousFactory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, false)
+
+            use anonymous =
+                anonymousFactory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            let! adminAnonymous = anonymous.GetAsync "/admin/invoices"
+            Assert.Equal(HttpStatusCode.Redirect, adminAnonymous.StatusCode)
+            let! pdfAnonymous = anonymous.GetAsync $"/invoices/{invoiceId}/pdf"
+            Assert.Equal(HttpStatusCode.Redirect, pdfAnonymous.StatusCode)
 
             let! onHand =
                 scalar Convert.ToInt32 $"SELECT on_hand FROM fsnix.product_stock WHERE product_id='{productId:D}'"
@@ -340,4 +432,151 @@ type PaymentHttpTests(fixture: PostgreSqlFixture) =
 
             let gateway = factory.Services.GetRequiredService<SimulatedPaymentGateway>()
             Assert.Equal(1, gateway.AuthorizeCalls attempt)
+        }
+
+    member private _.startUnknownAuthorization() =
+        task {
+            let factory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, userId = customerId)
+
+            let client =
+                factory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            do! seedCart factory
+            let! orderId, _ = submitCheckout client
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | AwaitingAuthorization _ -> true
+                    | _ -> false)
+
+            let! attempt = authorize client orderId PaymentMethodReference.Sandbox.Unknown
+
+            let! _ =
+                waitForPayment factory orderId (function
+                    | AuthorizationUnknown _ -> true
+                    | _ -> false)
+
+            let operation = PaymentOperationId.value attempt
+
+            let! scheduled =
+                scalar
+                    string
+                    $"SELECT reconcile_machine || ':' || (reconcile_entity = 'payment:{orderId:D}') || ':' || (next_check_at > statement_timestamp()) FROM fsnix.payment_operations WHERE operation_id='{operation}' AND status='unknown'"
+
+            Assert.Equal("payments:true:true", scheduled)
+            return factory, client, orderId, operation
+        }
+
+    member this.``an unknown authorization reconciles without customer action``() =
+        task {
+            let! factory, client, orderId, operation = this.startUnknownAuthorization ()
+            use factory = factory
+            use client = client
+
+            let! _ =
+                scalar
+                    ignore
+                    $"UPDATE fsnix.payment_operations SET next_check_at = statement_timestamp() - interval '1 second' WHERE operation_id='{operation}'"
+
+            let! settled =
+                waitForPayment factory orderId (function
+                    | Authorized _
+                    | Declined _ -> true
+                    | _ -> false)
+
+            let! order =
+                waitForOrder factory orderId (function
+                    | Placed _
+                    | AwaitingAuthorization _ -> true
+                    | _ -> false)
+
+            match settled, order with
+            | Authorized _, Placed _
+            | Declined _, AwaitingAuthorization _ -> ()
+            | other -> Assert.Fail $"Payment and order disagree after reconciliation: %A{other}"
+
+            let! row =
+                scalar
+                    string
+                    $"SELECT status || ':' || checks || ':' || (next_check_at IS NULL) FROM fsnix.payment_operations WHERE operation_id='{operation}'"
+
+            Assert.True(row.EndsWith(":1:true", StringComparison.Ordinal), row)
+            Assert.True(not (row.StartsWith("unknown", StringComparison.Ordinal)), row)
+        }
+
+    member this.``exhausted reconciliation parks the payment for review``() =
+        task {
+            let! factory, client, orderId, operation = this.startUnknownAuthorization ()
+            use factory = factory
+            use client = client
+
+            let! _ =
+                scalar
+                    ignore
+                    $"UPDATE fsnix.payment_operations SET checks = 5, next_check_at = statement_timestamp() - interval '1 second' WHERE operation_id='{operation}'"
+
+            let! _ =
+                waitForPayment factory orderId (function
+                    | PaymentState.ManualReview reason -> ReasonCode.value reason = "gateway-outcome-unknown"
+                    | _ -> false)
+
+            let! row =
+                scalar
+                    string
+                    $"SELECT status || ':' || checks || ':' || (next_check_at IS NULL) FROM fsnix.payment_operations WHERE operation_id='{operation}'"
+
+            Assert.Equal("unknown:6:true", row)
+        }
+
+    member _.``a lapsed authorization sends the placed order to review``() =
+        task {
+            use factory =
+                new AppFactory(FakeFeatureFlagStore(), fixture.ConnectionString, userId = customerId)
+
+            use client =
+                factory.CreateClient(WebApplicationFactoryClientOptions(AllowAutoRedirect = false))
+
+            do! seedCart factory
+            let! orderId, _ = submitCheckout client
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | AwaitingAuthorization _ -> true
+                    | _ -> false)
+
+            let! attempt = authorize client orderId PaymentMethodReference.Sandbox.Success
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | Placed _ -> true
+                    | _ -> false)
+
+            let operation = PaymentOperationId.value attempt
+
+            let! armed =
+                scalar
+                    string
+                    $"SELECT status || ':' || (deadline > statement_timestamp()) FROM fsnix.payment_deadlines WHERE payment_entity_id='payment:{orderId:D}' AND operation_id='{operation}'"
+
+            Assert.Equal("pending:true", armed)
+
+            let! _ =
+                scalar
+                    ignore
+                    $"UPDATE fsnix.payment_deadlines SET deadline = statement_timestamp() - interval '1 second' WHERE operation_id='{operation}'"
+
+            let! _ =
+                waitForPayment factory orderId (function
+                    | PaymentState.ManualReview reason -> ReasonCode.value reason = "authorization-expired"
+                    | _ -> false)
+
+            let! _ =
+                waitForOrder factory orderId (function
+                    | OrderState.ManualReview reason -> ReasonCode.value reason = "authorization-expired"
+                    | _ -> false)
+
+            let! fired = scalar string $"SELECT status FROM fsnix.payment_deadlines WHERE operation_id='{operation}'"
+
+            Assert.Equal("fired", fired)
         }

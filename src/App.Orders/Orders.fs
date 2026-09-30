@@ -70,14 +70,14 @@ type FulfilmentOrder =
 
 type HeldForReviewOrder =
     { Fulfilment: FulfilmentOrder
-      Reason: string }
+      Reason: ReasonCode }
 
 /// <summary>Cancellation completes only after both durable effects settle: stock release and
 /// payment unwinding. Either may arrive first; both are idempotent.</summary>
 type CancellationPendingOrder =
     { Order: ReservationPendingOrder
       ReservationIds: ReservationId list
-      Reason: string
+      Reason: ReasonCode
       ReservationsSettled: bool
       PaymentSettled: bool }
 
@@ -98,8 +98,8 @@ type OrderState =
     | CancelledAfterRefund of FulfilmentOrder
     | CancellationPending of CancellationPendingOrder
     | Cancelled
-    | ReservationFailed of code: string
-    | ManualReview of reasonCode: string
+    | ReservationFailed of code: ReasonCode
+    | ManualReview of reasonCode: ReasonCode
     | Closed
 
 [<RequireQualifiedAccess>]
@@ -108,6 +108,15 @@ type ReservationFailure =
     | ProductInactive
     | PriceVersionMismatch
     | InvalidReservation
+
+[<RequireQualifiedAccess>]
+module ReservationFailure =
+    let code =
+        function
+        | ReservationFailure.InsufficientStock -> ReasonCode.ofLiteral "insufficient-stock"
+        | ReservationFailure.ProductInactive -> ReasonCode.ofLiteral "product-inactive"
+        | ReservationFailure.PriceVersionMismatch -> ReasonCode.ofLiteral "price-version-mismatch"
+        | ReservationFailure.InvalidReservation -> ReasonCode.ofLiteral "invalid-reservation"
 
 type OrderEvent =
     | OrderSubmitted of ReservationPendingOrder
@@ -118,32 +127,34 @@ type OrderEvent =
     | ReservationsReleased
     | AuthorizePaymentRequested of method: PaymentMethodReference * attempt: PaymentOperationId
     | PaymentAuthorized of attempt: PaymentOperationId * providerReference: string
-    | PaymentDeclined of attempt: PaymentOperationId * reasonCode: string
+    | PaymentDeclined of attempt: PaymentOperationId * reasonCode: ReasonCode
     | PaymentSettled
     | StockCommitted
-    | StockCommitFailed of reason: string
-    | MarkManualReview of string
+    | StockCommitFailed of reason: ReasonCode
+    | MarkManualReview of ReasonCode
     | FulfilmentRequested of OrderShipmentPlan list
     | ShipmentCreated of shipmentId: ShipmentId * allocationId: ShipmentAllocationId
-    | ShipmentCreationFailed of shipmentId: ShipmentId * allocationId: ShipmentAllocationId * reason: string
+    | ShipmentCreationFailed of shipmentId: ShipmentId * allocationId: ShipmentAllocationId * reason: ReasonCode
     | ShipmentDispatched of shipmentId: ShipmentId * allocationId: ShipmentAllocationId
     | ShipmentDelivered of shipmentId: ShipmentId * allocationId: ShipmentAllocationId
     | PaymentCaptured of captureId: CaptureId * operationId: PaymentOperationId
-    | HoldRequested of reason: string
+    | HoldRequested of reason: ReasonCode
     | ReleaseHoldRequested
     | AddressSnapshotChanged of OrderSnapshotId
     | ReturnRequested of ReturnRequest
     | ReturnRefunded of ReturnId
     | ReturnRejected of ReturnId
     | OrderRefunded of RefundId
-    | OrderRefundFailed of RefundId * reasonCode: string
+    | OrderRefundFailed of RefundId * reasonCode: ReasonCode
+    /// <summary>The payment's authorization lapsed before it was fully captured.</summary>
+    | PaymentAuthorizationExpired
 
 type OrderAction =
     | ReserveStock of ReservationPendingOrder
     | ReleaseReservations of ReservationId list
     | NotifyCartConverted of cartId: string
     | RequestAuthorization of method: PaymentMethodReference * attempt: PaymentOperationId * amount: Money
-    | RequestPaymentCancellation of reason: string
+    | RequestPaymentCancellation of reason: ReasonCode
     | CommitStock of ReservationId list
     | CreateShipment of shipment: OrderShipmentPlan * addressSnapshotId: OrderSnapshotId
     | RequestCapture of
@@ -154,6 +165,9 @@ type OrderAction =
         providerReference: string
     | StartReturn of ReturnRequest
     | StartRefund of RefundRequest
+    /// <summary>Asks the invoice machine to issue this order's invoice from its immutable
+    /// snapshot. Emitted once, on placement.</summary>
+    | RequestInvoice of OrderSnapshotId
 
 [<RequireQualifiedAccess>]
 type OrderActionError =
@@ -174,8 +188,10 @@ module Orders =
     [<Literal>]
     let ActionQueue = "order_actions"
 
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
     [<Literal>]
-    let ChartVersion = 3
+    let ChartVersion = 1
 
     let initialState = Initial
 
@@ -274,7 +290,8 @@ module Orders =
         | ReturnRefunded _
         | ReturnRejected _
         | OrderRefunded _
-        | OrderRefundFailed _ -> true
+        | OrderRefundFailed _
+        | PaymentAuthorizationExpired -> true
         | OrderSubmitted _
         | CancelRequested
         | AuthorizePaymentRequested _
@@ -465,13 +482,16 @@ module Orders =
                     let priceValid =
                         original
                         |> Option.exists (fun item ->
-                            Money.currencyCode item.UnitPrice = Money.currencyCode line.RefundAmount
-                            && Money.amount line.RefundAmount > 0m
-                            && line.RefundAmount
-                               <= Money.multiply item.UnitPrice (decimal line.Quantity)
-                                  + Money.multiply
-                                      fulfilment.PlacedOrder.Reserved.Pending.Totals.Tax
-                                      (decimal line.Quantity / decimal (Quantity.value item.Quantity)))
+                            // Merchandise must be exactly the invoiced price, so the credit note
+                            // (re-priced from the invoice line) reverses exactly what is refunded.
+                            Money.currencyCode item.UnitPrice = Money.currencyCode line.Merchandise
+                            && line.Merchandise = Money.multiply item.UnitPrice (decimal line.Quantity)
+                            && Money.amount line.Merchandise > 0m
+                            && Money.amount line.Tax >= 0m
+                            && line.Tax
+                               <= Money.multiply
+                                   fulfilment.PlacedOrder.Reserved.Pending.Totals.Tax
+                                   (decimal line.Quantity / decimal (Quantity.value item.Quantity)))
 
                     delivered > 0 && line.Quantity + reserved <= delivered && priceValid))
         | _ -> false
@@ -580,7 +600,8 @@ module Orders =
     let private shipmentCreationFailed state event =
         match fulfilmentOfState state, event with
         | Some fulfilment, ShipmentCreationFailed(shipmentId, allocationId, reason) ->
-            not (String.IsNullOrWhiteSpace reason)
+            (ignore reason
+             true)
             && (tryShipment shipmentId allocationId fulfilment
                 |> Option.exists (fun shipment -> not shipment.Created && not shipment.CreationFailed))
         | _ -> false
@@ -613,7 +634,8 @@ module Orders =
     let private holdRequested state event =
         match state, event with
         | (FulfilmentPending _ | Processing _ | PartiallyShipped _ | Shipped _), HoldRequested reason ->
-            not (String.IsNullOrWhiteSpace reason)
+            (ignore reason
+             true)
         | _ -> false
 
     let private releaseHoldRequested state event =
@@ -700,6 +722,29 @@ module Orders =
             [], classifyUpdated state updated
         | _ -> [], state
 
+    let private authorizationExpired state event =
+        match state, event with
+        | (Placed _ | FulfilmentPending _ | Processing _ | PartiallyShipped _ | Shipped _), PaymentAuthorizationExpired ->
+            true
+        | _ -> false
+
+    /// <summary>Nothing more may ship against a lapsed authorization: fulfilment is held for an
+    /// operator, and an order not yet in fulfilment goes to manual review.</summary>
+    let private applyAuthorizationExpired state _ =
+        let reason = ReasonCode.ofLiteral "authorization-expired"
+
+        match state with
+        | Placed _ -> [], ManualReview reason
+        | FulfilmentPending fulfilment
+        | Processing fulfilment
+        | PartiallyShipped fulfilment
+        | Shipped fulfilment ->
+            [],
+            HeldForReview
+                { Fulfilment = fulfilment
+                  Reason = reason }
+        | _ -> [], state
+
     let private applyHoldRequested state event =
         match fulfilmentOfState state, event with
         | Some fulfilment, HoldRequested reason ->
@@ -760,7 +805,7 @@ module Orders =
 
                 on failed (fun _ event ->
                     match event with
-                    | StockReservationFailed reason -> [], ReservationFailed(string reason)
+                    | StockReservationFailed reason -> [], ReservationFailed(ReservationFailure.code reason)
                     | _ -> [], Initial)
 
                 on cancelable (fun state _ ->
@@ -769,7 +814,7 @@ module Orders =
                         beginCancellation
                             { Pending = pending
                               ReservationIds = [] }
-                            "customer-cancelled"
+                            (ReasonCode.ofLiteral "customer-cancelled")
                             false
                     | _ -> [], state)
 
@@ -788,13 +833,14 @@ module Orders =
 
                 on cancelable (fun state _ ->
                     match state with
-                    | AwaitingAuthorization reserved -> beginCancellation reserved "customer-cancelled" false
+                    | AwaitingAuthorization reserved ->
+                        beginCancellation reserved (ReasonCode.ofLiteral "customer-cancelled") false
                     | _ -> [], state)
 
                 on expired (fun state event ->
                     match state, event with
                     | AwaitingAuthorization reserved, ReservationExpired _ ->
-                        beginCancellation reserved "reservation-expired" false
+                        beginCancellation reserved (ReasonCode.ofLiteral "reservation-expired") false
                     | _ -> [], state)
 
                 internalOn absorb (fun _ _ -> [])
@@ -813,13 +859,14 @@ module Orders =
 
                 on cancelable (fun state _ ->
                     match state with
-                    | PaymentPending pending -> beginCancellation pending.Reserved "customer-cancelled" true
+                    | PaymentPending pending ->
+                        beginCancellation pending.Reserved (ReasonCode.ofLiteral "customer-cancelled") true
                     | _ -> [], state)
 
                 on expired (fun state event ->
                     match state, event with
                     | PaymentPending pending, ReservationExpired _ ->
-                        beginCancellation pending.Reserved "reservation-expired" true
+                        beginCancellation pending.Reserved (ReasonCode.ofLiteral "reservation-expired") true
                     | _ -> [], state)
 
                 internalOn absorb (fun _ _ -> [])
@@ -829,7 +876,7 @@ module Orders =
                 on stockCommitSettled (fun state event ->
                     match state, event with
                     | StockCommitPending pending, StockCommitted ->
-                        [],
+                        [ RequestInvoice pending.Reserved.Pending.SnapshotId ],
                         Placed
                             { Reserved = pending.Reserved
                               ProviderReference = pending.ProviderReference }
@@ -840,6 +887,8 @@ module Orders =
             }
 
             state "placed" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on fulfilmentRequested (fun state event ->
                     match state, event with
                     | Placed placed, FulfilmentRequested plan ->
@@ -903,6 +952,8 @@ module Orders =
             }
 
             state "fulfilment-pending" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on shipmentCreated applyShipmentCreated
                 on shipmentCreationFailed applyShipmentCreationFailed
                 on holdRequested applyHoldRequested
@@ -911,6 +962,8 @@ module Orders =
             }
 
             state "processing" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on shipmentDispatched applyShipmentDispatched
                 on holdRequested applyHoldRequested
                 on addressSnapshotChanged applyAddressSnapshotChanged
@@ -918,6 +971,8 @@ module Orders =
             }
 
             state "partially-shipped" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on shipmentDispatched applyShipmentDispatched
                 on shipmentDelivered applyShipmentDelivered
                 on paymentCaptured applyPaymentCaptured
@@ -926,6 +981,8 @@ module Orders =
             }
 
             state "shipped" {
+                on authorizationExpired applyAuthorizationExpired
+
                 on cancelCaptured beginCapturedCancellation
                 on shipmentDelivered applyShipmentDelivered
                 on paymentCaptured applyPaymentCaptured

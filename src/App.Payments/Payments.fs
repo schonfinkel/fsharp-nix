@@ -64,26 +64,34 @@ type PaymentState =
     | VoidPending of AuthorizedPayment
     | VoidUnknown of AuthorizedPayment
     | Voided of AuthorizedPayment
-    | Declined of reasonCode: string
+    | Declined of reasonCode: ReasonCode
     | CancelledWithoutCharge
-    | ManualReview of reasonCode: string
+    | ManualReview of reasonCode: ReasonCode
 
 type PaymentEvent =
     | AuthorizeRequested of AuthorizationAttempt
     | AuthorizationSucceeded of AuthorizationAttempt * providerReference: string * expiresAt: DateTimeOffset
-    | AuthorizationDeclined of AuthorizationAttempt * reasonCode: string
+    | AuthorizationDeclined of AuthorizationAttempt * reasonCode: ReasonCode
     | AuthorizationOutcomeUnknown of AuthorizationAttempt
     | CaptureRequested of CaptureRequest
     | CaptureSucceeded of CaptureRequest * providerReference: string
     | CaptureOutcomeUnknown of CaptureRequest
-    | CaptureDeclined of CaptureRequest * reasonCode: string
+    | CaptureDeclined of CaptureRequest * reasonCode: ReasonCode
     | RefundAllocationRequested of RefundRequest
     | RefundAllocationSettled of RefundAllocationId
     | RefundAllocationReleased of RefundAllocationId
-    | PaymentCancellationRequested of orderId: string * reason: string
+    | PaymentCancellationRequested of orderId: string * reason: ReasonCode
     | VoidSucceeded of AuthorizedPayment
     | VoidOutcomeUnknown of AuthorizedPayment
-    | MarkManualReview of reasonCode: string
+    | MarkManualReview of reasonCode: ReasonCode
+    /// <summary>The reconciliation scanner asks for another gateway check of a provider call
+    /// whose outcome is unknown. Carries the operation id so a check aimed at an older call is
+    /// absorbed.</summary>
+    | ReconcileRequested of operationId: PaymentOperationId
+    /// <summary>The reconciliation scanner ran out of checks for that operation.</summary>
+    | ReconciliationExhausted of operationId: PaymentOperationId
+    /// <summary>The expiry scanner reports that the authorization's hold has lapsed.</summary>
+    | AuthorizationExpired of operationId: PaymentOperationId * expiresAt: DateTimeOffset
 
 type PaymentAction =
     | CallGatewayAuthorize of AuthorizationAttempt
@@ -92,12 +100,13 @@ type PaymentAction =
     | QueryGatewayCapture of AuthorizedPayment * CaptureRequest
     | CallGatewayVoid of AuthorizedPayment
     | NotifyOrderAuthorized of AuthorizedPayment
-    | NotifyOrderDeclined of AuthorizationAttempt * reasonCode: string
+    | NotifyOrderDeclined of AuthorizationAttempt * reasonCode: ReasonCode
     | NotifyOrderCancelled of orderId: string
     | NotifyOrderVoided of AuthorizedPayment
     | NotifyOrderCaptured of CaptureRecord
+    | NotifyOrderAuthorizationExpired of AuthorizedPayment
     | NotifyRefundApproved of ApprovedRefund
-    | NotifyRefundDenied of RefundRequest * reasonCode: string
+    | NotifyRefundDenied of RefundRequest * reasonCode: ReasonCode
     | NotifyRefundSettled of RefundRequest
 
 [<RequireQualifiedAccess>]
@@ -118,6 +127,11 @@ module Payments =
 
     [<Literal>]
     let ActionQueue = "payment_actions"
+
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
 
     let initialState = Initial
 
@@ -174,10 +188,57 @@ module Payments =
 
     let private voidSettled state event =
         match state, event with
-        | VoidPending authorized, VoidSucceeded confirmed
+        | (VoidPending authorized | VoidUnknown authorized), VoidSucceeded confirmed
         | VoidPending authorized, VoidOutcomeUnknown confirmed ->
             confirmed.Attempt.OperationId = authorized.Attempt.OperationId
         | _ -> false
+
+    /// <summary>The provider call whose outcome an unknown state is waiting for.</summary>
+    let private unknownOperation =
+        function
+        | AuthorizationUnknown pending -> Some pending.Attempt.OperationId
+        | CaptureUnknown pending -> Some pending.Request.OperationId
+        | VoidUnknown authorized -> Some(PaymentOperationId.voidOf authorized.Attempt.OperationId)
+        | _ -> None
+
+    let private reconcile state event =
+        match unknownOperation state, event with
+        | Some operation, ReconcileRequested requested -> requested = operation
+        | _ -> false
+
+    let private reconciliationExhausted state event =
+        match unknownOperation state, event with
+        | Some operation, ReconciliationExhausted requested -> requested = operation
+        | _ -> false
+
+    let private applyReconcile state _ =
+        match state with
+        | AuthorizationUnknown pending -> [ QueryGatewayAuthorization pending.Attempt ], state
+        | CaptureUnknown pending -> [ QueryGatewayCapture(pending.Payment.Authorization, pending.Request) ], state
+        // Voids have no query operation; repeating the call under the same operation id is
+        // idempotent at the provider and returns the settled result.
+        | VoidUnknown authorized -> [ CallGatewayVoid authorized ], state
+        | _ -> [], state
+
+    /// <summary>An uncaptured authorization lapses. Only the open states hold uncaptured funds;
+    /// a capture in flight is settled (or reconciled) by its own result.</summary>
+    let private authorizationExpired state event =
+        match state, event with
+        | Authorized authorized, AuthorizationExpired(operation, _) -> operation = authorized.Attempt.OperationId
+        | PartiallyCaptured payment, AuthorizationExpired(operation, _) ->
+            operation = payment.Authorization.Attempt.OperationId
+        | _ -> false
+
+    let private applyAuthorizationExpired state _ =
+        let reason = ReasonCode.ofLiteral "authorization-expired"
+
+        match state with
+        | Authorized authorized -> [ NotifyOrderAuthorizationExpired authorized ], ManualReview reason
+        | PartiallyCaptured payment -> [ NotifyOrderAuthorizationExpired payment.Authorization ], ManualReview reason
+        | _ -> [], state
+
+    let private applyExhausted state _ =
+        [], ManualReview(ReasonCode.ofLiteral "gateway-outcome-unknown")
 
     let private captureTotal (payment: CapturedPayment) =
         payment.Captures
@@ -318,17 +379,17 @@ module Payments =
                       { Request = request
                         PaymentReference = payment.Authorization.ProviderReference } ],
                 state
-            | Some _ -> [ NotifyRefundDenied(request, "allocation-conflict") ], state
+            | Some _ -> [ NotifyRefundDenied(request, (ReasonCode.ofLiteral "allocation-conflict")) ], state
             | None ->
                 match refundableTotal payment with
-                | Error _ -> [ NotifyRefundDenied(request, "balance-invalid") ], state
+                | Error _ -> [ NotifyRefundDenied(request, (ReasonCode.ofLiteral "balance-invalid")) ], state
                 | Ok remaining when
                     RefundOrigin.orderId request.Origin <> expectedOrder
                     || Money.currencyCode request.Amount <> Money.currencyCode remaining
                     || Money.amount request.Amount <= 0m
                     || request.Amount > remaining
                     ->
-                    [ NotifyRefundDenied(request, "insufficient-captured-balance") ], state
+                    [ NotifyRefundDenied(request, (ReasonCode.ofLiteral "insufficient-captured-balance")) ], state
                 | Ok _ ->
                     let updated =
                         { payment with
@@ -381,7 +442,10 @@ module Payments =
         | CaptureOutcomeUnknown _
         | CaptureDeclined _
         | VoidSucceeded _
-        | VoidOutcomeUnknown _ -> true
+        | VoidOutcomeUnknown _
+        | ReconcileRequested _
+        | ReconciliationExhausted _
+        | AuthorizationExpired _ -> true
         | RefundAllocationSettled _
         | RefundAllocationReleased _ -> true
         | AuthorizeRequested _
@@ -478,6 +542,9 @@ module Payments =
                         actions, next
                     | _ -> [], state)
 
+                on reconcile applyReconcile
+                on reconciliationExhausted applyExhausted
+
                 on cancelInFlight (fun state _ ->
                     match state with
                     | AuthorizationUnknown pending ->
@@ -506,6 +573,8 @@ module Payments =
                     | Authorized authorized -> [ CallGatewayVoid authorized ], VoidPending authorized
                     | _ -> [], state)
 
+                on authorizationExpired applyAuthorizationExpired
+
                 internalOn absorb (fun _ _ -> [])
             }
 
@@ -515,7 +584,7 @@ module Payments =
                     | CapturePending pending -> settleCapture true pending event
                     | _ -> [], state)
 
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "cancellation-during-capture")
+                on cancelAfterCapture (fun _ _ -> [], ManualReview(ReasonCode.ofLiteral "cancellation-during-capture"))
                 internalOn absorb (fun _ _ -> [])
             }
 
@@ -525,7 +594,12 @@ module Payments =
                     | CaptureUnknown pending -> settleCapture false pending event
                     | _ -> [], state)
 
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "cancellation-during-unknown-capture")
+                on cancelAfterCapture (fun _ _ ->
+                    [], ManualReview(ReasonCode.ofLiteral "cancellation-during-unknown-capture"))
+
+                on reconcile applyReconcile
+                on reconciliationExhausted applyExhausted
+
                 internalOn absorb (fun _ _ -> [])
             }
 
@@ -537,14 +611,15 @@ module Payments =
                         CapturePending { Payment = payment; Request = request }
                     | _ -> [], state)
 
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
+                on cancelAfterCapture (fun _ _ -> [], ManualReview(ReasonCode.ofLiteral "void-requested-after-capture"))
                 on refundRequest applyRefundRequest
                 on refundSettlement applyRefundSettlement
+                on authorizationExpired applyAuthorizationExpired
                 internalOn absorb (fun _ _ -> [])
             }
 
             state "captured" {
-                on cancelAfterCapture (fun _ _ -> [], ManualReview "void-requested-after-capture")
+                on cancelAfterCapture (fun _ _ -> [], ManualReview(ReasonCode.ofLiteral "void-requested-after-capture"))
                 on refundRequest applyRefundRequest
                 on refundSettlement applyRefundSettlement
                 internalOn absorb (fun _ _ -> [])
@@ -574,7 +649,17 @@ module Payments =
                 internalOn absorb (fun _ _ -> [])
             }
 
-            state "void-unknown" { internalOn absorb (fun _ _ -> []) }
+            state "void-unknown" {
+                on voidSettled (fun state event ->
+                    match state, event with
+                    | VoidUnknown authorized, VoidSucceeded _ -> [ NotifyOrderVoided authorized ], Voided authorized
+                    | _ -> [], state)
+
+                on reconcile applyReconcile
+                on reconciliationExhausted applyExhausted
+                internalOn absorb (fun _ _ -> [])
+            }
+
             state "voided" { internalOn absorb (fun _ _ -> []) }
 
             state "declined" {

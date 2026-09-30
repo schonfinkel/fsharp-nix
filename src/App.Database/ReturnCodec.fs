@@ -146,81 +146,87 @@ module ReturnCodec =
             (fun (value: ReturnState) ->
                 let dto =
                     match value with
-                    | Initial -> empty "initial"
-                    | AuthorizationPending p -> progressDto "authorization-pending" p
-                    | Approved p -> progressDto "approved" p
+                    | Initial -> empty "initial-v1"
+                    | AuthorizationPending p -> progressDto "authorization-pending-v1" p
+                    | Approved p -> progressDto "approved-v1" p
                     | ReturnState.Rejected(p, reason) ->
-                        { progressDto "rejected" p with
-                            Reason = reason }
-                    | LabelPending p -> progressDto "label-pending" p
+                        { progressDto "rejected-v1" p with
+                            Reason = ReasonCode.value reason }
+                    | LabelPending p -> progressDto "label-pending-v1" p
                     | LabelIssued(p, reference) ->
-                        { progressDto "label-issued" p with
+                        { progressDto "label-issued-v1" p with
                             Reference = CarrierReference.value reference }
                     | InTransit(p, reference) ->
-                        { progressDto "in-transit" p with
+                        { progressDto "in-transit-v1" p with
                             Reference = CarrierReference.value reference }
                     | Received(p, reference) ->
-                        { progressDto "received" p with
+                        { progressDto "received-v1" p with
                             Reference = CarrierReference.value reference }
                     | Inspected(p, reference) ->
-                        { progressDto "inspected" p with
+                        { progressDto "inspected-v1" p with
                             Reference = CarrierReference.value reference }
                     | RefundPending(p, refund) ->
-                        { progressDto "refund-pending" p with
+                        { progressDto "refund-pending-v1" p with
                             Refund = PaymentCodec.refundDto refund }
                     | Refunded(p, refund) ->
-                        { progressDto "refunded" p with
+                        { progressDto "refunded-v1" p with
                             Refund = PaymentCodec.refundDto refund }
                     | RejectedAfterInspection(p, reason) ->
-                        { progressDto "rejected-after-inspection" p with
-                            Reason = reason }
+                        { progressDto "rejected-after-inspection-v1" p with
+                            Reason = ReasonCode.value reason }
                     | ManualReview(p, reason) ->
-                        { progressDto "manual-review" p with
-                            Reason = reason }
-                    | Closed p -> progressDto "closed" p
+                        { progressDto "manual-review-v1" p with
+                            Reason = ReasonCode.value reason }
+                    | Closed p -> progressDto "closed-v1" p
 
                 encode "ReturnState" dto)
             (fun json ->
                 decode "ReturnState" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "initial" -> Ok Initial
-                    | "authorization-pending" -> progressOfDto "ReturnState" dto |> Result.map AuthorizationPending
-                    | "approved" -> progressOfDto "ReturnState" dto |> Result.map Approved
-                    | "rejected" ->
+                    | "initial-v1" -> Ok Initial
+                    | "authorization-pending-v1" -> progressOfDto "ReturnState" dto |> Result.map AuthorizationPending
+                    | "approved-v1" -> progressOfDto "ReturnState" dto |> Result.map Approved
+                    | "rejected-v1" ->
                         progressOfDto "ReturnState" dto
-                        |> Result.map (fun p -> ReturnState.Rejected(p, dto.Reason))
-                    | "label-pending" -> progressOfDto "ReturnState" dto |> Result.map LabelPending
-                    | "label-issued" ->
+                        |> Result.bind (fun p ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> ReturnState.Rejected(p, reason)))
+                    | "label-pending-v1" -> progressOfDto "ReturnState" dto |> Result.map LabelPending
+                    | "label-issued-v1" ->
                         progressOfDto "ReturnState" dto
                         |> Result.bind (fun p ->
                             reference "ReturnState" dto |> Result.map (fun r -> LabelIssued(p, r)))
-                    | "in-transit" ->
+                    | "in-transit-v1" ->
                         progressOfDto "ReturnState" dto
                         |> Result.bind (fun p -> reference "ReturnState" dto |> Result.map (fun r -> InTransit(p, r)))
-                    | "received" ->
+                    | "received-v1" ->
                         progressOfDto "ReturnState" dto
                         |> Result.bind (fun p -> reference "ReturnState" dto |> Result.map (fun r -> Received(p, r)))
-                    | "inspected" ->
+                    | "inspected-v1" ->
                         progressOfDto "ReturnState" dto
                         |> Result.bind (fun p -> reference "ReturnState" dto |> Result.map (fun r -> Inspected(p, r)))
-                    | "refund-pending" ->
+                    | "refund-pending-v1" ->
                         progressOfDto "ReturnState" dto
                         |> Result.bind (fun p ->
                             PaymentCodec.refundOfDto "ReturnState" dto.Refund
                             |> Result.map (fun r -> RefundPending(p, r)))
-                    | "refunded" ->
+                    | "refunded-v1" ->
                         progressOfDto "ReturnState" dto
                         |> Result.bind (fun p ->
                             PaymentCodec.refundOfDto "ReturnState" dto.Refund
                             |> Result.map (fun r -> Refunded(p, r)))
-                    | "rejected-after-inspection" ->
+                    | "rejected-after-inspection-v1" ->
                         progressOfDto "ReturnState" dto
-                        |> Result.map (fun p -> RejectedAfterInspection(p, dto.Reason))
-                    | "manual-review" ->
+                        |> Result.bind (fun p ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> RejectedAfterInspection(p, reason)))
+                    | "manual-review-v1" ->
                         progressOfDto "ReturnState" dto
-                        |> Result.map (fun p -> ManualReview(p, dto.Reason))
-                    | "closed" -> progressOfDto "ReturnState" dto |> Result.map Closed
+                        |> Result.bind (fun p ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> ManualReview(p, reason)))
+                    | "closed-v1" -> progressOfDto "ReturnState" dto |> Result.map Closed
                     | _ -> Error(error "ReturnState" "Unknown return state.")))
 
     let event: Codec<ReturnEvent> =
@@ -228,85 +234,90 @@ module ReturnCodec =
             (fun (value: ReturnEvent) ->
                 let dto =
                     match value with
-                    | ReturnRequested r -> requestDto "requested" r
+                    | ReturnRequested r -> requestDto "requested-v1" r
                     | AuthorizationApproved id ->
-                        { empty "authorization-approved" with
+                        { empty "authorization-approved-v1" with
                             AuthorizationId = ReturnAuthorizationId.wireString id }
                     | AuthorizationRejected(id, reason) ->
-                        { empty "authorization-rejected" with
+                        { empty "authorization-rejected-v1" with
                             AuthorizationId = ReturnAuthorizationId.wireString id
-                            Reason = reason }
+                            Reason = ReasonCode.value reason }
                     | LabelCreated reference ->
-                        { empty "label-created" with
+                        { empty "label-created-v1" with
                             Reference = CarrierReference.value reference }
                     | LabelFailed reason ->
-                        { empty "label-failed" with
-                            Reason = reason }
+                        { empty "label-failed-v1" with
+                            Reason = ReasonCode.value reason }
                     | CarrierScanReceived id ->
-                        { empty "carrier-scan" with
+                        { empty "carrier-scan-v1" with
                             ScanId = ReturnTrackingEventId.value id }
                     | ItemsReceived quantities ->
-                        { empty "items-received" with
+                        { empty "items-received-v1" with
                             Quantities = quantitiesDto quantities }
                     | InspectionApproved quantities ->
-                        { empty "inspection-approved" with
+                        { empty "inspection-approved-v1" with
                             Quantities = quantitiesDto quantities }
                     | RestockCompleted id ->
-                        { empty "restock-completed" with
+                        { empty "restock-completed-v1" with
                             RefundId = ReturnId.wireString id }
                     | InspectionRejected reason ->
-                        { empty "inspection-rejected" with
-                            Reason = reason }
+                        { empty "inspection-rejected-v1" with
+                            Reason = ReasonCode.value reason }
                     | RefundSucceeded id ->
-                        { empty "refund-succeeded" with
+                        { empty "refund-succeeded-v1" with
                             RefundId = RefundId.wireString id }
                     | RefundFailed(id, reason) ->
-                        { empty "refund-failed" with
+                        { empty "refund-failed-v1" with
                             RefundId = RefundId.wireString id
-                            Reason = reason }
+                            Reason = ReasonCode.value reason }
                     | ReturnWindowExpired(id, deadline) ->
-                        { empty "window-expired" with
+                        { empty "window-expired-v1" with
                             AuthorizationId = ReturnAuthorizationId.wireString id
                             WindowEndsAt = deadline.ToUnixTimeMilliseconds() }
-                    | CloseRequested -> empty "close-requested"
+                    | RefundStartRequested -> empty "refund-start-requested-v1"
+                    | CloseRequested -> empty "close-requested-v1"
 
                 encode "ReturnEvent" dto)
             (fun json ->
                 decode "ReturnEvent" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "requested" -> requestOfDto "ReturnEvent" dto |> Result.map ReturnRequested
-                    | "authorization-approved" ->
+                    | "requested-v1" -> requestOfDto "ReturnEvent" dto |> Result.map ReturnRequested
+                    | "authorization-approved-v1" ->
                         ReturnAuthorizationId.tryParse dto.AuthorizationId
                         |> Result.mapError (error "ReturnEvent")
                         |> Result.map AuthorizationApproved
-                    | "authorization-rejected" ->
+                    | "authorization-rejected-v1" ->
                         ReturnAuthorizationId.tryParse dto.AuthorizationId
                         |> Result.mapError (error "ReturnEvent")
-                        |> Result.map (fun id -> AuthorizationRejected(id, dto.Reason))
-                    | "label-created" -> reference "ReturnEvent" dto |> Result.map LabelCreated
-                    | "label-failed" -> Ok(LabelFailed dto.Reason)
-                    | "carrier-scan" ->
+                        |> Result.bind (fun id ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> AuthorizationRejected(id, reason)))
+                    | "label-created-v1" -> reference "ReturnEvent" dto |> Result.map LabelCreated
+                    | "label-failed-v1" -> (CodecSupport.reason dto.Reason |> Result.map LabelFailed)
+                    | "carrier-scan-v1" ->
                         ReturnTrackingEventId.tryParse dto.ScanId
                         |> Result.mapError (error "ReturnEvent")
                         |> Result.map CarrierScanReceived
-                    | "items-received" -> quantitiesOfDto "ReturnEvent" dto.Quantities |> Result.map ItemsReceived
-                    | "inspection-approved" ->
+                    | "items-received-v1" -> quantitiesOfDto "ReturnEvent" dto.Quantities |> Result.map ItemsReceived
+                    | "inspection-approved-v1" ->
                         quantitiesOfDto "ReturnEvent" dto.Quantities |> Result.map InspectionApproved
-                    | "restock-completed" ->
+                    | "restock-completed-v1" ->
                         ReturnId.tryParse dto.RefundId
                         |> Result.mapError (error "ReturnEvent")
                         |> Result.map RestockCompleted
-                    | "inspection-rejected" -> Ok(InspectionRejected dto.Reason)
-                    | "refund-succeeded" ->
+                    | "inspection-rejected-v1" -> (CodecSupport.reason dto.Reason |> Result.map InspectionRejected)
+                    | "refund-succeeded-v1" ->
                         RefundId.tryParse dto.RefundId
                         |> Result.mapError (error "ReturnEvent")
                         |> Result.map RefundSucceeded
-                    | "refund-failed" ->
+                    | "refund-failed-v1" ->
                         RefundId.tryParse dto.RefundId
                         |> Result.mapError (error "ReturnEvent")
-                        |> Result.map (fun id -> RefundFailed(id, dto.Reason))
-                    | "window-expired" ->
+                        |> Result.bind (fun id ->
+                            CodecSupport.reason dto.Reason
+                            |> Result.map (fun reason -> RefundFailed(id, reason)))
+                    | "window-expired-v1" ->
                         ReturnAuthorizationId.tryParse dto.AuthorizationId
                         |> Result.mapError (error "ReturnEvent")
                         |> Result.bind (fun id ->
@@ -314,7 +325,8 @@ module ReturnCodec =
                                 Ok(ReturnWindowExpired(id, DateTimeOffset.FromUnixTimeMilliseconds dto.WindowEndsAt))
                             with _ ->
                                 Error(error "ReturnEvent" "Invalid deadline."))
-                    | "close-requested" -> Ok CloseRequested
+                    | "refund-start-requested-v1" -> Ok RefundStartRequested
+                    | "close-requested-v1" -> Ok CloseRequested
                     | _ -> Error(error "ReturnEvent" "Unknown return event.")))
 
     let action: Codec<ReturnAction> =
@@ -322,33 +334,33 @@ module ReturnCodec =
             (fun (value: ReturnAction) ->
                 let dto =
                     match value with
-                    | VerifyAuthorization r -> requestDto "verify-authorization" r
-                    | IssueLabel r -> requestDto "issue-label" r
+                    | VerifyAuthorization r -> requestDto "verify-authorization-v1" r
+                    | IssueLabel r -> requestDto "issue-label-v1" r
                     | RestockItems(r, quantities) ->
-                        { requestDto "restock-items" r with
+                        { requestDto "restock-items-v1" r with
                             Quantities = quantitiesDto quantities }
                     | RequestRefund r ->
-                        { empty "request-refund" with
+                        { empty "request-refund-v1" with
                             Refund = PaymentCodec.refundDto r }
-                    | NotifyOrderRefunded r -> requestDto "notify-order-refunded" r
-                    | NotifyOrderRejected r -> requestDto "notify-order-rejected" r
+                    | NotifyOrderRefunded r -> requestDto "notify-order-refunded-v1" r
+                    | NotifyOrderRejected r -> requestDto "notify-order-rejected-v1" r
 
                 encode "ReturnAction" dto)
             (fun json ->
                 decode "ReturnAction" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "verify-authorization" -> requestOfDto "ReturnAction" dto |> Result.map VerifyAuthorization
-                    | "issue-label" -> requestOfDto "ReturnAction" dto |> Result.map IssueLabel
-                    | "restock-items" ->
+                    | "verify-authorization-v1" -> requestOfDto "ReturnAction" dto |> Result.map VerifyAuthorization
+                    | "issue-label-v1" -> requestOfDto "ReturnAction" dto |> Result.map IssueLabel
+                    | "restock-items-v1" ->
                         requestOfDto "ReturnAction" dto
                         |> Result.bind (fun r ->
                             quantitiesOfDto "ReturnAction" dto.Quantities
                             |> Result.map (fun q -> RestockItems(r, q)))
-                    | "request-refund" ->
+                    | "request-refund-v1" ->
                         PaymentCodec.refundOfDto "ReturnAction" dto.Refund |> Result.map RequestRefund
-                    | "notify-order-refunded" -> requestOfDto "ReturnAction" dto |> Result.map NotifyOrderRefunded
-                    | "notify-order-rejected" -> requestOfDto "ReturnAction" dto |> Result.map NotifyOrderRejected
+                    | "notify-order-refunded-v1" -> requestOfDto "ReturnAction" dto |> Result.map NotifyOrderRefunded
+                    | "notify-order-rejected-v1" -> requestOfDto "ReturnAction" dto |> Result.map NotifyOrderRejected
                     | _ -> Error(error "ReturnAction" "Unknown return action.")))
 
     let actionError: Codec<ReturnActionError> =
@@ -356,18 +368,18 @@ module ReturnCodec =
             (fun (value: ReturnActionError) ->
                 let tag =
                     match value with
-                    | ReturnActionError.CallbackEncodingFailed -> "callback-encoding"
-                    | ReturnActionError.ActionReceiptMismatch -> "receipt-mismatch"
-                    | ReturnActionError.InvalidAction -> "invalid-action"
+                    | ReturnActionError.CallbackEncodingFailed -> "callback-encoding-v1"
+                    | ReturnActionError.ActionReceiptMismatch -> "receipt-mismatch-v1"
+                    | ReturnActionError.InvalidAction -> "invalid-action-v1"
 
                 encode "ReturnActionError" (empty tag))
             (fun json ->
                 decode "ReturnActionError" json
                 |> Result.bind (fun dto ->
                     match dto.Tag with
-                    | "callback-encoding" -> Ok ReturnActionError.CallbackEncodingFailed
-                    | "receipt-mismatch" -> Ok ReturnActionError.ActionReceiptMismatch
-                    | "invalid-action" -> Ok ReturnActionError.InvalidAction
+                    | "callback-encoding-v1" -> Ok ReturnActionError.CallbackEncodingFailed
+                    | "receipt-mismatch-v1" -> Ok ReturnActionError.ActionReceiptMismatch
+                    | "invalid-action-v1" -> Ok ReturnActionError.InvalidAction
                     | _ -> Error(error "ReturnActionError" "Unknown return action error.")))
 
     let storeOptions
@@ -386,7 +398,7 @@ module ReturnCodec =
             machineId Returns.MachineKey
         ) {
             chart Returns.chartValue
-            chartVersion 1
+            chartVersion Returns.ChartVersion
             initialState Returns.initialState
             store storeArg
             logger log

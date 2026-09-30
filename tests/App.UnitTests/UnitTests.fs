@@ -185,7 +185,7 @@ module UnitTests =
 
         match
             AccountFlowCodec.event.Decode
-                "{\"tag\":\"notification-queued-v2\",\"generation\":1,\"token\":\"must-not-persist\"}"
+                "{\"tag\":\"notification-queued-v1\",\"generation\":1,\"token\":\"must-not-persist\"}"
         with
         | Error _ -> ()
         | Ok value -> Assert.Fail $"An unknown secret-bearing property decoded as %A{value}."
@@ -248,47 +248,47 @@ module UnitTests =
             Assert.Equal(resentAwaiting, (expectResolution resentAwaiting stale).Next)
 
     let ``flow codecs version notification callbacks with their generation`` () =
-        let golden = "{\"tag\":\"notification-sent-v2\",\"generation\":2}"
+        let golden = "{\"tag\":\"notification-sent-v1\",\"generation\":2}"
 
         Assert.Equal(Ok golden, AccountFlowCodec.event.Encode(NotificationSent 2))
         Assert.Equal(Ok(NotificationSent 2), AccountFlowCodec.event.Decode golden)
 
         Assert.Equal(
-            Ok "{\"tag\":\"notification-queued-v2\",\"generation\":1}",
+            Ok "{\"tag\":\"notification-queued-v1\",\"generation\":1}",
             AccountFlowCodec.event.Encode(NotificationQueued 1)
         )
 
         Assert.Equal(
-            Ok "{\"tag\":\"notification-send-failed-v2\",\"generation\":3}",
+            Ok "{\"tag\":\"notification-send-failed-v1\",\"generation\":3}",
             AccountFlowCodec.event.Encode(NotificationSendFailed 3)
         )
 
-        match AccountFlowCodec.event.Decode "{\"tag\":\"notification-sent-v2\",\"generation\":0}" with
+        match AccountFlowCodec.event.Decode "{\"tag\":\"notification-sent-v1\",\"generation\":0}" with
         | Error _ -> ()
         | Ok value -> Assert.Fail $"A generation below one decoded as %A{value}."
 
         match AccountFlowCodec.event.Decode "{\"tag\":\"notification-sent-v1\"}" with
         | Error _ -> ()
-        | Ok value -> Assert.Fail $"A superseded generation-less tag decoded as %A{value}."
+        | Ok value -> Assert.Fail $"A generation-less payload decoded as %A{value}."
 
     let ``flow action codec carries a validated generation`` () =
         Assert.Equal(
-            Ok "{\"tag\":\"send-notification-v2\",\"generation\":2}",
+            Ok "{\"tag\":\"send-notification-v1\",\"generation\":2}",
             AccountFlowCodec.action.Encode(SendNotification 2)
         )
 
         Assert.Equal(
             Ok(SendNotification 2),
-            AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v2\",\"generation\":2}"
+            AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v1\",\"generation\":2}"
         )
 
-        match AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v2\",\"generation\":0}" with
+        match AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v1\",\"generation\":0}" with
         | Error _ -> ()
         | Ok value -> Assert.Fail $"A generation below one decoded as %A{value}."
 
         match AccountFlowCodec.action.Decode "{\"tag\":\"send-notification-v1\"}" with
         | Error _ -> ()
-        | Ok value -> Assert.Fail $"A superseded action tag decoded as %A{value}."
+        | Ok value -> Assert.Fail $"A generation-less action decoded as %A{value}."
 
     let ``capabilities are 256-bit scoped keyed hashes`` () =
         let key =
@@ -483,6 +483,7 @@ module UnitTests =
         health.Succeeded RuntimeComponent.ShipmentMachine
         health.Succeeded RuntimeComponent.RefundMachine
         health.Succeeded RuntimeComponent.ReturnMachine
+        health.Succeeded RuntimeComponent.InvoiceMachine
         Assert.True(health.Snapshot() |> RuntimeHealth.startupReady)
 
         health.Succeeded RuntimeComponent.IntegrationOutboxRelay
@@ -492,6 +493,10 @@ module UnitTests =
         health.Succeeded RuntimeComponent.CartMergeScanner
         health.Succeeded RuntimeComponent.ReservationExpiryScanner
         health.Succeeded RuntimeComponent.ReturnWindowScanner
+        health.Succeeded RuntimeComponent.GatewayReconciliationScanner
+        health.Succeeded RuntimeComponent.AuthorizationExpiryScanner
+        health.Succeeded RuntimeComponent.InvoiceRenderScanner
+        health.Succeeded RuntimeComponent.ShipmentLostScanner
         let snapshot = health.Snapshot()
         Assert.True(RuntimeHealth.workersReady (DateTimeOffset.UtcNow) (TimeSpan.FromMinutes 1.) snapshot)
 
@@ -621,11 +626,11 @@ module UnitTests =
 
         let event = OrderSubmitted pending
         let json = OrderCodec.event.Encode event |> Result.defaultWith string
-        Assert.Contains("\"tag\":\"order-submitted-v2\"", json)
+        Assert.Contains("\"tag\":\"order-submitted-v1\"", json)
         Assert.Equal(Ok event, OrderCodec.event.Decode json)
         let state = ReservationPending pending
         Assert.Equal(Ok state, OrderCodec.state.Encode state |> Result.bind OrderCodec.state.Decode)
-        Assert.True(Result.isError (OrderCodec.event.Decode "{\"tag\":\"unknown-v2\"}"))
+        Assert.True(Result.isError (OrderCodec.event.Decode "{\"tag\":\"unknown-v1\"}"))
         Assert.True(Result.isError (OrderCodec.event.Decode "{\"tag\":\"order-submitted-v1\"}"))
 
     let private makeAuthorizationAttempt () : AuthorizationAttempt =
@@ -736,7 +741,7 @@ module UnitTests =
         Assert.Equal([ CommitStock reserved.ReservationIds ], authorized.Actions)
 
         let declined =
-            expectOrderResolution pending (PaymentDeclined(attempt, "do-not-honor"))
+            expectOrderResolution pending (PaymentDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
         Assert.Equal(AwaitingAuthorization reserved, declined.Next)
         Assert.Empty(declined.Actions)
@@ -753,7 +758,7 @@ module UnitTests =
             PaymentOperationId.create "authorize:v1:two" |> Result.defaultWith Assert.Fail
 
         expectOrderAbsorbed pending (PaymentAuthorized(stale, "sim-stale"))
-        expectOrderAbsorbed pending (PaymentDeclined(stale, "do-not-honor"))
+        expectOrderAbsorbed pending (PaymentDeclined(stale, (ReasonCode.ofLiteral "do-not-honor")))
 
     let ``stock commitment places the order`` () =
         let reserved = reservedOrder ()
@@ -772,7 +777,7 @@ module UnitTests =
             resolution.Next
         )
 
-        Assert.Empty(resolution.Actions)
+        Assert.Equal([ RequestInvoice reserved.Pending.SnapshotId ], resolution.Actions)
 
     let ``cancellation waits for both reservations and payment to settle`` () =
         let reserved = reservedOrder ()
@@ -790,7 +795,7 @@ module UnitTests =
 
         Assert.Equal(
             [ ReleaseReservations reserved.ReservationIds
-              RequestPaymentCancellation "customer-cancelled" ],
+              RequestPaymentCancellation(ReasonCode.ofLiteral "customer-cancelled") ],
             cancelling.Actions
         )
 
@@ -824,7 +829,7 @@ module UnitTests =
                 .Next
 
         expectOrderAbsorbed cancelling (PaymentAuthorized(attempt, "sim-late"))
-        expectOrderAbsorbed cancelling (PaymentDeclined(attempt, "do-not-honor"))
+        expectOrderAbsorbed cancelling (PaymentDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
     let ``payment chart authorizes notifies and voids`` () =
         let attempt = makeAuthorizationAttempt ()
@@ -859,7 +864,7 @@ module UnitTests =
         let voiding =
             expectPaymentResolution
                 authorized.Next
-                (PaymentCancellationRequested(attempt.OrderId, "customer-cancelled"))
+                (PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         Assert.Equal(
             VoidPending
@@ -892,7 +897,9 @@ module UnitTests =
             expectPaymentResolution Payments.initialState (AuthorizeRequested attempt)
 
         let cancelling =
-            expectPaymentResolution started.Next (PaymentCancellationRequested(attempt.OrderId, "customer-cancelled"))
+            expectPaymentResolution
+                started.Next
+                (PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         match cancelling.Next with
         | AuthorizationPending pending -> Assert.True(pending.CancelRequested)
@@ -918,7 +925,9 @@ module UnitTests =
          | _ -> Assert.Fail "expected void pending")
 
         let declined =
-            expectPaymentResolution cancelling.Next (AuthorizationDeclined(attempt, "do-not-honor"))
+            expectPaymentResolution
+                cancelling.Next
+                (AuthorizationDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
         Assert.Equal(CancelledWithoutCharge, declined.Next)
         Assert.Equal([ NotifyOrderCancelled attempt.OrderId ], declined.Actions)
@@ -942,7 +951,9 @@ module UnitTests =
         Assert.Empty(parked.Actions)
 
         let cancelling =
-            expectPaymentResolution parked.Next (PaymentCancellationRequested(attempt.OrderId, "customer-cancelled"))
+            expectPaymentResolution
+                parked.Next
+                (PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         Assert.Equal(
             AuthorizationUnknown
@@ -957,7 +968,9 @@ module UnitTests =
         let orderId = $"order:{Guid.NewGuid():D}"
 
         let closed =
-            expectPaymentResolution Payments.initialState (PaymentCancellationRequested(orderId, "customer-cancelled"))
+            expectPaymentResolution
+                Payments.initialState
+                (PaymentCancellationRequested(orderId, (ReasonCode.ofLiteral "customer-cancelled")))
 
         Assert.Equal(CancelledWithoutCharge, closed.Next)
         Assert.Equal([ NotifyOrderCancelled orderId ], closed.Actions)
@@ -969,9 +982,9 @@ module UnitTests =
             expectPaymentResolution Payments.initialState (AuthorizeRequested attempt)
 
         let declined =
-            expectPaymentResolution started.Next (AuthorizationDeclined(attempt, "do-not-honor"))
+            expectPaymentResolution started.Next (AuthorizationDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor")))
 
-        Assert.Equal(Declined "do-not-honor", declined.Next)
+        Assert.Equal(Declined(ReasonCode.ofLiteral "do-not-honor"), declined.Next)
 
         let retried =
             expectPaymentResolution
@@ -990,7 +1003,7 @@ module UnitTests =
 
         let request = AuthorizeRequested attempt
         let json = PaymentCodec.event.Encode request |> Result.defaultWith string
-        Assert.Contains("\"tag\":\"authorize-requested-v2\"", json)
+        Assert.Contains("\"tag\":\"authorize-requested-v1\"", json)
         Assert.Equal(Ok request, PaymentCodec.event.Decode json)
 
         let authorized =
@@ -1001,7 +1014,9 @@ module UnitTests =
 
         Assert.Equal(Ok authorized, PaymentCodec.state.Encode authorized |> Result.bind PaymentCodec.state.Decode)
 
-        let cancel = PaymentCancellationRequested(attempt.OrderId, "customer-cancelled")
+        let cancel =
+            PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled"))
+
         Assert.Equal(Ok cancel, PaymentCodec.event.Encode cancel |> Result.bind PaymentCodec.event.Decode)
 
         let notify = NotifyOrderCancelled attempt.OrderId
@@ -1021,19 +1036,19 @@ module UnitTests =
         let events =
             [ AuthorizeRequested attempt
               AuthorizationSucceeded(attempt, "sim-abc123", expiry)
-              AuthorizationDeclined(attempt, "do-not-honor")
+              AuthorizationDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor"))
               AuthorizationOutcomeUnknown attempt
-              PaymentCancellationRequested(attempt.OrderId, "customer-cancelled")
+              PaymentCancellationRequested(attempt.OrderId, (ReasonCode.ofLiteral "customer-cancelled"))
               VoidSucceeded authorized
               VoidOutcomeUnknown authorized
-              MarkManualReview "reconciliation-exhausted" ]
+              MarkManualReview(ReasonCode.ofLiteral "reconciliation-exhausted") ]
 
         let actions =
             [ CallGatewayAuthorize attempt
               QueryGatewayAuthorization attempt
               CallGatewayVoid authorized
               NotifyOrderAuthorized authorized
-              NotifyOrderDeclined(attempt, "do-not-honor")
+              NotifyOrderDeclined(attempt, (ReasonCode.ofLiteral "do-not-honor"))
               NotifyOrderCancelled attempt.OrderId
               NotifyOrderVoided authorized ]
 
@@ -1350,11 +1365,14 @@ module UnitTests =
         | other -> Assert.Fail $"Expected in-transit, got %A{other}."
 
         match dispatched.Actions with
-        | [ NotifyOrderDispatched(orderId, shipmentId, allocationId, _) ] ->
+        | [ NotifyOrderDispatched(orderId, shipmentId, allocationId, dispatchedAt)
+            RecordTrackingCheckpoint(checkedId, 1L, None, observedAt) ] ->
             Assert.Equal(request.OrderId, orderId)
             Assert.Equal(request.ShipmentId, shipmentId)
             Assert.Equal(request.AllocationId, allocationId)
-        | other -> Assert.Fail $"Expected notify-order-dispatched, got %A{other}."
+            Assert.Equal(request.ShipmentId, checkedId)
+            Assert.Equal(dispatchedAt, observedAt)
+        | other -> Assert.Fail $"Expected dispatch notification and tracking checkpoint, got %A{other}."
 
         let trackingId = TrackingEventId.create "scan-1" |> Result.defaultWith Assert.Fail
 
@@ -1372,8 +1390,51 @@ module UnitTests =
         | other -> Assert.Fail $"Expected delivered, got %A{other}."
 
         match delivered.Actions with
-        | [ NotifyOrderDelivered(orderId, _, _, _) ] -> Assert.Equal(request.OrderId, orderId)
-        | other -> Assert.Fail $"Expected notify-order-delivered, got %A{other}."
+        | [ NotifyOrderDelivered(orderId, _, _, _); StopTrackingCheck stopped ] ->
+            Assert.Equal(request.OrderId, orderId)
+            Assert.Equal(request.ShipmentId, stopped)
+        | other -> Assert.Fail $"Expected delivery notification and stopped tracking, got %A{other}."
+
+        let scanAt =
+            DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+
+        let scanned =
+            expectShipmentResolution
+                dispatched.Next
+                (CarrierTrackingReceived
+                    { EventId = TrackingEventId.create "scan-2" |> Result.defaultWith Assert.Fail
+                      Generation = 1L
+                      OccurredAt = scanAt
+                      Status = CarrierTrackingStatus.InTransit })
+
+        Assert.Equal([ RecordTrackingCheckpoint(request.ShipmentId, 1L, Some scanAt, scanAt) ], scanned.Actions)
+
+        // A lost check computed before the newer scan is stale and absorbed.
+        let stale =
+            expectShipmentResolution scanned.Next (MarkLost(1L, None, DateTimeOffset.UtcNow))
+
+        Assert.Equal(scanned.Next, stale.Next)
+
+        let lost =
+            expectShipmentResolution scanned.Next (MarkLost(1L, Some scanAt, DateTimeOffset.UtcNow))
+
+        match lost.Next with
+        | ShipmentState.Lost _ -> ()
+        | other -> Assert.Fail $"Expected lost, got %A{other}."
+
+        for action in
+            [ RecordTrackingCheckpoint(request.ShipmentId, 2L, Some scanAt, scanAt)
+              RecordTrackingCheckpoint(request.ShipmentId, 1L, None, scanAt)
+              StopTrackingCheck request.ShipmentId ] do
+            let json =
+                ShipmentCodec.action.Encode action
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                action,
+                ShipmentCodec.action.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
 
     let ``order fulfilment requests capture on dispatch and completes on delivery`` () =
         let reserved = reservedOrder ()
@@ -1592,7 +1653,8 @@ module UnitTests =
           Lines =
             [ { OrderLineId = lineId
                 Quantity = 1
-                RefundAmount = Money.create 10m "USD" |> Result.defaultWith Assert.Fail } ] }
+                Merchandise = Money.create 9m "USD" |> Result.defaultWith Assert.Fail
+                Tax = Money.create 1m "USD" |> Result.defaultWith Assert.Fail } ] }
 
     let private expectReturnResolution state event =
         match Chart.resolve App.Returns.Returns.chartValue state event with
@@ -1650,7 +1712,7 @@ module UnitTests =
             expectReturnResolution inspected.Next (App.Returns.ReturnEvent.RestockCompleted request.ReturnId)
 
         let refunding =
-            expectReturnResolution restocked.Next App.Returns.ReturnEvent.CloseRequested
+            expectReturnResolution restocked.Next App.Returns.ReturnEvent.RefundStartRequested
 
         let refundId =
             match refunding.Next with
@@ -1709,6 +1771,617 @@ module UnitTests =
         match settled.Next with
         | Captured payment -> Assert.True(payment.Refunds.Head.Status = "settled")
         | other -> Assert.Fail $"Expected captured, got %A{other}."
+
+    let ``reservation failures keep distinct reason codes`` () =
+        let codes =
+            [ ReservationFailure.InsufficientStock
+              ReservationFailure.ProductInactive
+              ReservationFailure.PriceVersionMismatch
+              ReservationFailure.InvalidReservation ]
+            |> List.map (ReservationFailure.code >> ReasonCode.value)
+
+        Assert.Equal<string list>(
+            [ "insufficient-stock"
+              "product-inactive"
+              "price-version-mismatch"
+              "invalid-reservation" ],
+            codes
+        )
+
+    let private invoiceRequest () =
+        OrderSnapshotId.create (Guid.NewGuid())
+        |> Result.defaultWith Assert.Fail
+        |> InvoiceRequest.forOrder
+
+    let private invoiceNumber sequence =
+        InvoiceNumber.create "FSNIX" "INV" "2026-09" sequence
+        |> Result.defaultWith Assert.Fail
+
+    let private expectInvoiceResolution state event =
+        match Chart.resolve App.Invoices.Invoices.chartValue state event with
+        | Ok resolution -> resolution
+        | Error error -> Assert.Fail $"Expected the invoice event to resolve, got %A{error}."
+
+    let ``invoice numbers validate scope and format for display`` () =
+        Assert.Equal("INV-2026-09-00000042", InvoiceNumber.display (invoiceNumber 42L))
+        Assert.Equal("INV-2026-09-99999999", InvoiceNumber.display (invoiceNumber 99999999L))
+        Assert.True(Result.isError (InvoiceNumber.create "fsnix" "INV" "2026-09" 1L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "-INV" "2026-09" 1L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" "2026-09" 0L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" "2026-09" 100000000L))
+        Assert.True(Result.isError (InvoiceNumber.create "FSNIX" (String('A', 17)) "2026-09" 1L))
+
+        for period in [ "2026"; "2026-00"; "2026-13"; "2026-9"; "2026/09"; "26-09-01" ] do
+            Assert.True(Result.isError (InvoiceNumber.create "FSNIX" "INV" period 1L), period)
+
+        let request = invoiceRequest ()
+        Assert.True(Result.isOk (InvoiceRequest.validate request))
+
+        Assert.True(
+            Result.isError (
+                InvoiceRequest.validate
+                    { request with
+                        OrderId = "order:" + Guid.NewGuid().ToString("D") }
+            )
+        )
+
+    let ``invoice chart issues once and parks failures for operator retry`` () =
+        let request = invoiceRequest ()
+        let number = invoiceNumber 7L
+
+        let requested =
+            expectInvoiceResolution App.Invoices.Invoices.initialState (App.Invoices.InvoiceRequested request)
+
+        Assert.Equal(App.Invoices.SnapshotPending request, requested.Next)
+        Assert.Equal([ App.Invoices.IssueSnapshot request ], requested.Actions)
+
+        let duplicate =
+            expectInvoiceResolution requested.Next (App.Invoices.InvoiceRequested request)
+
+        Assert.Equal(requested.Next, duplicate.Next)
+        Assert.Empty(duplicate.Actions)
+
+        let other = invoiceRequest ()
+
+        let stale =
+            expectInvoiceResolution requested.Next (App.Invoices.SnapshotIssued(other.InvoiceId, number))
+
+        Assert.Equal(requested.Next, stale.Next)
+
+        let issued =
+            expectInvoiceResolution requested.Next (App.Invoices.SnapshotIssued(request.InvoiceId, number))
+
+        let issuedInvoice: App.Invoices.IssuedInvoice =
+            { Request = request; Number = number }
+
+        Assert.Equal(App.Invoices.RenderPending issuedInvoice, issued.Next)
+        Assert.Equal([ App.Invoices.RenderDocument issuedInvoice ], issued.Actions)
+
+        let late =
+            expectInvoiceResolution issued.Next (App.Invoices.SnapshotIssued(request.InvoiceId, invoiceNumber 8L))
+
+        Assert.Equal(issued.Next, late.Next)
+
+        let digest =
+            DocumentDigest.create (String('a', 64)) |> Result.defaultWith Assert.Fail
+
+        let renderFailure = ReasonCode.ofLiteral "render-failed"
+
+        let staleRender =
+            expectInvoiceResolution issued.Next (App.Invoices.DocumentRendered(other.InvoiceId, digest))
+
+        Assert.Equal(issued.Next, staleRender.Next)
+
+        let renderFailed =
+            expectInvoiceResolution issued.Next (App.Invoices.DocumentRenderFailed(request.InvoiceId, renderFailure))
+
+        Assert.Equal(App.Invoices.RenderFailed(issuedInvoice, renderFailure), renderFailed.Next)
+
+        let rerender =
+            expectInvoiceResolution renderFailed.Next App.Invoices.RenderRetryRequested
+
+        Assert.Equal(App.Invoices.RenderPending issuedInvoice, rerender.Next)
+        Assert.Equal([ App.Invoices.RenderDocument issuedInvoice ], rerender.Actions)
+
+        let rendered =
+            expectInvoiceResolution rerender.Next (App.Invoices.DocumentRendered(request.InvoiceId, digest))
+
+        Assert.Equal(App.Invoices.Rendered(issuedInvoice, digest), rendered.Next)
+        Assert.Empty(rendered.Actions)
+
+        let duplicateRender =
+            expectInvoiceResolution rendered.Next (App.Invoices.DocumentRendered(request.InvoiceId, digest))
+
+        Assert.Equal(rendered.Next, duplicateRender.Next)
+
+        match Chart.resolve App.Invoices.Invoices.chartValue rendered.Next App.Invoices.RenderRetryRequested with
+        | Ok _ -> Assert.Fail "Retrying a rendered invoice must be rejected."
+        | Error _ -> ()
+
+        let closed = expectInvoiceResolution rendered.Next App.Invoices.CloseRequested
+        Assert.Equal(App.Invoices.Closed issuedInvoice, closed.Next)
+
+        let reason = ReasonCode.ofLiteral "snapshot-missing"
+
+        let failed =
+            expectInvoiceResolution requested.Next (App.Invoices.IssuanceFailed(request.InvoiceId, reason))
+
+        Assert.Equal(App.Invoices.ManualReview(request, reason), failed.Next)
+
+        let retried =
+            expectInvoiceResolution failed.Next App.Invoices.IssuanceRetryRequested
+
+        Assert.Equal(App.Invoices.SnapshotPending request, retried.Next)
+        Assert.Equal([ App.Invoices.IssueSnapshot request ], retried.Actions)
+
+        match
+            Chart.resolve
+                App.Invoices.Invoices.chartValue
+                App.Invoices.Invoices.initialState
+                App.Invoices.CloseRequested
+        with
+        | Ok _ -> Assert.Fail "Closing an unissued invoice must be rejected."
+        | Error _ -> ()
+
+    let ``invoice codecs round trip every case and reject unknown tags`` () =
+        let request = invoiceRequest ()
+        let number = invoiceNumber 3L
+        let reason = ReasonCode.ofLiteral "snapshot-missing"
+
+        let issued: App.Invoices.IssuedInvoice = { Request = request; Number = number }
+
+        let roundTrip (codec: Codec<'T>) (value: 'T) =
+            let json = codec.Encode value |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            Assert.DoesNotContain("@", json)
+            Assert.Equal(value, codec.Decode json |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}"))
+
+        let digest =
+            DocumentDigest.ofBytes (Array.init 32 byte) |> Result.defaultWith Assert.Fail
+
+        [ App.Invoices.Initial
+          App.Invoices.SnapshotPending request
+          App.Invoices.RenderPending issued
+          App.Invoices.Rendered(issued, digest)
+          App.Invoices.RenderFailed(issued, reason)
+          App.Invoices.ManualReview(request, reason)
+          App.Invoices.Closed issued ]
+        |> List.iter (roundTrip InvoiceCodec.state)
+
+        [ App.Invoices.InvoiceRequested request
+          App.Invoices.SnapshotIssued(request.InvoiceId, number)
+          App.Invoices.IssuanceFailed(request.InvoiceId, reason)
+          App.Invoices.IssuanceRetryRequested
+          App.Invoices.DocumentRendered(request.InvoiceId, digest)
+          App.Invoices.DocumentRenderFailed(request.InvoiceId, reason)
+          App.Invoices.RenderRetryRequested
+          App.Invoices.CloseRequested ]
+        |> List.iter (roundTrip InvoiceCodec.event)
+
+        roundTrip InvoiceCodec.action (App.Invoices.IssueSnapshot request)
+        roundTrip InvoiceCodec.action (App.Invoices.RenderDocument issued)
+
+        let rendered =
+            InvoiceCodec.event.Encode(App.Invoices.DocumentRendered(request.InvoiceId, digest))
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+        Assert.True(
+            Result.isError (InvoiceCodec.event.Decode(rendered.Replace(DocumentDigest.value digest, String('Z', 64))))
+        )
+
+        [ App.Invoices.InvoiceActionError.CallbackEncodingFailed
+          App.Invoices.InvoiceActionError.ActionReceiptMismatch
+          App.Invoices.InvoiceActionError.InvalidAction ]
+        |> List.iter (roundTrip InvoiceCodec.actionError)
+
+        roundTrip OrderCodec.action (RequestInvoice request.SnapshotId)
+
+        let encoded =
+            InvoiceCodec.event.Encode(App.Invoices.SnapshotIssued(request.InvoiceId, number))
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+        Assert.Contains("\"tag\":\"snapshot-issued-v1\"", encoded)
+
+        Assert.True(
+            Result.isError (InvoiceCodec.event.Decode(encoded.Replace("snapshot-issued-v1", "snapshot-issued-v9")))
+        )
+
+        Assert.True(Result.isError (InvoiceCodec.event.Decode(encoded.Replace("\"sequence\":3", "\"sequence\":0"))))
+
+        let mismatched =
+            InvoiceCodec.action.Encode(App.Invoices.IssueSnapshot request)
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            |> fun json -> json.Replace(request.OrderId, "order:" + Guid.NewGuid().ToString("D"))
+
+        Assert.True(Result.isError (InvoiceCodec.action.Decode mismatched))
+
+    let ``pdf renders deterministically with the shipped font only`` () =
+        let first = Pdf.renderSample ()
+        let second = Pdf.renderSample ()
+
+        Assert.True(Pdf.isPdf first, "Expected a PDF header.")
+        Assert.Equal<byte array>(first, second)
+        Assert.False(QuestPDF.Settings.UseSystemFonts)
+
+        let text = Text.Encoding.Latin1.GetString first
+        Assert.Contains("Lato", text)
+
+    let ``document digests are lowercase hex sha256`` () =
+        let digest =
+            DocumentDigest.ofBytes (Array.init 32 (fun index -> byte (index * 7)))
+            |> Result.defaultWith Assert.Fail
+
+        Assert.Equal(64, (DocumentDigest.value digest).Length)
+        Assert.Equal<byte array>(Array.init 32 (fun index -> byte (index * 7)), DocumentDigest.bytes digest)
+        Assert.True(Result.isError (DocumentDigest.create (String('A', 64))))
+        Assert.True(Result.isError (DocumentDigest.create (String('a', 63))))
+        Assert.True(Result.isError (DocumentDigest.ofBytes (Array.zeroCreate 31)))
+
+    let private sampleInvoiceDocument sequence : InvoiceDocument =
+        { InvoiceId =
+            InvoiceId.create (Guid.Parse "00000000-0000-0000-0000-00000000000a")
+            |> Result.defaultWith Assert.Fail
+          Number = invoiceNumber sequence
+          IssuedAt = DateTimeOffset(2026, 9, 29, 12, 0, 0, TimeSpan.Zero)
+          SellerName = "fsnix Store"
+          SellerAddress = "1 Example Street"
+          SellerTaxId = "TAX-1"
+          BuyerEmail = "buyer@example.test"
+          BillingAddress = [ "Buyer"; "2 Road"; "Town OR 97201"; "US" ]
+          Lines =
+            [ { Sku = "COFFEE-ESPRESSO"
+                Description = "Espresso Beans — Café Ação"
+                Quantity = 2
+                UnitPrice = 24.90m
+                Amount = 49.80m } ]
+          Subtotal = 49.80m
+          Shipping = 5m
+          Tax = 4.38m
+          Total = 59.18m
+          Currency = "USD"
+          Credits = None }
+
+    let ``invoice pdf is deterministic per snapshot`` () =
+        let first = InvoicePdf.render (sampleInvoiceDocument 42L)
+        let again = InvoicePdf.render (sampleInvoiceDocument 42L)
+        let other = InvoicePdf.render (sampleInvoiceDocument 43L)
+
+        Assert.True(Pdf.isPdf first, "Expected a PDF header.")
+        Assert.Equal<byte array>(first, again)
+        Assert.NotEqual<byte array>(first, other)
+        Assert.Equal("invoice-v1", InvoicePdf.renderer.Name)
+
+    let ``unknown provider calls reconcile on request and park when exhausted`` () =
+        let attempt = makeAuthorizationAttempt ()
+        let stale = (makeAuthorizationAttempt ()).OperationId
+
+        let pending =
+            AuthorizationUnknown
+                { Attempt = attempt
+                  CancelRequested = false }
+
+        let checkedAgain =
+            expectPaymentResolution pending (ReconcileRequested attempt.OperationId)
+
+        Assert.Equal(pending, checkedAgain.Next)
+        Assert.Equal([ QueryGatewayAuthorization attempt ], checkedAgain.Actions)
+
+        let staleCheck = expectPaymentResolution pending (ReconcileRequested stale)
+        Assert.Equal(pending, staleCheck.Next)
+        Assert.Empty(staleCheck.Actions)
+
+        let exhausted =
+            expectPaymentResolution pending (ReconciliationExhausted attempt.OperationId)
+
+        Assert.Equal(PaymentState.ManualReview(ReasonCode.ofLiteral "gateway-outcome-unknown"), exhausted.Next)
+
+        let authorized =
+            { Attempt = attempt
+              ProviderReference = "sim-abc123"
+              ExpiresAt = DateTimeOffset.UtcNow.AddDays 6. }
+
+        let settled =
+            expectPaymentResolution (Authorized authorized) (ReconcileRequested attempt.OperationId)
+
+        Assert.Equal(Authorized authorized, settled.Next)
+        Assert.Empty(settled.Actions)
+
+        let capture =
+            { OrderId = attempt.OrderId
+              CaptureId = CaptureId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+              OperationId =
+                PaymentOperationId.create "capture:v1:reconcile"
+                |> Result.defaultWith Assert.Fail
+              Amount = Money.create 10m "USD" |> Result.defaultWith Assert.Fail }
+
+        let captureUnknown =
+            CaptureUnknown
+                { Payment =
+                    { Authorization = authorized
+                      Captures = []
+                      Refunds = [] }
+                  Request = capture }
+
+        let captureCheck =
+            expectPaymentResolution captureUnknown (ReconcileRequested capture.OperationId)
+
+        Assert.Equal([ QueryGatewayCapture(authorized, capture) ], captureCheck.Actions)
+
+        let voidOperation = PaymentOperationId.voidOf attempt.OperationId
+
+        let voidCheck =
+            expectPaymentResolution (VoidUnknown authorized) (ReconcileRequested voidOperation)
+
+        Assert.Equal([ CallGatewayVoid authorized ], voidCheck.Actions)
+
+        let voided =
+            expectPaymentResolution (VoidUnknown authorized) (VoidSucceeded authorized)
+
+        Assert.Equal(Voided authorized, voided.Next)
+        Assert.Equal([ NotifyOrderVoided authorized ], voided.Actions)
+
+        let refund = makeRefundRequest 10m
+
+        let approved: ApprovedRefund =
+            { Request = refund
+              PaymentReference = "sim-abc123" }
+
+        let resolveRefund state event =
+            match Chart.resolve App.Refunds.Refunds.chartValue state event with
+            | Ok resolution -> resolution
+            | Error error -> Assert.Fail $"Expected refund event to resolve, got %A{error}."
+
+        let refundUnknown = App.Refunds.RefundState.OutcomeUnknown approved
+
+        let refundCheck =
+            resolveRefund refundUnknown (App.Refunds.RefundEvent.ReconcileRequested refund.OperationId)
+
+        Assert.Equal(refundUnknown, refundCheck.Next)
+        Assert.Equal([ App.Refunds.RefundAction.QueryGatewayRefund approved ], refundCheck.Actions)
+
+        let refundExhausted =
+            resolveRefund refundUnknown (App.Refunds.RefundEvent.ReconciliationExhausted refund.OperationId)
+
+        let reason = ReasonCode.ofLiteral "gateway-outcome-unknown"
+        Assert.Equal(App.Refunds.RefundState.ManualReview(refund, reason), refundExhausted.Next)
+        Assert.Equal([ App.Refunds.RefundAction.NotifyOriginFailed(refund, reason) ], refundExhausted.Actions)
+
+        for event in
+            [ ReconcileRequested attempt.OperationId
+              ReconciliationExhausted attempt.OperationId ] do
+            let json =
+                PaymentCodec.event.Encode event
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                event,
+                PaymentCodec.event.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
+        for event in
+            [ App.Refunds.RefundEvent.ReconcileRequested refund.OperationId
+              App.Refunds.RefundEvent.ReconciliationExhausted refund.OperationId ] do
+            let json =
+                RefundCodec.event.Encode event
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                event,
+                RefundCodec.event.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
+    let ``lapsed authorizations hold the order for review`` () =
+        let attempt = makeAuthorizationAttempt ()
+
+        let authorized =
+            { Attempt = attempt
+              ProviderReference = "sim-abc123"
+              ExpiresAt = DateTimeOffset.UtcNow.AddDays 6. }
+
+        let expired = AuthorizationExpired(attempt.OperationId, authorized.ExpiresAt)
+        let reason = ReasonCode.ofLiteral "authorization-expired"
+
+        let open' = expectPaymentResolution (Authorized authorized) expired
+        Assert.Equal(PaymentState.ManualReview reason, open'.Next)
+        Assert.Equal([ NotifyOrderAuthorizationExpired authorized ], open'.Actions)
+
+        let partial =
+            PartiallyCaptured
+                { Authorization = authorized
+                  Captures = []
+                  Refunds = [] }
+
+        let partialExpired = expectPaymentResolution partial expired
+        Assert.Equal(PaymentState.ManualReview reason, partialExpired.Next)
+
+        let captured =
+            Captured
+                { Authorization = authorized
+                  Captures = []
+                  Refunds = [] }
+
+        let absorbed = expectPaymentResolution captured expired
+        Assert.Equal(captured, absorbed.Next)
+        Assert.Empty(absorbed.Actions)
+
+        let stale =
+            expectPaymentResolution
+                (Authorized authorized)
+                (AuthorizationExpired((makeAuthorizationAttempt ()).OperationId, authorized.ExpiresAt))
+
+        Assert.Equal(Authorized authorized, stale.Next)
+
+        let reserved = reservedOrder ()
+
+        let placed =
+            Placed
+                { Reserved = reserved
+                  ProviderReference = "sim-abc123" }
+
+        let review = expectOrderResolution placed PaymentAuthorizationExpired
+        Assert.Equal(OrderState.ManualReview reason, review.Next)
+
+        let fulfilment =
+            { PlacedOrder =
+                { Reserved = reserved
+                  ProviderReference = "sim-abc123" }
+              AddressSnapshotId = reserved.Pending.SnapshotId
+              Shipments = []
+              Returns = [] }
+
+        let held = expectOrderResolution (Processing fulfilment) PaymentAuthorizationExpired
+
+        Assert.Equal(
+            HeldForReview
+                { Fulfilment = fulfilment
+                  Reason = reason },
+            held.Next
+        )
+
+        expectOrderAbsorbed (OrderState.Delivered fulfilment) PaymentAuthorizationExpired
+
+        let roundTrip (codec: Codec<'T>) (value: 'T) =
+            let json = codec.Encode value |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            let decoded =
+                codec.Decode json |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            decoded
+
+        match roundTrip PaymentCodec.event expired with
+        | AuthorizationExpired(operation, expiresAt) ->
+            Assert.Equal(attempt.OperationId, operation)
+            Assert.Equal(authorized.ExpiresAt.ToUnixTimeMilliseconds(), expiresAt.ToUnixTimeMilliseconds())
+        | other -> Assert.Fail $"Expected AuthorizationExpired, got %A{other}."
+
+        Assert.Equal(PaymentAuthorizationExpired, roundTrip OrderCodec.event PaymentAuthorizationExpired)
+
+        match roundTrip PaymentCodec.action (NotifyOrderAuthorizationExpired authorized) with
+        | NotifyOrderAuthorizationExpired decoded -> Assert.Equal(authorized.Attempt, decoded.Attempt)
+        | other -> Assert.Fail $"Expected NotifyOrderAuthorizationExpired, got %A{other}."
+
+    let ``stalled invoice renders are re-requested then parked`` () =
+        let request = invoiceRequest ()
+
+        let issued: App.Invoices.IssuedInvoice =
+            { Request = request
+              Number = invoiceNumber 5L }
+
+        let pending = App.Invoices.RenderPending issued
+
+        let again =
+            expectInvoiceResolution pending (App.Invoices.RenderReconcileRequested 0)
+
+        Assert.Equal(pending, again.Next)
+        Assert.Equal([ App.Invoices.RenderDocument issued ], again.Actions)
+
+        let parked = expectInvoiceResolution pending App.Invoices.RenderReconcileExhausted
+
+        Assert.Equal(App.Invoices.RenderFailed(issued, ReasonCode.ofLiteral "render-timeout"), parked.Next)
+
+        let digest =
+            DocumentDigest.create (String('b', 64)) |> Result.defaultWith Assert.Fail
+
+        let rendered = App.Invoices.Rendered(issued, digest)
+
+        let late =
+            expectInvoiceResolution rendered (App.Invoices.RenderReconcileRequested 1)
+
+        Assert.Equal(rendered, late.Next)
+        Assert.Empty(late.Actions)
+
+        for event in
+            [ App.Invoices.RenderReconcileRequested 2
+              App.Invoices.RenderReconcileExhausted ] do
+            let json =
+                InvoiceCodec.event.Encode event
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                event,
+                InvoiceCodec.event.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
+    let ``credit notes are keyed by refund and render distinctly`` () =
+        let snapshot =
+            OrderSnapshotId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+
+        let orderId = $"order:{OrderSnapshotId.value snapshot:D}"
+        let refundId = RefundId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+        let returnId = Guid.NewGuid()
+
+        let credit =
+            InvoiceRequest.forCredit refundId (InspectedReturn(orderId, returnId))
+            |> Result.defaultWith Assert.Fail
+
+        Assert.Equal(RefundId.value refundId, InvoiceId.value credit.InvoiceId)
+        Assert.Equal(snapshot, credit.SnapshotId)
+        Assert.True(Result.isOk (InvoiceRequest.validate credit))
+
+        Assert.True(
+            Result.isError (
+                InvoiceRequest.validate
+                    { credit with
+                        InvoiceId = InvoiceId.ofSnapshot snapshot }
+            )
+        )
+
+        Assert.True(
+            Result.isError (
+                InvoiceRequest.validate
+                    { credit with
+                        Credit =
+                            Some
+                                { RefundId = refundId
+                                  Origin = OrderCancellation $"order:{Guid.NewGuid():D}" } }
+            )
+        )
+
+        Assert.True(Result.isError (InvoiceRequest.forCredit refundId (OrderCancellation "cart:nope")))
+
+        for request in
+            [ credit
+              InvoiceRequest.forCredit refundId (OrderCancellation orderId)
+              |> Result.defaultWith Assert.Fail ] do
+            let action = App.Invoices.IssueSnapshot request
+
+            let json =
+                InvoiceCodec.action.Encode action
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+            Assert.Equal(
+                action,
+                InvoiceCodec.action.Decode json
+                |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+            )
+
+        let invoiceJson =
+            InvoiceCodec.action.Encode(App.Invoices.IssueSnapshot(InvoiceRequest.forOrder snapshot))
+            |> Result.defaultWith (fun e -> Assert.Fail $"%A{e}")
+
+        Assert.DoesNotContain("credit", invoiceJson)
+
+        let line: ReturnLine =
+            { OrderLineId = OrderLineId.create (Guid.NewGuid()) |> Result.defaultWith Assert.Fail
+              Quantity = 2
+              Merchandise = Money.create 49.80m "USD" |> Result.defaultWith Assert.Fail
+              Tax = Money.create 3.98m "USD" |> Result.defaultWith Assert.Fail }
+
+        Assert.Equal(53.78m, Money.amount (ReturnLine.refundAmount line))
+
+        let invoicePdf = InvoicePdf.render (sampleInvoiceDocument 42L)
+
+        let creditDocument =
+            { sampleInvoiceDocument 1L with
+                Number = InvoiceNumber.create "FSNIX" "CN" "2026-09" 1L |> Result.defaultWith Assert.Fail
+                Credits = Some(invoiceNumber 42L) }
+
+        let creditPdf = InvoicePdf.render creditDocument
+        Assert.True(Pdf.isPdf creditPdf, "Expected a PDF header.")
+        Assert.Equal<byte array>(creditPdf, InvoicePdf.render creditDocument)
+        Assert.NotEqual<byte array>(invoicePdf, creditPdf)
 
     let tests =
         testList
@@ -1819,4 +2492,25 @@ module UnitTests =
                   "payment reserves and settles refund allocations"
                   ``payment reserves and settles a refund allocation``
               testCase "cart codecs contain no secret fields" ``cart codecs cover every case without secret fields``
-              testCase "cart codecs round trip an active cart" ``cart codecs round trip an active cart`` ]
+              testCase "cart codecs round trip an active cart" ``cart codecs round trip an active cart``
+              testCase "reservation failures keep distinct codes" ``reservation failures keep distinct reason codes``
+              testCase "invoice numbers validate and display" ``invoice numbers validate scope and format for display``
+              testCase
+                  "invoice chart issues once and parks failures"
+                  ``invoice chart issues once and parks failures for operator retry``
+              testCase
+                  "invoice codecs round trip and reject unknown tags"
+                  ``invoice codecs round trip every case and reject unknown tags``
+              testCase
+                  "pdf renders deterministically with the shipped font"
+                  ``pdf renders deterministically with the shipped font only``
+              testCase "document digests are lowercase hex sha256" ``document digests are lowercase hex sha256``
+              testCase "invoice pdf is deterministic per snapshot" ``invoice pdf is deterministic per snapshot``
+              testCase
+                  "unknown provider calls reconcile and park"
+                  ``unknown provider calls reconcile on request and park when exhausted``
+              testCase "lapsed authorizations hold the order" ``lapsed authorizations hold the order for review``
+              testCase
+                  "stalled invoice renders are re-requested"
+                  ``stalled invoice renders are re-requested then parked``
+              testCase "credit notes are keyed by refund" ``credit notes are keyed by refund and render distinctly`` ]

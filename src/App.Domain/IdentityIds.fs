@@ -9,6 +9,9 @@ type UserId = private UserId of value: Guid
 
 module UserId =
 
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : UserId = UserId(Guid.CreateVersion7())
+
     let create (value: Guid) : Result<UserId, string> =
         if value = Guid.Empty then
             Error "A user id must not be empty."

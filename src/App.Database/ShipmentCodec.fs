@@ -204,9 +204,11 @@ module ShipmentCodec =
 
     let private failedOfDto name (dto: ShipmentWire.WireDto) =
         inTransitOfDto name dto
-        |> Result.map (fun transit ->
-            { Transit = transit
-              ReasonCode = dto.ReasonCode })
+        |> Result.bind (fun transit ->
+            CodecSupport.reason dto.ReasonCode
+            |> Result.map (fun reason ->
+                { Transit = transit
+                  ReasonCode = reason }))
 
     let private inTransitDto (dto: ShipmentWire.WireDto) (transit: ShipmentInTransit) : ShipmentWire.WireDto =
         let request = transit.Shipment.Shipment.Request
@@ -244,7 +246,8 @@ module ShipmentCodec =
         | "returned-to-sender" -> Ok CarrierTrackingStatus.ReturnedToSender
         | "lost" -> Ok CarrierTrackingStatus.Lost
         | value when value.StartsWith("delivery-failed:", StringComparison.Ordinal) ->
-            Ok(CarrierTrackingStatus.DeliveryFailed value["delivery-failed:".Length ..])
+            ReasonCode.create value["delivery-failed:".Length ..]
+            |> Result.map CarrierTrackingStatus.DeliveryFailed
         | _ -> Error "Unknown tracking status."
 
     let state: Codec<ShipmentState> =
@@ -276,7 +279,7 @@ module ShipmentCodec =
                         inTransitDto (empty "delivery-failed-v1") failed.Transit
                         |> fun dto ->
                             { dto with
-                                ReasonCode = failed.ReasonCode }
+                                ReasonCode = ReasonCode.value failed.ReasonCode }
                     | ShipmentState.Delivered completed ->
                         inTransitDto (empty "delivered-v1") completed.Transit
                         |> fun dto ->
@@ -294,7 +297,9 @@ module ShipmentCodec =
                                 CompletedAt = completed.CompletedAt.ToUnixTimeMilliseconds() }
                     | ManualReview(request, reason) ->
                         requestDto (empty "manual-review-v1") request
-                        |> fun dto -> { dto with ReasonCode = reason }
+                        |> fun dto ->
+                            { dto with
+                                ReasonCode = ReasonCode.value reason }
                     | Closed request -> requestDto (empty "closed-v1") request
 
                 encode "ShipmentState" dto)
@@ -318,7 +323,9 @@ module ShipmentCodec =
                     | "lost-v1" -> completedOfDto "ShipmentState" dto |> Result.map ShipmentState.Lost
                     | "manual-review-v1" when not (String.IsNullOrWhiteSpace dto.ReasonCode) ->
                         requestOfDto "ShipmentState" dto
-                        |> Result.map (fun request -> ManualReview(request, dto.ReasonCode))
+                        |> Result.bind (fun request ->
+                            CodecSupport.reason dto.ReasonCode
+                            |> Result.map (fun reason -> ManualReview(request, reason)))
                     | "closed-v1" -> requestOfDto "ShipmentState" dto |> Result.map Closed
                     | tag -> Error(codecError "ShipmentState" $"Unknown or invalid tag '{tag}'.")))
 
@@ -334,7 +341,7 @@ module ShipmentCodec =
                     | AllocationRejected(allocationId, reason) ->
                         { empty "allocation-rejected-v1" with
                             AllocationId = ShipmentAllocationId.wireString allocationId
-                            ReasonCode = reason }
+                            ReasonCode = ReasonCode.value reason }
                     | PreparationCompleted -> empty "preparation-completed-v1"
                     | LabelCreated(generation, reference) ->
                         { empty "label-created-v1" with
@@ -343,7 +350,7 @@ module ShipmentCodec =
                     | LabelCreationFailed(generation, reason) ->
                         { empty "label-creation-failed-v1" with
                             Generation = generation
-                            ReasonCode = reason }
+                            ReasonCode = ReasonCode.value reason }
                     | DispatchConfirmed dispatchedAt ->
                         { empty "dispatch-confirmed-v1" with
                             DispatchedAt = dispatchedAt.ToUnixTimeMilliseconds() }
@@ -364,7 +371,7 @@ module ShipmentCodec =
                             DetectedAt = detectedAt.ToUnixTimeMilliseconds() }
                     | ManualReviewRequested reason ->
                         { empty "manual-review-requested-v1" with
-                            ReasonCode = reason }
+                            ReasonCode = ReasonCode.value reason }
                     | ShipmentCloseRequested -> empty "shipment-close-requested-v1"
 
                 encode "ShipmentEvent" dto)
@@ -378,13 +385,16 @@ module ShipmentCodec =
                         |> Result.map AllocationConfirmed
                     | "allocation-rejected-v1" when not (String.IsNullOrWhiteSpace dto.ReasonCode) ->
                         idValue ShipmentAllocationId.tryParse "ShipmentEvent" dto.AllocationId
-                        |> Result.map (fun allocationId -> AllocationRejected(allocationId, dto.ReasonCode))
+                        |> Result.bind (fun allocationId ->
+                            CodecSupport.reason dto.ReasonCode
+                            |> Result.map (fun reason -> AllocationRejected(allocationId, reason)))
                     | "preparation-completed-v1" -> Ok PreparationCompleted
                     | "label-created-v1" ->
                         idValue CarrierReference.tryParse "ShipmentEvent" dto.CarrierReference
                         |> Result.map (fun reference -> LabelCreated(dto.Generation, reference))
                     | "label-creation-failed-v1" when not (String.IsNullOrWhiteSpace dto.ReasonCode) ->
-                        Ok(LabelCreationFailed(dto.Generation, dto.ReasonCode))
+                        (CodecSupport.reason dto.ReasonCode
+                         |> Result.map (fun reason -> LabelCreationFailed(dto.Generation, reason)))
                     | "dispatch-confirmed-v1" ->
                         Ok(DispatchConfirmed(DateTimeOffset.FromUnixTimeMilliseconds dto.DispatchedAt))
                     | "carrier-tracking-received-v1" ->
@@ -414,7 +424,7 @@ module ShipmentCodec =
                             )
                         )
                     | "manual-review-requested-v1" when not (String.IsNullOrWhiteSpace dto.ReasonCode) ->
-                        Ok(ManualReviewRequested dto.ReasonCode)
+                        (CodecSupport.reason dto.ReasonCode |> Result.map ManualReviewRequested)
                     | "shipment-close-requested-v1" -> Ok ShipmentCloseRequested
                     | tag -> Error(codecError "ShipmentEvent" $"Unknown tag '{tag}'.")))
 
@@ -454,7 +464,21 @@ module ShipmentCodec =
                         "ShipmentAction"
                         { empty "request-delivery-retry-v1" with
                             CarrierReference = CarrierReference.value reference
-                            Attempt = attempt })
+                            Attempt = attempt }
+                | RecordTrackingCheckpoint(shipmentId, generation, lastScanAt, observedAt) ->
+                    encode
+                        "ShipmentAction"
+                        { empty "record-tracking-checkpoint-v1" with
+                            ShipmentId = ShipmentId.wireString shipmentId
+                            TrackingGeneration = generation
+                            LastCheckpointAt =
+                                lastScanAt |> Option.map _.ToUnixTimeMilliseconds() |> Option.defaultValue 0L
+                            OccurredAt = observedAt.ToUnixTimeMilliseconds() }
+                | StopTrackingCheck shipmentId ->
+                    encode
+                        "ShipmentAction"
+                        { empty "stop-tracking-check-v1" with
+                            ShipmentId = ShipmentId.wireString shipmentId })
             (fun json ->
                 decode "ShipmentAction" json
                 |> Result.bind (fun dto ->
@@ -490,6 +514,21 @@ module ShipmentCodec =
                     | "request-delivery-retry-v1" ->
                         idValue CarrierReference.tryParse "ShipmentAction" dto.CarrierReference
                         |> Result.map (fun reference -> RequestDeliveryRetry(reference, dto.Attempt))
+                    | "record-tracking-checkpoint-v1" when dto.TrackingGeneration >= 1L ->
+                        idValue ShipmentId.tryParse "ShipmentAction" dto.ShipmentId
+                        |> Result.map (fun shipmentId ->
+                            RecordTrackingCheckpoint(
+                                shipmentId,
+                                dto.TrackingGeneration,
+                                (if dto.LastCheckpointAt = 0L then
+                                     None
+                                 else
+                                     Some(DateTimeOffset.FromUnixTimeMilliseconds dto.LastCheckpointAt)),
+                                DateTimeOffset.FromUnixTimeMilliseconds dto.OccurredAt
+                            ))
+                    | "stop-tracking-check-v1" ->
+                        idValue ShipmentId.tryParse "ShipmentAction" dto.ShipmentId
+                        |> Result.map StopTrackingCheck
                     | tag -> Error(codecError "ShipmentAction" $"Unknown tag '{tag}'.")))
 
     let error: Codec<ShipmentActionError> =
@@ -543,7 +582,7 @@ module ShipmentCodec =
             machineId Shipments.MachineKey
         ) {
             chart Shipments.chartValue
-            chartVersion 1
+            chartVersion Shipments.ChartVersion
             initialState Shipments.initialState
             store storeArg
             logger log

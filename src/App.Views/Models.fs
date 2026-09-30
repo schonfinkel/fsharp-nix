@@ -96,12 +96,19 @@ type DeadlineHealthModel =
       Leased: int64
       EarliestPendingDeadline: DateTimeOffset option }
 
+type ReconciliationHealthModel =
+    { Unknown: int64
+      Due: int64
+      Parked: int64
+      MaximumChecks: int option }
+
 type OperationalHealthModel =
     { CapturedAt: DateTimeOffset
       Runtime: RuntimeHealthModel list
       Outboxes: OutboxHealthModel list
       FlowRequests: FlowRequestHealthModel list
-      Deadlines: DeadlineHealthModel list }
+      Deadlines: DeadlineHealthModel list
+      Reconciliation: ReconciliationHealthModel }
 
 type CatalogProductModel =
     { ProductId: string
@@ -167,12 +174,37 @@ type ReturnLineModel =
       ReturnKey: string }
 
 type OrderStatusModel =
-    { OrderId: string
-      Status: string
-      Total: string
-      CanCancel: bool
-      TooLateToCancel: bool
-      Pay: OrderPayModel option
-      ReturnLines: ReturnLineModel list
-      ReturnStatuses: (string * string) list
-      Error: string option }
+    {
+        OrderId: string
+        Status: string
+        Total: string
+        CanCancel: bool
+        TooLateToCancel: bool
+        Pay: OrderPayModel option
+        ReturnLines: ReturnLineModel list
+        ReturnStatuses: (string * string) list
+        /// <summary>Download URL and display number, once the invoice PDF is stored.</summary>
+        Invoice: (string * string) option
+        /// <summary>Download URL and number of each rendered credit note.</summary>
+        CreditNotes: (string * string) list
+        Error: string option
+    }
+
+type InvoiceRowModel =
+    {
+        Number: string
+        /// <summary>"Invoice", or "Credit note (INV-…)" naming the credited invoice.</summary>
+        Kind: string
+        IssuedOn: string
+        Total: string
+        OrderId: string
+        Status: string
+        DownloadUrl: string option
+        /// <summary>Operator retry form: post URL and a fresh idempotency key.</summary>
+        Retry: (string * string) option
+    }
+
+type InvoiceListModel =
+    { Title: string
+      Rows: InvoiceRowModel list
+      OlderUrl: string option }

@@ -102,6 +102,11 @@ module AccountFlow =
     [<Literal>]
     let ActionQueue = "flow_actions"
 
+    /// Bump on every semantic chart change (guards, transitions, codecs), even when the
+    /// structure is unchanged; Automata's fingerprint cannot see inside functions.
+    [<Literal>]
+    let ChartVersion = 1
+
     /// <summary>Upper bound on resends per flow before the next request must supersede it.</summary>
     [<Literal>]
     let MaxResendCount = 3

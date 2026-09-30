@@ -74,7 +74,12 @@ module OperationalHealthEndpoints =
                               Count = row.Count
                               Due = row.Due
                               Leased = row.Leased
-                              EarliestPendingDeadline = row.EarliestPendingDeadline }) }
+                              EarliestPendingDeadline = row.EarliestPendingDeadline })
+                      Reconciliation =
+                        { Unknown = database.Reconciliation.Unknown
+                          Due = database.Reconciliation.Due
+                          Parked = database.Reconciliation.Parked
+                          MaximumChecks = database.Reconciliation.MaximumChecks } }
 
                 return! context.WriteHtmlView(OperationalHealthViews.page context model)
             }

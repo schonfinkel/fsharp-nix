@@ -13,6 +13,15 @@ open ByzantineSystems.Automata.Core
 open ByzantineSystems.Automata.Storage
 open Npgsql
 
+[<RequireQualifiedAccess>]
+module PaymentSql =
+    let insertExpiryDeadline = Sql.load "Payments/insert-expiry-deadline"
+    let insertOperation = Sql.load "Payments/insert-operation"
+    let insertRefundAllocation = Sql.load "Payments/insert-refund-allocation"
+    let operationRow = Sql.load "Payments/operation-row"
+    let refundAllocationRow = Sql.load "Payments/refund-allocation-row"
+    let settleOperation = Sql.load "Payments/settle-operation"
+
 /// <summary>
 /// Gateway-bound effects for the payments machine. Provider calls never run inside a database
 /// transaction: phase one durably records the operation, the call happens outside, and phase
@@ -34,6 +43,7 @@ module PaymentEffects =
         | NotifyOrderCancelled _ -> "notify-order-cancelled"
         | NotifyOrderVoided _ -> "notify-order-voided"
         | NotifyOrderCaptured _ -> "notify-order-captured"
+        | NotifyOrderAuthorizationExpired _ -> "notify-order-authorization-expired"
         | NotifyRefundApproved _ -> "notify-refund-approved"
         | NotifyRefundDenied _ -> "notify-refund-denied"
         | NotifyRefundSettled _ -> "notify-refund-settled"
@@ -47,104 +57,44 @@ module PaymentEffects =
         (record: ActionRecord<PaymentId, PaymentAction>)
         (ct: CancellationToken)
         =
-        task {
-            let json =
-                PaymentCodec.action.Encode record.Action
-                |> Result.defaultWith (fun _ -> "invalid")
+        WorkflowEffects.firstDelivery
+            PaymentCodec.action
+            actionKind
+            PaymentActionError.CallbackEncodingFailed
+            PaymentActionError.ActionReceiptMismatch
+            connection
+            tx
+            record
+            ct
 
-            let hash = SHA256.HashData(Encoding.UTF8.GetBytes json)
+    let private callback connection tx callbackKey machine entity eventJson ct =
+        WorkflowEffects.callback connection tx callbackKey machine entity eventJson ct
 
-            use insert =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.action_receipts(machine_id,command_id,ordinal,action_kind,payload_hash) VALUES(@machine,@command,@ordinal,@kind,@hash) ON CONFLICT DO NOTHING RETURNING command_id",
-                    connection,
-                    tx
-                )
-
-            insert.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
-            |> ignore
-
-            insert.Parameters.AddWithValue("command", CommandId.value record.CommandId)
-            |> ignore
-
-            insert.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-            insert.Parameters.AddWithValue("kind", actionKind record.Action) |> ignore
-            insert.Parameters.AddWithValue("hash", hash) |> ignore
-            let! inserted = insert.ExecuteScalarAsync ct
-
-            if not (isNull inserted) then
-                return Ok true
-            else
-                use verify =
-                    new NpgsqlCommand(
-                        "SELECT action_kind,payload_hash FROM fsnix.action_receipts WHERE machine_id=@machine AND command_id=@command AND ordinal=@ordinal",
-                        connection,
-                        tx
-                    )
-
-                verify.Parameters.AddWithValue("machine", MachineId.value record.MachineId)
-                |> ignore
-
-                verify.Parameters.AddWithValue("command", CommandId.value record.CommandId)
-                |> ignore
-
-                verify.Parameters.AddWithValue("ordinal", record.Ordinal) |> ignore
-                let! reader = verify.ExecuteReaderAsync ct
-                let! found = reader.ReadAsync ct
-
-                let matches =
-                    found
-                    && reader.GetString 0 = actionKind record.Action
-                    && CryptographicOperations.FixedTimeEquals(reader.GetFieldValue<byte array>(1), hash)
-
-                reader.Dispose()
-
-                return
-                    if matches then
-                        Ok false
-                    else
-                        Error PaymentActionError.ActionReceiptMismatch
-        }
-
-    let private callback
-        (connection: NpgsqlConnection)
-        (tx: NpgsqlTransaction)
-        callbackKey
-        machine
-        entity
-        eventJson
-        (ct: CancellationToken)
-        =
-        task {
-            use command =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.integration_outbox(callback_key,machine_id,entity_id,event) VALUES(@key,@machine,@entity,@event::jsonb) ON CONFLICT(callback_key) DO NOTHING",
-                    connection,
-                    tx
-                )
-
-            command.Parameters.AddWithValue("key", callbackKey) |> ignore
-            command.Parameters.AddWithValue("machine", machine) |> ignore
-            command.Parameters.AddWithValue("entity", entity) |> ignore
-            command.Parameters.AddWithValue("event", eventJson) |> ignore
-            let! _ = command.ExecuteNonQueryAsync ct
-            return ()
-        }
-
+    /// <summary>Queues a result event for this payment. A successful authorization also arms its
+    /// expiry deadline in the same transaction, gated on this callback, so the expiry can never
+    /// reach the machine before the authorization it expires.</summary>
     let private selfCallback connection tx record purpose (event: PaymentEvent) ct =
         task {
             match PaymentCodec.event.Encode event with
             | Error _ -> return Error PaymentActionError.CallbackEncodingFailed
             | Ok json ->
-                do!
-                    callback
-                        connection
-                        tx
-                        (key record purpose)
-                        Payments.MachineKey
-                        (EntityId.value record.EntityId)
-                        json
-                        ct
+                let callbackKey = key record purpose
+
+                do! callback connection tx callbackKey Payments.MachineKey (EntityId.value record.EntityId) json ct
+
+                match event with
+                | AuthorizationSucceeded(attempt, _, expiresAt) ->
+                    use arm = new NpgsqlCommand(PaymentSql.insertExpiryDeadline, connection, tx)
+                    arm.Parameters.AddWithValue("entity", EntityId.value record.EntityId) |> ignore
+
+                    arm.Parameters.AddWithValue("operation", PaymentOperationId.value attempt.OperationId)
+                    |> ignore
+
+                    arm.Parameters.AddWithValue("deadline", expiresAt) |> ignore
+                    arm.Parameters.AddWithValue("gate", callbackKey) |> ignore
+                    let! _ = arm.ExecuteNonQueryAsync ct
+                    ()
+                | _ -> ()
 
                 return Ok()
         }
@@ -165,12 +115,7 @@ module PaymentEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    "SELECT payment_entity_id,order_id,kind,status,provider_reference,result_code,expires_at FROM fsnix.payment_operations WHERE operation_id=@operation",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(PaymentSql.operationRow, connection, tx)
 
             command.Parameters.AddWithValue("operation", operationId) |> ignore
             let! reader = command.ExecuteReaderAsync(ct)
@@ -207,12 +152,7 @@ module PaymentEffects =
         (ct: CancellationToken)
         =
         task {
-            use insert =
-                new NpgsqlCommand(
-                    "INSERT INTO fsnix.payment_operations(operation_id,payment_entity_id,order_id,kind) VALUES(@operation,@entity,@order,@kind) ON CONFLICT(operation_id) DO NOTHING",
-                    connection,
-                    tx
-                )
+            use insert = new NpgsqlCommand(PaymentSql.insertOperation, connection, tx)
 
             insert.Parameters.AddWithValue("operation", operationId) |> ignore
 
@@ -246,20 +186,7 @@ module PaymentEffects =
         (ct: CancellationToken)
         =
         task {
-            use command =
-                new NpgsqlCommand(
-                    """UPDATE fsnix.payment_operations
-                       SET status=@status,
-                           provider_reference=@reference,
-                           result_code=@result,
-                           expires_at=@expires,
-                           attempts=attempts+1,
-                           updated_at=statement_timestamp()
-                       WHERE operation_id=@operation
-                         AND status IN ('pending','unknown')""",
-                    connection,
-                    tx
-                )
+            use command = new NpgsqlCommand(PaymentSql.settleOperation, connection, tx)
 
             command.Parameters.AddWithValue("operation", operationId) |> ignore
             command.Parameters.AddWithValue("status", status) |> ignore
@@ -298,11 +225,13 @@ module PaymentEffects =
         && value
            |> Seq.forall (fun c -> Char.IsAsciiLetterOrDigit c || c = ':' || c = '/' || c = '_' || c = '-')
 
-    let private validResultCode (value: string) =
-        not (String.IsNullOrWhiteSpace value)
-        && value.Length <= 64
-        && value
-           |> Seq.forall (fun c -> Char.IsAsciiLetterLower c || Char.IsDigit c || c = '-')
+    let private providerDeclined = ReasonCode.ofLiteral "provider-declined"
+
+    /// <summary>The recorded decline reason of a settled operation row.</summary>
+    let private recordedReason (row: OperationRow) =
+        row.ResultCode
+        |> Option.map (ReasonCode.sanitize providerDeclined)
+        |> Option.defaultValue providerDeclined
 
     let private authorizeOutcome attempt (outcome: GatewayAuthorization) =
         match outcome with
@@ -314,10 +243,9 @@ module PaymentEffects =
             AuthorizationSucceeded(attempt, reference, expiresAt)
         | GatewayAuthorized _ ->
             "unknown", None, Some "invalid-provider-response", None, AuthorizationOutcomeUnknown attempt
-        | GatewayAuthorization.GatewayDeclined reason when validResultCode reason ->
-            "failed", None, Some reason, None, AuthorizationDeclined(attempt, reason)
-        | GatewayAuthorization.GatewayDeclined _ ->
-            "failed", None, Some "provider-declined", None, AuthorizationDeclined(attempt, "provider-declined")
+        | GatewayAuthorization.GatewayDeclined text ->
+            let reason = ReasonCode.sanitize providerDeclined text
+            "failed", None, Some(ReasonCode.value reason), None, AuthorizationDeclined(attempt, reason)
         | GatewayOutcomeUnknown -> "unknown", None, Some "outcome-unknown", None, AuthorizationOutcomeUnknown attempt
 
     let private authorizeRowEvent attempt (row: OperationRow) =
@@ -330,7 +258,7 @@ module PaymentEffects =
                 row.ExpiresAt
                 |> Option.defaultWith (fun () -> invalidOp "succeeded authorizations carry an expiry")
             )
-        | "failed" -> AuthorizationDeclined(attempt, row.ResultCode |> Option.defaultValue "unknown")
+        | "failed" -> AuthorizationDeclined(attempt, recordedReason row)
         | _ -> AuthorizationOutcomeUnknown attempt
 
     let private captureOutcome request (outcome: GatewayCapture) =
@@ -338,10 +266,9 @@ module PaymentEffects =
         | GatewayCaptured reference when validProviderReference reference ->
             "succeeded", Some reference, Some "captured", None, CaptureSucceeded(request, reference)
         | GatewayCaptured _ -> "unknown", None, Some "invalid-provider-response", None, CaptureOutcomeUnknown request
-        | GatewayCaptureDeclined reason when validResultCode reason ->
-            "failed", None, Some reason, None, CaptureDeclined(request, reason)
-        | GatewayCaptureDeclined _ ->
-            "failed", None, Some "provider-declined", None, CaptureDeclined(request, "provider-declined")
+        | GatewayCaptureDeclined text ->
+            let reason = ReasonCode.sanitize providerDeclined text
+            "failed", None, Some(ReasonCode.value reason), None, CaptureDeclined(request, reason)
         | GatewayCaptureUnknown -> "unknown", None, Some "outcome-unknown", None, CaptureOutcomeUnknown request
 
     let private captureRowEvent request (row: OperationRow) =
@@ -352,7 +279,7 @@ module PaymentEffects =
                 row.ProviderReference
                 |> Option.defaultWith (fun () -> invalidOp "succeeded captures carry a reference")
             )
-        | "failed" -> CaptureDeclined(request, row.ResultCode |> Option.defaultValue "unknown")
+        | "failed" -> CaptureDeclined(request, recordedReason row)
         | _ -> CaptureOutcomeUnknown request
 
     let private recordAndSettle
@@ -696,6 +623,8 @@ module PaymentEffects =
                 | NotifyOrderCancelled orderId -> Some(PaymentSettled, orderId, "notify-order-cancelled")
                 | NotifyOrderVoided authorized ->
                     Some(PaymentSettled, authorized.Attempt.OrderId, "notify-order-voided")
+                | NotifyOrderAuthorizationExpired authorized ->
+                    Some(PaymentAuthorizationExpired, authorized.Attempt.OrderId, "notify-order-authorization-expired")
                 | NotifyOrderCaptured capture ->
                     Some(
                         PaymentCaptured(capture.Request.CaptureId, capture.Request.OperationId),
@@ -753,12 +682,7 @@ module PaymentEffects =
                     return Error error
                 | Ok _ ->
                     if reserve then
-                        use insert =
-                            new NpgsqlCommand(
-                                "INSERT INTO fsnix.refund_allocations(allocation_id,refund_id,order_id,amount,currency,status) VALUES(@allocation,@refund,@order,@amount,@currency,'pending') ON CONFLICT(allocation_id) DO NOTHING",
-                                connection,
-                                tx
-                            )
+                        use insert = new NpgsqlCommand(PaymentSql.insertRefundAllocation, connection, tx)
 
                         insert.Parameters.AddWithValue("allocation", RefundAllocationId.value request.AllocationId)
                         |> ignore
@@ -776,12 +700,7 @@ module PaymentEffects =
 
                         let! _ = insert.ExecuteNonQueryAsync ct
 
-                        use verify =
-                            new NpgsqlCommand(
-                                "SELECT refund_id,order_id,amount,currency,status FROM fsnix.refund_allocations WHERE allocation_id=@allocation",
-                                connection,
-                                tx
-                            )
+                        use verify = new NpgsqlCommand(PaymentSql.refundAllocationRow, connection, tx)
 
                         verify.Parameters.AddWithValue("allocation", RefundAllocationId.value request.AllocationId)
                         |> ignore

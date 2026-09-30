@@ -10,6 +10,7 @@
     <PackageReference Include="MailKit" Version="4.18.1" />
     <PackageReference Include="Microsoft.FeatureManagement.AspNetCore" Version="4.5.0" />
     <PackageReference Include="Oxpecker" Version="2.1.1" />
+    <PackageReference Include="QuestPDF" Version="2026.9.1" />
     <PackageReference Include="Oxpecker.Htmx" Version="4.0.0" />
     <PackageReference Include="Oxpecker.ViewEngine" Version="2.1.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
@@ -24,6 +25,7 @@
     <ProjectReference Include="..\App.Refunds\App.Refunds.fsproj" />
     <ProjectReference Include="..\App.Returns\App.Returns.fsproj" />
     <ProjectReference Include="..\App.Shipments\App.Shipments.fsproj" />
+    <ProjectReference Include="..\App.Invoices\App.Invoices.fsproj" />
     <ProjectReference Include="..\App.Database\App.Database.fsproj" />
     <ProjectReference Include="..\App.Migrations\App.Migrations.fsproj" />
     <ProjectReference Include="..\App.Views\App.Views.fsproj" />
@@ -32,6 +34,7 @@
     <Compile Include="FeatureFlags.fs" />
     <Compile Include="FeatureEvents.fs" />
     <Compile Include="Web.fs" />
+    <Compile Include="HttpErrors.fs" />
     <Compile Include="Demo.fs" />
     <Compile Include="Account.fs" />
     <Compile Include="Bootstrap.fs" />
@@ -43,6 +46,7 @@
     <Compile Include="Admin.fs" />
     <Compile Include="Migrations.fs" />
     <Compile Include="MachineClients.fs" />
+    <Compile Include="Scanners.fs" />
     <Compile Include="Health.fs" />
     <Compile Include="OperationalHealth.fs" />
     <Compile Include="AccountFlowEndpoints.fs" />
@@ -55,8 +59,12 @@
     <Compile Include="ShipmentHandler.fs" />
     <Compile Include="RefundHandler.fs" />
     <Compile Include="ReturnHandler.fs" />
+    <Compile Include="Pdf.fs" />
+    <Compile Include="InvoicePdf.fs" />
+    <Compile Include="InvoiceHandler.fs" />
     <Compile Include="OrderEndpoints.fs" />
     <Compile Include="ReturnEndpoints.fs" />
+    <Compile Include="InvoiceEndpoints.fs" />
     <Compile Include="CatalogEndpoints.fs" />
     <Compile Include="CatalogAdminEndpoints.fs" />
     <Compile Include="AdminFulfilment.fs" />

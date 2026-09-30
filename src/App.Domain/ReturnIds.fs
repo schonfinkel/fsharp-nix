@@ -7,6 +7,9 @@ type ReturnId = private ReturnId of Guid
 
 [<RequireQualifiedAccess>]
 module ReturnId =
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : ReturnId = ReturnId(Guid.CreateVersion7())
+
     let create value =
         if value = Guid.Empty then
             Error "A return id is required."
@@ -26,6 +29,10 @@ type ReturnAuthorizationId = private ReturnAuthorizationId of Guid
 
 [<RequireQualifiedAccess>]
 module ReturnAuthorizationId =
+    /// <summary>A fresh, time-ordered id (never empty).</summary>
+    let generate () : ReturnAuthorizationId =
+        ReturnAuthorizationId(Guid.CreateVersion7())
+
     let create value =
         if value = Guid.Empty then
             Error "A return authorization id is required."

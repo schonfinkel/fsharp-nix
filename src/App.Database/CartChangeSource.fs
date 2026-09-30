@@ -21,6 +21,10 @@ type ICartChangeSubscription =
 type ICartChangeSource =
     abstract member Subscribe: CancellationToken -> Task<ICartChangeSubscription>
 
+[<RequireQualifiedAccess>]
+module CartChangeSql =
+    let listen = Sql.load "Carts/listen"
+
 type private PostgresCartChangeSubscription(connection: NpgsqlConnection) =
     let heartbeat = TimeSpan.FromSeconds 15.
 
@@ -42,7 +46,7 @@ type PostgresCartChangeSource(dataSource: NpgsqlDataSource) =
                 do! connection.OpenAsync(cancellationToken)
 
                 try
-                    use command = new NpgsqlCommand($"LISTEN {CartChange.Channel}", connection)
+                    use command = new NpgsqlCommand(CartChangeSql.listen, connection)
                     let! _ = command.ExecuteNonQueryAsync(cancellationToken)
                     return PostgresCartChangeSubscription(connection) :> ICartChangeSubscription
                 with error ->

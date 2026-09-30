@@ -11,6 +11,7 @@ open App.Domain
 open App.Orders
 open App.Payments
 open App.Refunds
+open App.Invoices
 open App.Returns
 open App.Shipments
 open ByzantineSystems.Automata.Core
@@ -38,6 +39,12 @@ open Serilog.Events
 type AppMarker = class end
 
 [<RequireQualifiedAccess>]
+module BootSql =
+    let appliedRepeatables = Sql.load "Boot/applied-repeatables"
+    let appliedScripts = Sql.load "Boot/applied-scripts"
+    let fsmSchemaExists = Sql.load "Boot/fsm-schema-exists"
+
+[<RequireQualifiedAccess>]
 module BootChecks =
 
     /// <summary>
@@ -57,19 +64,14 @@ module BootChecks =
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
 
-                use fsmExists =
-                    new NpgsqlCommand(
-                        "SELECT EXISTS (SELECT FROM information_schema.schemata WHERE schema_name = 'fsm')",
-                        connection
-                    )
+                use fsmExists = new NpgsqlCommand(BootSql.fsmSchemaExists, connection)
 
                 let! fsm = fsmExists.ExecuteScalarAsync()
 
                 if not (fsm :?> bool) then
                     return Error "The fsm schema is missing; run the deployment migration job (--migrate) first."
                 else
-                    use journal =
-                        new NpgsqlCommand("SELECT scriptname FROM fsnix.schemaversions", connection)
+                    use journal = new NpgsqlCommand(BootSql.appliedScripts, connection)
 
                     let! reader = journal.ExecuteReaderAsync()
                     let applied = HashSet<string>()
@@ -90,8 +92,7 @@ module BootChecks =
                         expected
                         |> List.filter (fun name -> name.Contains(".repeatable.", StringComparison.Ordinal))
 
-                    use repeatable =
-                        new NpgsqlCommand("SELECT script_name FROM fsnix.repeatable_migration_state", connection)
+                    use repeatable = new NpgsqlCommand(BootSql.appliedRepeatables, connection)
 
                     let! repeatableReader = repeatable.ExecuteReaderAsync()
                     let repeatableApplied = HashSet<string>()
@@ -198,6 +199,32 @@ module Application =
         CapabilityHashKey.create keyId bytes
         |> Result.defaultWith (fun message -> invalidOp message)
 
+    /// <summary>Supervised worker registration for one machine: the worker store owns LISTEN and
+    /// processing, the chart registry is shared, and action delivery resolves the scoped
+    /// <c>IActionHandler</c>.</summary>
+    let private worker<'Id, 'State, 'Event, 'Action, 'Error when 'Id: equality>
+        machineKey
+        loggerName
+        (buildWorker:
+            Microsoft.Extensions.Logging.ILogger
+                -> PostgresContext
+                -> Result<
+                    ByzantineSystems.Automata.Runtime.Machine<'Id, 'State, 'Event, 'Action, 'Error>,
+                    ByzantineSystems.Automata.Runtime.MachineConfigError list
+                 >)
+        =
+        { MachineKey = machineKey
+          Supervisor = AutomataSupervisorOptions.defaults machineKey
+          Actions = ActionDelivery.registered<'Id, 'Action, 'Error>
+          MachineFactory =
+            fun (provider: IServiceProvider) ->
+                buildWorker
+                    (provider.GetRequiredService<ILoggerFactory>().CreateLogger(loggerName: string))
+                    (provider.GetRequiredService<PostgresContext>())
+          ChartRegistry =
+            fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
+          TimeProvider = TimeProvider.System }
+
     let configureServices (builder: WebApplicationBuilder) =
         builder.Services.AddRouting() |> ignore
         builder.Services.AddAntiforgery() |> ignore
@@ -207,6 +234,18 @@ module Application =
         builder.Services.AddSingleton<CatalogStore>() |> ignore
 
         builder.Services.AddSingleton(CheckoutPricing.load builder.Configuration)
+        |> ignore
+
+        builder.Services.AddSingleton(InvoiceIssuerConfig.load builder.Configuration)
+        |> ignore
+
+        builder.Services.AddSingleton(ReconciliationPolicy.load builder.Configuration)
+        |> ignore
+
+        builder.Services.AddSingleton(InvoiceRenderPolicyConfig.load builder.Configuration)
+        |> ignore
+
+        builder.Services.AddSingleton(ShipmentTrackingPolicy.load builder.Configuration)
         |> ignore
 
         builder.Services.AddSingleton<ICartChangeSource, PostgresCartChangeSource>()
@@ -325,6 +364,7 @@ module Application =
             .AddScoped<IActionHandler<ShipmentEntityId, ShipmentAction, ShipmentActionError>, ShipmentEffectHandler>()
             .AddScoped<IActionHandler<RefundEntityId, RefundAction, RefundActionError>, RefundEffectHandler>()
             .AddScoped<IActionHandler<ReturnEntityId, ReturnAction, ReturnActionError>, ReturnEffectHandler>()
+            .AddScoped<IActionHandler<InvoiceEntityId, InvoiceAction, InvoiceActionError>, InvoiceEffectHandler>()
             .AddSingleton<SimulatedPaymentGateway>()
             .AddSingleton<IPaymentGateway>(fun provider ->
                 provider.GetRequiredService<SimulatedPaymentGateway>() :> IPaymentGateway)
@@ -346,6 +386,8 @@ module Application =
             .AddHostedService(fun provider -> provider.GetRequiredService<RefundMachineClient>())
             .AddSingleton<ReturnMachineClient>()
             .AddHostedService(fun provider -> provider.GetRequiredService<ReturnMachineClient>())
+            .AddSingleton<InvoiceMachineClient>()
+            .AddHostedService(fun provider -> provider.GetRequiredService<InvoiceMachineClient>())
             .AddHostedService<ReservationExpiryScanner>()
             .AddSingleton<OutboxDestination list>(fun provider ->
                 let probeClient = provider.GetRequiredService<ProbeMachineClient>()
@@ -356,6 +398,7 @@ module Application =
                 let shipmentsClient = provider.GetRequiredService<ShipmentMachineClient>()
                 let refundsClient = provider.GetRequiredService<RefundMachineClient>()
                 let returnsClient = provider.GetRequiredService<ReturnMachineClient>()
+                let invoicesClient = provider.GetRequiredService<InvoiceMachineClient>()
 
                 [ OutboxDestination.forMachineProvider
                       Probe.MachineKey
@@ -384,117 +427,31 @@ module Application =
                   OutboxDestination.forMachineProvider Refunds.MachineKey EntityId.create RefundCodec.event (fun () ->
                       refundsClient.Refunds)
                   OutboxDestination.forMachineProvider Returns.MachineKey EntityId.create ReturnCodec.event (fun () ->
-                      returnsClient.Returns) ])
+                      returnsClient.Returns)
+                  OutboxDestination.forMachineProvider
+                      Invoices.MachineKey
+                      EntityId.create
+                      InvoiceCodec.event
+                      (fun () -> invoicesClient.Invoices) ])
             .AddHostedService<IntegrationOutboxRelay>()
             .AddHostedService<EmailDeliveryRelay>()
             .AddHostedService<FlowDeadlineScanner>()
             .AddHostedService<CartAbandonmentScanner>()
             .AddHostedService<CartMergeScanner>()
             .AddHostedService<ReturnWindowScanner>()
-            .AddAutomata(
-                { MachineKey = Probe.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Probe.MachineKey
-                  Actions = ActionDelivery.registered<ProbeId, ProbeAction, ProbeActionError>
-                  MachineFactory =
-                    fun provider ->
-                        Probe.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "probes")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = AccountFlow.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults AccountFlow.MachineKey
-                  Actions = ActionDelivery.registered<FlowId, FlowAction, FlowActionError>
-                  MachineFactory =
-                    fun provider ->
-                        AccountFlowCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "flows")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Cart.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Cart.MachineKey
-                  Actions = ActionDelivery.registered<CartId, CartAction, CartActionError>
-                  MachineFactory =
-                    fun provider ->
-                        CartCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "carts")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Orders.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Orders.MachineKey
-                  Actions = ActionDelivery.registered<OrderId, OrderAction, OrderActionError>
-                  MachineFactory =
-                    fun provider ->
-                        OrderCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "orders")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Payments.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Payments.MachineKey
-                  Actions = ActionDelivery.registered<PaymentId, PaymentAction, PaymentActionError>
-                  MachineFactory =
-                    fun provider ->
-                        PaymentCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "payments")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Shipments.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Shipments.MachineKey
-                  Actions = ActionDelivery.registered<ShipmentEntityId, ShipmentAction, ShipmentActionError>
-                  MachineFactory =
-                    fun provider ->
-                        ShipmentCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "shipments")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Refunds.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Refunds.MachineKey
-                  Actions = ActionDelivery.registered<RefundEntityId, RefundAction, RefundActionError>
-                  MachineFactory =
-                    fun provider ->
-                        RefundCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "refunds")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
-            .AddAutomata(
-                { MachineKey = Returns.MachineKey
-                  Supervisor = AutomataSupervisorOptions.defaults Returns.MachineKey
-                  Actions = ActionDelivery.registered<ReturnEntityId, ReturnAction, ReturnActionError>
-                  MachineFactory =
-                    fun provider ->
-                        ReturnCodec.buildWorker
-                            (provider.GetRequiredService<ILoggerFactory>().CreateLogger "returns")
-                            (provider.GetRequiredService<PostgresContext>())
-                  ChartRegistry =
-                    fun provider -> PostgresChartRegistry { Context = provider.GetRequiredService<PostgresContext>() }
-                  TimeProvider = TimeProvider.System }
-            )
+            .AddHostedService<GatewayReconciliationScanner>()
+            .AddHostedService<AuthorizationExpiryScanner>()
+            .AddHostedService<InvoiceRenderScanner>()
+            .AddHostedService<ShipmentLostScanner>()
+            .AddAutomata(worker Probe.MachineKey "probes" Probe.buildWorker)
+            .AddAutomata(worker AccountFlow.MachineKey "flows" AccountFlowCodec.buildWorker)
+            .AddAutomata(worker Cart.MachineKey "carts" CartCodec.buildWorker)
+            .AddAutomata(worker Orders.MachineKey "orders" OrderCodec.buildWorker)
+            .AddAutomata(worker Payments.MachineKey "payments" PaymentCodec.buildWorker)
+            .AddAutomata(worker Shipments.MachineKey "shipments" ShipmentCodec.buildWorker)
+            .AddAutomata(worker Refunds.MachineKey "refunds" RefundCodec.buildWorker)
+            .AddAutomata(worker Returns.MachineKey "returns" ReturnCodec.buildWorker)
+            .AddAutomata(worker Invoices.MachineKey "invoices" InvoiceCodec.buildWorker)
             .AddAutomataMaintenance(
                 { MaintenanceOptions.defaults (fun provider ->
                       PostgresMaintenance(provider.GetRequiredService<PostgresContext>())) with
@@ -548,6 +505,10 @@ module Application =
                 route "/admin/operations" (Account.requireMfa OperationalHealthEndpoints.index)
                 route "/admin/catalog" (Account.requireMfa CatalogAdminEndpoints.index)
                 route "/admin/returns/{returnId}" (Account.requireMfa ReturnEndpoints.adminPage)
+                route "/invoices" (Account.requireAuthenticated InvoiceEndpoints.list)
+                route "/invoices/{invoiceId}/pdf" (Account.requireAuthenticated InvoiceEndpoints.customerPdf)
+                route "/admin/invoices" (Account.requireMfa InvoiceEndpoints.adminList)
+                route "/admin/invoices/{invoiceId}/pdf" (Account.requireMfa InvoiceEndpoints.adminPdf)
                 route "/admin/probe" (Account.requireMfa ProbeAdmin.index) ]
           POST
               [ route "/account/login" (Admin.requireValidAntiforgery Account.login)
@@ -609,6 +570,9 @@ module Application =
                     (Account.requireMfa (Admin.requireValidAntiforgery Admin.schedule))
                 route "/admin/probe/run" (Account.requireMfa (Admin.requireValidAntiforgery ProbeAdmin.run))
                 route
+                    "/admin/invoices/{invoiceId}/retry-render"
+                    (Account.requireMfa (Admin.requireValidAntiforgery InvoiceEndpoints.retryRender))
+                route
                     "/admin/orders/{orderId}/ship"
                     (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.ship))
                 route
@@ -628,6 +592,7 @@ module Application =
                     (Account.requireMfa (Admin.requireValidAntiforgery AdminFulfilment.release)) ] ]
 
     let create (args: string array) =
+        Pdf.configure ()
         let builder = createBuilder args
         configureServices builder
         let app = builder.Build()
@@ -686,8 +651,26 @@ module Program =
         task {
             let migrateOnly = args |> Array.contains "--migrate"
             let bootstrapOnly = args |> Array.contains "--bootstrap-user"
+            let renderCheckOnly = args |> Array.contains "--render-check"
 
-            if migrateOnly then
+            if renderCheckOnly then
+                // Needs no database or configuration: proves the QuestPDF native library and the
+                // shipped fonts load in this environment (the flake's pdf-render check and the OCI
+                // image run exactly this).
+                try
+                    let pdf = Pdf.renderSample ()
+
+                    if Pdf.isPdf pdf then
+                        printfn "PDF render check succeeded (%d bytes)." pdf.Length
+                        return 0
+                    else
+                        eprintfn "PDF render check produced invalid output."
+                        return 1
+                with error ->
+                    eprintfn "PDF render check failed: %s" (error.GetType().FullName)
+                    eprintfn "%O" error
+                    return 1
+            elif migrateOnly then
                 let builder = Application.createBuilder args
                 use app = builder.Build()
                 let connection = Application.connectionString app.Configuration
